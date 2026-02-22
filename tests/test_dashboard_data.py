@@ -264,6 +264,31 @@ class TestDashboardData(unittest.TestCase):
             with self.assertRaises(ValueError):
                 get_dashboard_payload(settings, max_age_seconds=3600, response_mode="year")
 
+    def test_normalizes_type_meta_for_legacy_cached_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = self._settings_for(td)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cached_payload = {
+                "generated_at": now_iso,
+                "validated_at": now_iso,
+                "years": [2026],
+                "types": ["HighIntensityIntervalTraining", "Workout", "Run"],
+                "type_meta": {"Run": {"label": "Run"}},
+                "other_bucket": "OtherSports",
+                "aggregates": {},
+                "units": {"distance": "mi", "elevation": "ft"},
+                "week_start": "sunday",
+                "activities": [],
+                "intervals": {"enabled": False, "records": 0, "matched_activities": 0},
+                "intervals_year_type_metrics": {},
+            }
+            write_json(dashboard_data_path(settings), cached_payload)
+            payload = get_dashboard_payload(settings, max_age_seconds=3600)
+            type_meta = payload.get("type_meta", {})
+            self.assertEqual(type_meta.get("HighIntensityIntervalTraining", {}).get("label"), "HITT")
+            self.assertEqual(type_meta.get("Workout", {}).get("label"), "Other Workout")
+            self.assertEqual(type_meta.get("Run", {}).get("accent"), "#3fa8ff")
+
     def test_returns_stale_cache_if_rebuild_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             settings = self._settings_for(td)

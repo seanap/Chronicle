@@ -73,6 +73,7 @@ curl http://localhost:1609/service-metrics
   - Includes Intervals metrics sections:
     - `intervals` (enabled/records/matched_activities)
     - `intervals_year_type_metrics` (year/type aggregate averages)
+  - `type_meta` is the canonical source for activity-type labels/accents used by frontend rendering.
   - Daily `aggregates` entries may include optional metric keys:
     - `avg_pace_mps`
     - `avg_efficiency_factor`

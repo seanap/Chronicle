@@ -5,21 +5,9 @@
 
 const DEFAULT_COLORS = ["#2a2a2a", "#2a2a2a", "#2a2a2a", "#2a2a2a", "#2a2a2a"];
 const MULTI_TYPE_COLOR = "#ff8a3d";
-const TYPE_ACCENT_OVERRIDES = {
-  Run: "#3fa8ff",
-  Ride: "#39d98a",
-  Walk: "#ffd166",
-  Hike: "#8ecae6",
-  WeightTraining: "#b392f0",
-  Workout: "#ff7aa2",
-};
 const FALLBACK_VAPORWAVE = ["#3fa8ff", "#39d98a", "#ffd166", "#b392f0", "#ff7aa2", "#7bdff2", "#95d5b2", "#cdb4db"];
 const STAT_PLACEHOLDER = "- - -";
 const CREATOR_REPO_SLUG = "aspain/git-sweaty";
-const TYPE_LABEL_OVERRIDES = {
-  HighIntensityIntervalTraining: "HITT",
-  Workout: "Other Workout",
-};
 let TYPE_META = {};
 let OTHER_BUCKET = "OtherSports";
 
@@ -2160,7 +2148,7 @@ function attachTooltip(cell, text) {
 }
 
 function getColors(type) {
-  const accent = TYPE_ACCENT_OVERRIDES[type] || TYPE_META[type]?.accent || fallbackColor(type);
+  const accent = TYPE_META[type]?.accent || fallbackColor(type);
   return [DEFAULT_COLORS[0], DEFAULT_COLORS[1], DEFAULT_COLORS[2], DEFAULT_COLORS[3], accent];
 }
 
@@ -2248,7 +2236,6 @@ function fallbackColor(type) {
 
 function prettifyType(type) {
   const value = String(type || "Other").trim();
-  if (TYPE_LABEL_OVERRIDES[value]) return TYPE_LABEL_OVERRIDES[value];
   return capitalizeLabelStart(value
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/_/g, " ")

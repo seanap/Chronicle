@@ -90,6 +90,8 @@ class TestDashboardPayloadContract(unittest.TestCase):
                 meta = payload["type_meta"][type_name]
                 self.assertIsInstance(meta.get("label"), str)
                 self.assertIsInstance(meta.get("accent"), str)
+            self.assertEqual(payload["type_meta"]["Run"]["accent"], "#3fa8ff")
+            self.assertEqual(payload["type_meta"]["Ride"]["accent"], "#39d98a")
 
             self.assertEqual(payload["units"], {"distance": "mi", "elevation": "ft"})
             self.assertIn(payload["week_start"], {"sunday", "monday"})

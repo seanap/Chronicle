@@ -1054,6 +1054,34 @@ def _empty_payload(*, error: str | None = None) -> dict[str, Any]:
 
 def _normalize_dashboard_payload(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
     normalized = dict(payload)
+
+    types_raw = normalized.get("types")
+    types: list[str] = []
+    if isinstance(types_raw, list):
+        for item in types_raw:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip()
+            if cleaned and cleaned not in types:
+                types.append(cleaned)
+    normalized["types"] = types
+
+    type_meta_raw = normalized.get("type_meta")
+    incoming_type_meta = type_meta_raw if isinstance(type_meta_raw, dict) else {}
+    canonical_type_meta = _type_meta(types)
+    normalized_type_meta: dict[str, dict[str, Any]] = {}
+    for type_name in types:
+        incoming_meta = incoming_type_meta.get(type_name)
+        incoming_meta_dict = incoming_meta if isinstance(incoming_meta, dict) else {}
+        canonical_meta = canonical_type_meta.get(type_name, {"label": _prettify_type(type_name), "accent": "#3fa8ff"})
+        label = incoming_meta_dict.get("label")
+        accent = incoming_meta_dict.get("accent")
+        normalized_entry: dict[str, Any] = dict(incoming_meta_dict)
+        normalized_entry["label"] = str(label).strip() if isinstance(label, str) and label.strip() else canonical_meta["label"]
+        normalized_entry["accent"] = str(accent).strip() if isinstance(accent, str) and accent.strip() else canonical_meta["accent"]
+        normalized_type_meta[type_name] = normalized_entry
+    normalized["type_meta"] = normalized_type_meta
+
     intervals_raw = normalized.get("intervals")
     intervals = dict(intervals_raw) if isinstance(intervals_raw, dict) else {}
     intervals["enabled"] = bool(settings.enable_intervals)
