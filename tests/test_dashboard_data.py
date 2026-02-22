@@ -356,6 +356,135 @@ class TestDashboardData(unittest.TestCase):
             assert isinstance(cache_payload, dict)
             self.assertEqual(cache_payload.get("last_fetch_mode"), "incremental")
 
+    def test_smart_revalidate_uses_incremental_activity_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = replace(self._settings_for(td), enable_intervals=False)
+            data_path = dashboard_data_path(settings)
+            cached_payload = {
+                "generated_at": "2026-02-08T10:00:00+00:00",
+                "validated_at": "2026-02-08T10:00:00+00:00",
+                "years": [2026],
+                "types": ["Run"],
+                "type_meta": {"Run": {"label": "Run", "accent": "#3fa8ff"}},
+                "other_bucket": "OtherSports",
+                "aggregates": {
+                    "2026": {
+                        "Run": {
+                            "2026-02-08": {
+                                "count": 1,
+                                "distance": 5000.0,
+                                "moving_time": 1500.0,
+                                "elevation_gain": 50.0,
+                                "activity_ids": ["1001"],
+                            }
+                        }
+                    }
+                },
+                "units": {"distance": "mi", "elevation": "ft"},
+                "week_start": "sunday",
+                "activities": [
+                    {
+                        "id": "1001",
+                        "date": "2026-02-08",
+                        "year": 2026,
+                        "type": "Run",
+                        "raw_type": "Run",
+                        "start_date_local": "2026-02-08T10:00:00+00:00",
+                        "hour": 10,
+                        "distance": 5000.0,
+                        "moving_time": 1500.0,
+                        "elevation_gain": 50.0,
+                        "url": "https://www.strava.com/activities/1001",
+                    }
+                ],
+                "latest_activity_id": "1001",
+                "latest_activity_start_date": "2026-02-08T10:00:00+00:00",
+                "intervals": {"enabled": False, "records": 0, "matched_activities": 0},
+                "intervals_year_type_metrics": {},
+            }
+            write_json(data_path, cached_payload)
+
+            recent_raw = [
+                {
+                    "id": 1003,
+                    "start_date_local": "2026-02-10T10:00:00+00:00",
+                    "sport_type": "Run",
+                    "distance": 6000.0,
+                    "moving_time": 1800,
+                    "total_elevation_gain": 65.0,
+                    "name": "Progression Run",
+                }
+            ]
+
+            with mock.patch(
+                "chronicle.dashboard_data._fetch_latest_activity_marker",
+                return_value=("1003", "2026-02-10T10:00:00+00:00"),
+            ), mock.patch("chronicle.dashboard_data.StravaClient") as mock_client_cls, mock.patch(
+                "chronicle.dashboard_data.build_dashboard_payload",
+                side_effect=AssertionError("full rebuild should not run"),
+            ):
+                mock_client = mock_client_cls.return_value
+                mock_client.get_activities_after.return_value = recent_raw
+                refreshed = dashboard_data._smart_revalidate_payload(settings, data_path, cached_payload)
+
+            self.assertEqual(refreshed.get("sync_mode"), "incremental")
+            self.assertEqual(refreshed.get("latest_activity_id"), "1003")
+            self.assertEqual(len(refreshed.get("activities", [])), 2)
+            ids = [item.get("id") for item in refreshed["activities"]]
+            self.assertEqual(ids, ["1001", "1003"])
+            call_args = mock_client.get_activities_after.call_args
+            self.assertIsNotNone(call_args)
+            assert call_args is not None
+            self.assertIsInstance(call_args.args[0], datetime)
+            self.assertEqual(call_args.kwargs.get("per_page"), 200)
+
+    def test_smart_revalidate_falls_back_to_full_rebuild_for_legacy_cached_activities(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = replace(self._settings_for(td), enable_intervals=False)
+            data_path = dashboard_data_path(settings)
+            legacy_cached_payload = {
+                "generated_at": "2026-02-08T10:00:00+00:00",
+                "validated_at": "2026-02-08T10:00:00+00:00",
+                "years": [2026],
+                "types": ["Run"],
+                "type_meta": {"Run": {"label": "Run", "accent": "#3fa8ff"}},
+                "other_bucket": "OtherSports",
+                "aggregates": {},
+                "units": {"distance": "mi", "elevation": "ft"},
+                "week_start": "sunday",
+                "activities": [
+                    {
+                        "date": "2026-02-08",
+                        "year": 2026,
+                        "type": "Run",
+                        "raw_type": "Run",
+                        "start_date_local": "2026-02-08T10:00:00+00:00",
+                        "hour": 10,
+                        "url": "https://www.strava.com/activities/1001",
+                    }
+                ],
+                "latest_activity_id": "1001",
+                "latest_activity_start_date": "2026-02-08T10:00:00+00:00",
+                "intervals": {"enabled": False, "records": 0, "matched_activities": 0},
+                "intervals_year_type_metrics": {},
+            }
+            write_json(data_path, legacy_cached_payload)
+            full_payload = dict(legacy_cached_payload)
+            full_payload["activities"] = []
+            full_payload["latest_activity_id"] = "1002"
+
+            with mock.patch(
+                "chronicle.dashboard_data._fetch_latest_activity_marker",
+                return_value=("1002", "2026-02-09T10:00:00+00:00"),
+            ), mock.patch(
+                "chronicle.dashboard_data.build_dashboard_payload",
+                return_value=full_payload,
+            ) as build_payload:
+                refreshed = dashboard_data._smart_revalidate_payload(settings, data_path, legacy_cached_payload)
+
+            build_payload.assert_called_once()
+            self.assertEqual(refreshed.get("latest_activity_id"), "1002")
+
 
 if __name__ == "__main__":
     unittest.main()

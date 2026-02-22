@@ -127,12 +127,16 @@ class TestDashboardPayloadContract(unittest.TestCase):
             self.assertIsInstance(payload["activities"], list)
             self.assertEqual(len(payload["activities"]), 2)
             for activity in payload["activities"]:
+                self.assertIsInstance(activity.get("id"), str)
                 self.assertRegex(str(activity.get("date")), r"^\d{4}-\d{2}-\d{2}$")
                 self.assertIsInstance(activity.get("year"), int)
                 self.assertIsInstance(activity.get("type"), str)
                 self.assertIsInstance(activity.get("raw_type"), str)
                 self.assertIsInstance(activity.get("start_date_local"), str)
                 self.assertIsInstance(activity.get("hour"), int)
+                self.assertIsInstance(activity.get("distance"), float)
+                self.assertIsInstance(activity.get("moving_time"), float)
+                self.assertIsInstance(activity.get("elevation_gain"), float)
                 self.assertTrue(str(activity.get("url", "")).startswith("https://www.strava.com/activities/"))
 
 

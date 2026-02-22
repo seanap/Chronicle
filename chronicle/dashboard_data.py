@@ -17,7 +17,7 @@ from .storage import (
     acquire_runtime_lock,
     read_json,
     release_runtime_lock,
-    set_runtime_value,
+    set_runtime_values,
     write_json,
 )
 from .strava_client import MAX_ACTIVITY_PAGES, StravaClient
@@ -34,6 +34,7 @@ DEFAULT_OTHER_BUCKET = "OtherSports"
 DEFAULT_HISTORY_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
 DEFAULT_REFRESH_LOCK_TTL_SECONDS = 300
 DEFAULT_INTERVALS_INCREMENTAL_OVERLAP_HOURS = 48
+DEFAULT_STRAVA_INCREMENTAL_OVERLAP_HOURS = 48
 INTERVALS_CACHE_SCHEMA_VERSION = 1
 REFRESH_LOCK_NAME = "dashboard.refresh"
 
@@ -206,6 +207,17 @@ def _intervals_incremental_overlap_hours() -> int:
         value = int(raw)
     except ValueError:
         value = DEFAULT_INTERVALS_INCREMENTAL_OVERLAP_HOURS
+    return max(1, min(336, value))
+
+
+def _strava_incremental_overlap_hours() -> int:
+    raw = str(
+        os.getenv("DASHBOARD_STRAVA_INCREMENTAL_OVERLAP_HOURS", DEFAULT_STRAVA_INCREMENTAL_OVERLAP_HOURS)
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_STRAVA_INCREMENTAL_OVERLAP_HOURS
     return max(1, min(336, value))
 
 
@@ -554,45 +566,103 @@ def _normalize_activity(item: dict[str, Any]) -> dict[str, Any] | None:
     return normalized
 
 
-def build_dashboard_payload(
-    settings: Settings,
-    *,
-    latest_marker: tuple[str | None, str | None] | None = None,
-) -> dict[str, Any]:
-    client = StravaClient(settings)
-    after_dt = _dashboard_history_start()
-    raw_activities = client.get_activities_after(after_dt, per_page=200)
-    marker = latest_marker
-    if marker is None:
-        derived_id: str | None = None
-        derived_start: str | None = None
-        if raw_activities and isinstance(raw_activities[0], dict):
-            first = raw_activities[0]
-            raw_id = first.get("id")
-            derived_id = str(raw_id).strip() if raw_id is not None else None
-            raw_start = first.get("start_date") or first.get("start_date_local")
-            derived_start = str(raw_start).strip() if raw_start is not None else None
-        marker = (derived_id or None, derived_start or None)
-        if marker == (None, None):
-            marker = _fetch_latest_activity_marker(settings)
+def _activity_id_from_url(url: object) -> str | None:
+    text = str(url or "").strip()
+    if not text:
+        return None
+    match = re.search(r"/activities/(\d+)$", text)
+    if not match:
+        return None
+    return match.group(1)
 
+
+def _normalize_cached_activity(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    raw_id = item.get("id")
+    activity_id = str(raw_id).strip() if raw_id not in {None, ""} else ""
+    if not activity_id:
+        activity_id = str(_activity_id_from_url(item.get("url")) or "").strip()
+    if not activity_id:
+        return None
+
+    parsed_start = _parse_iso_datetime(item.get("start_date_local"))
+    if parsed_start is None:
+        return None
+
+    type_name = _canonical_type(item.get("type") or item.get("raw_type"))
+    raw_type = str(item.get("raw_type") or item.get("type") or type_name)
+    normalized: dict[str, Any] = {
+        "id": activity_id,
+        "date": parsed_start.strftime("%Y-%m-%d"),
+        "year": int(parsed_start.year),
+        "type": type_name,
+        "raw_type": raw_type,
+        "start_date_local": str(item.get("start_date_local") or ""),
+        "_start_minute_key": parsed_start.replace(second=0, microsecond=0).isoformat(),
+        "hour": int(item.get("hour")) if isinstance(item.get("hour"), int) else int(parsed_start.hour),
+        "distance": _as_float(item.get("distance")),
+        "moving_time": _as_float(item.get("moving_time")),
+        "elevation_gain": _as_float(item.get("elevation_gain")),
+        "url": str(item.get("url") or _activity_url(activity_id)),
+    }
+    name = str(item.get("name") or "").strip()
+    if name:
+        normalized["name"] = name
+    for metric_key in ("avg_pace_mps", "avg_efficiency_factor", "avg_fitness", "avg_fatigue"):
+        metric_value = _as_optional_float(item.get(metric_key))
+        if metric_value is not None:
+            normalized[metric_key] = metric_value
+    moving_time_seconds = _as_optional_float(item.get("_intervals_moving_time_seconds"))
+    if moving_time_seconds is not None and moving_time_seconds > 0:
+        normalized["_intervals_moving_time_seconds"] = moving_time_seconds
+    return normalized
+
+
+def _cached_activities_support_incremental(cached_payload: dict[str, Any]) -> bool:
+    activities_raw = cached_payload.get("activities")
+    if not isinstance(activities_raw, list):
+        return False
+    if not activities_raw:
+        return True
+    first = activities_raw[0]
+    if not isinstance(first, dict):
+        return False
+    required = {"start_date_local", "distance", "moving_time", "elevation_gain"}
+    return required.issubset(first.keys())
+
+
+def _normalized_activities_from_payload(cached_payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    if not _cached_activities_support_incremental(cached_payload):
+        return None
+    activities_raw = cached_payload.get("activities")
+    if not isinstance(activities_raw, list):
+        return None
     deduped_by_id: dict[str, dict[str, Any]] = {}
-    for raw in raw_activities:
-        if not isinstance(raw, dict):
-            continue
-        normalized = _normalize_activity(raw)
+    for item in activities_raw:
+        normalized = _normalize_cached_activity(item) if isinstance(item, dict) else None
         if normalized is None:
-            continue
+            return None
         deduped_by_id[normalized["id"]] = normalized
-
-    activities = sorted(
+    return sorted(
         deduped_by_id.values(),
-        key=lambda item: (str(item["date"]), str(item["id"])),
+        key=lambda value: (str(value["date"]), str(value["id"])),
     )
+
+
+def _build_payload_from_activities(
+    settings: Settings,
+    activities: list[dict[str, Any]],
+    *,
+    marker: tuple[str | None, str | None],
+    history_truncated: bool = False,
+) -> dict[str, Any]:
+    activities_copy = [dict(item) for item in activities]
 
     intervals_records: list[dict[str, Any]] = []
     intervals_sync: dict[str, Any] = {}
     intervals_matches = 0
+    after_dt = _dashboard_history_start()
     if (
         settings.enable_intervals
         and isinstance(settings.intervals_user_id, str)
@@ -607,7 +677,7 @@ def build_dashboard_payload(
         )
     intervals_by_id, intervals_by_minute = _index_intervals_metrics(intervals_records)
     if intervals_by_id or intervals_by_minute:
-        for activity in activities:
+        for activity in activities_copy:
             matched = intervals_by_id.get(str(activity["id"])) or intervals_by_minute.get(
                 str(activity.get("_start_minute_key") or "")
             )
@@ -638,7 +708,7 @@ def build_dashboard_payload(
     type_totals: dict[str, int] = defaultdict(int)
     years_seen: set[int] = set()
 
-    for activity in activities:
+    for activity in activities_copy:
         year = int(activity["year"])
         years_seen.add(year)
         year_key = str(year)
@@ -727,12 +797,16 @@ def build_dashboard_payload(
         "week_start": week_start,
         "activities": [
             {
+                "id": item["id"],
                 "date": item["date"],
                 "year": item["year"],
                 "type": item["type"],
                 "raw_type": item["raw_type"],
                 "start_date_local": item["start_date_local"],
                 "hour": item["hour"],
+                "distance": float(item.get("distance") or 0.0),
+                "moving_time": float(item.get("moving_time") or 0.0),
+                "elevation_gain": float(item.get("elevation_gain") or 0.0),
                 "url": item["url"],
                 **({"name": item["name"]} if "name" in item else {}),
                 **({"avg_pace_mps": item["avg_pace_mps"]} if "avg_pace_mps" in item else {}),
@@ -743,8 +817,13 @@ def build_dashboard_payload(
                 ),
                 **({"avg_fitness": item["avg_fitness"]} if "avg_fitness" in item else {}),
                 **({"avg_fatigue": item["avg_fatigue"]} if "avg_fatigue" in item else {}),
+                **(
+                    {"_intervals_moving_time_seconds": item["_intervals_moving_time_seconds"]}
+                    if "_intervals_moving_time_seconds" in item
+                    else {}
+                ),
             }
-            for item in activities
+            for item in activities_copy
         ],
     }
 
@@ -763,8 +842,7 @@ def build_dashboard_payload(
     if repo and "/" in repo:
         payload["repo"] = repo
 
-    page_cap = MAX_ACTIVITY_PAGES * 200
-    if len(raw_activities) >= page_cap:
+    if history_truncated:
         payload["history_truncated"] = True
 
     payload["intervals"] = {
@@ -787,6 +865,102 @@ def build_dashboard_payload(
     }
     payload["intervals_year_type_metrics"] = intervals_year_type_metrics
 
+    return payload
+
+
+def build_dashboard_payload(
+    settings: Settings,
+    *,
+    latest_marker: tuple[str | None, str | None] | None = None,
+) -> dict[str, Any]:
+    client = StravaClient(settings)
+    after_dt = _dashboard_history_start()
+    raw_activities = client.get_activities_after(after_dt, per_page=200)
+    marker = latest_marker
+    if marker is None:
+        derived_id: str | None = None
+        derived_start: str | None = None
+        if raw_activities and isinstance(raw_activities[0], dict):
+            first = raw_activities[0]
+            raw_id = first.get("id")
+            derived_id = str(raw_id).strip() if raw_id is not None else None
+            raw_start = first.get("start_date") or first.get("start_date_local")
+            derived_start = str(raw_start).strip() if raw_start is not None else None
+        marker = (derived_id or None, derived_start or None)
+        if marker == (None, None):
+            marker = _fetch_latest_activity_marker(settings)
+
+    deduped_by_id: dict[str, dict[str, Any]] = {}
+    for raw in raw_activities:
+        if not isinstance(raw, dict):
+            continue
+        normalized = _normalize_activity(raw)
+        if normalized is None:
+            continue
+        deduped_by_id[normalized["id"]] = normalized
+
+    activities = sorted(
+        deduped_by_id.values(),
+        key=lambda item: (str(item["date"]), str(item["id"])),
+    )
+    page_cap = MAX_ACTIVITY_PAGES * 200
+    return _build_payload_from_activities(
+        settings,
+        activities,
+        marker=marker,
+        history_truncated=len(raw_activities) >= page_cap,
+    )
+
+
+def _build_incremental_payload_from_cache(
+    settings: Settings,
+    cached_payload: dict[str, Any],
+    *,
+    latest_marker: tuple[str | None, str | None],
+) -> dict[str, Any] | None:
+    cached_activities = _normalized_activities_from_payload(cached_payload)
+    if cached_activities is None:
+        return None
+
+    latest_id, latest_start = latest_marker
+    latest_start_dt = _parse_iso_datetime(latest_start)
+    if latest_start_dt is None:
+        return None
+
+    history_start = _dashboard_history_start()
+    overlap = timedelta(hours=_strava_incremental_overlap_hours())
+    fetch_after = latest_start_dt - overlap
+    if fetch_after < history_start:
+        fetch_after = history_start
+
+    client = StravaClient(settings)
+    raw_recent = client.get_activities_after(fetch_after, per_page=200)
+    deduped_by_id: dict[str, dict[str, Any]] = {item["id"]: item for item in cached_activities}
+    for raw in raw_recent:
+        if not isinstance(raw, dict):
+            continue
+        normalized = _normalize_activity(raw)
+        if normalized is None:
+            continue
+        deduped_by_id[normalized["id"]] = normalized
+
+    if latest_id and latest_id not in deduped_by_id:
+        return None
+
+    merged_activities = sorted(
+        deduped_by_id.values(),
+        key=lambda value: (str(value["date"]), str(value["id"])),
+    )
+    history_truncated = bool(cached_payload.get("history_truncated"))
+    payload = _build_payload_from_activities(
+        settings,
+        merged_activities,
+        marker=latest_marker,
+        history_truncated=history_truncated,
+    )
+    payload["sync_mode"] = "incremental"
+    payload["sync_fetch_after"] = fetch_after.isoformat()
+    payload["sync_fetched_records"] = int(len(raw_recent))
     return payload
 
 
@@ -858,6 +1032,14 @@ def _smart_revalidate_payload(settings: Settings, data_path: Path, cached_payloa
         touched = _touch_cached_payload_validation(cached_payload, latest_marker)
         write_json(data_path, touched)
         return touched
+    incremental = _build_incremental_payload_from_cache(
+        settings,
+        cached_payload,
+        latest_marker=latest_marker,
+    )
+    if isinstance(incremental, dict):
+        write_json(data_path, incremental)
+        return incremental
     return _build_and_persist_payload(settings, data_path, latest_marker=latest_marker)
 
 
@@ -876,30 +1058,53 @@ def _run_background_refresh(settings: Settings, *, reason: str) -> None:
     try:
         data_path = dashboard_data_path(settings)
         cached = read_json(data_path)
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.state", "running")
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.reason", reason)
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.started_at_utc", _now_iso())
+        set_runtime_values(
+            settings.processed_log_file,
+            {
+                "dashboard.refresh.state": "running",
+                "dashboard.refresh.reason": reason,
+                "dashboard.refresh.started_at_utc": _now_iso(),
+            },
+        )
 
         if isinstance(cached, dict):
             refreshed = _smart_revalidate_payload(settings, data_path, cached)
             latest_id, _latest_start = _payload_latest_marker(refreshed)
-            set_runtime_value(
+            set_runtime_values(
                 settings.processed_log_file,
-                "dashboard.refresh.result",
-                "validated_unchanged" if latest_id and latest_id == _payload_latest_marker(cached)[0] else "rebuilt",
+                {
+                    "dashboard.refresh.result": (
+                        "validated_unchanged" if latest_id and latest_id == _payload_latest_marker(cached)[0] else "rebuilt"
+                    )
+                },
             )
         else:
             _build_and_persist_payload(settings, data_path)
-            set_runtime_value(settings.processed_log_file, "dashboard.refresh.result", "rebuilt")
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.last_success_at_utc", _now_iso())
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.last_error", "")
+            set_runtime_values(settings.processed_log_file, {"dashboard.refresh.result": "rebuilt"})
+        set_runtime_values(
+            settings.processed_log_file,
+            {
+                "dashboard.refresh.last_success_at_utc": _now_iso(),
+                "dashboard.refresh.last_error": "",
+            },
+        )
     except Exception as exc:
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.last_error", str(exc))
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.last_error_at_utc", _now_iso())
+        set_runtime_values(
+            settings.processed_log_file,
+            {
+                "dashboard.refresh.last_error": str(exc),
+                "dashboard.refresh.last_error_at_utc": _now_iso(),
+            },
+        )
         logger.warning("Background dashboard refresh failed (%s): %s", reason, exc)
     finally:
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.state", "idle")
-        set_runtime_value(settings.processed_log_file, "dashboard.refresh.finished_at_utc", _now_iso())
+        set_runtime_values(
+            settings.processed_log_file,
+            {
+                "dashboard.refresh.state": "idle",
+                "dashboard.refresh.finished_at_utc": _now_iso(),
+            },
+        )
         release_runtime_lock(
             settings.processed_log_file,
             lock_name=REFRESH_LOCK_NAME,

@@ -5,9 +5,10 @@ import hashlib
 import json
 import logging
 import math
+import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -44,6 +45,7 @@ from .storage import (
     enqueue_activity_job,
     get_runtime_lock_owner,
     get_runtime_value,
+    get_runtime_values,
     is_activity_processed,
     mark_activity_processed,
     record_activity_output,
@@ -51,6 +53,7 @@ from .storage import (
     release_runtime_lock,
     start_activity_job_run,
     set_runtime_value,
+    set_runtime_values,
     write_config_snapshot,
     write_json,
 )
@@ -60,6 +63,10 @@ from .strava_client import StravaClient, get_gap_speed_mps, mps_to_pace
 
 
 logger = logging.getLogger(__name__)
+
+
+PERIOD_STATS_ACTIVITIES_CACHE_KEY = "cycle.period_stats.activities_cache"
+DEFAULT_STRAVA_PERIOD_STATS_INCREMENTAL_OVERLAP_HOURS = 48
 
 
 def _configure_logging(level: str) -> None:
@@ -77,19 +84,22 @@ def _record_cycle_status(
     activity_id: int | None = None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
-    set_runtime_value(settings.processed_log_file, "cycle.last_status", status)
-    set_runtime_value(settings.processed_log_file, "cycle.last_status_at_utc", now_iso)
+    updates: dict[str, Any] = {
+        "cycle.last_status": status,
+        "cycle.last_status_at_utc": now_iso,
+    }
     if activity_id is not None:
-        set_runtime_value(settings.processed_log_file, "cycle.last_activity_id", activity_id)
+        updates["cycle.last_activity_id"] = activity_id
     if status in {"updated", "already_processed", "no_activities"}:
-        set_runtime_value(settings.processed_log_file, "cycle.last_success_at_utc", now_iso)
+        updates["cycle.last_success_at_utc"] = now_iso
         if error:
-            set_runtime_value(settings.processed_log_file, "cycle.last_error", error)
+            updates["cycle.last_error"] = error
         else:
             delete_runtime_value(settings.processed_log_file, "cycle.last_error")
     elif error:
-        set_runtime_value(settings.processed_log_file, "cycle.last_error", error)
-        set_runtime_value(settings.processed_log_file, "cycle.last_error_at_utc", now_iso)
+        updates["cycle.last_error"] = error
+        updates["cycle.last_error_at_utc"] = now_iso
+    set_runtime_values(settings.processed_log_file, updates)
 
 
 def _persist_cycle_service_state(settings: Settings, service_state: dict[str, Any] | None) -> None:
@@ -143,13 +153,38 @@ def _service_cycle_bucket(service_state: dict[str, Any] | None, service_name: st
 
 
 def _service_counter_inc(settings: Settings, service_name: str, key_suffix: str, by: int = 1) -> None:
-    runtime_key = _service_key(service_name, key_suffix)
-    current = get_runtime_value(settings.processed_log_file, runtime_key, 0)
-    try:
-        current_val = int(current)
-    except (TypeError, ValueError):
-        current_val = 0
-    set_runtime_value(settings.processed_log_file, runtime_key, current_val + int(by))
+    updates = _service_counter_updates(settings, service_name, {key_suffix: by})
+    if updates:
+        set_runtime_values(settings.processed_log_file, updates)
+
+
+def _service_counter_updates(
+    settings: Settings,
+    service_name: str,
+    increments: dict[str, int],
+) -> dict[str, int]:
+    runtime_increments: dict[str, int] = {}
+    for key_suffix, by in increments.items():
+        try:
+            delta = int(by)
+        except (TypeError, ValueError):
+            continue
+        if delta == 0:
+            continue
+        runtime_increments[_service_key(service_name, key_suffix)] = delta
+    if not runtime_increments:
+        return {}
+
+    existing = get_runtime_values(settings.processed_log_file, list(runtime_increments.keys()))
+    updates: dict[str, int] = {}
+    for runtime_key, delta in runtime_increments.items():
+        current = existing.get(runtime_key, 0)
+        try:
+            current_val = int(current)
+        except (TypeError, ValueError):
+            current_val = 0
+        updates[runtime_key] = current_val + delta
+    return updates
 
 
 def _record_service_status(
@@ -160,39 +195,25 @@ def _record_service_status(
     duration_ms: int | None = None,
     error: str | None = None,
 ) -> None:
-    _service_counter_inc(settings, service_name, "events_total", 1)
-    _service_counter_inc(settings, service_name, f"events.{status}", 1)
-    set_runtime_value(
-        settings.processed_log_file,
-        _service_key(service_name, "last_status"),
-        status,
-    )
+    increments: dict[str, int] = {
+        "events_total": 1,
+        f"events.{status}": 1,
+    }
     now_iso = datetime.now(timezone.utc).isoformat()
-    set_runtime_value(
-        settings.processed_log_file,
-        _service_key(service_name, "last_status_at_utc"),
-        now_iso,
-    )
+    updates: dict[str, Any] = {
+        _service_key(service_name, "last_status"): status,
+        _service_key(service_name, "last_status_at_utc"): now_iso,
+    }
     if duration_ms is not None:
         duration_value = max(0, int(duration_ms))
-        _service_counter_inc(settings, service_name, "duration_count", 1)
-        _service_counter_inc(settings, service_name, "duration_total_ms", duration_value)
-        set_runtime_value(
-            settings.processed_log_file,
-            _service_key(service_name, "last_duration_ms"),
-            duration_value,
-        )
+        increments["duration_count"] = 1
+        increments["duration_total_ms"] = duration_value
+        updates[_service_key(service_name, "last_duration_ms")] = duration_value
     if error:
-        set_runtime_value(
-            settings.processed_log_file,
-            _service_key(service_name, "last_error"),
-            error,
-        )
-        set_runtime_value(
-            settings.processed_log_file,
-            _service_key(service_name, "last_error_at_utc"),
-            now_iso,
-        )
+        updates[_service_key(service_name, "last_error")] = error
+        updates[_service_key(service_name, "last_error_at_utc")] = now_iso
+    updates.update(_service_counter_updates(settings, service_name, increments))
+    set_runtime_values(settings.processed_log_file, updates)
 
 
 def _service_cache_runtime_key(service_name: str, cache_key: str) -> str:
@@ -277,18 +298,26 @@ def _set_service_cooldown(settings: Settings, service_name: str, failure_count: 
         settings.service_cooldown_max_seconds,
     )
     cooldown_until = datetime.now(timezone.utc).timestamp() + delay
-    set_runtime_value(
+    set_runtime_values(
         settings.processed_log_file,
-        _service_key(service_name, "cooldown_until_utc"),
-        datetime.fromtimestamp(cooldown_until, tz=timezone.utc).isoformat(),
+        {
+            _service_key(service_name, "cooldown_until_utc"): datetime.fromtimestamp(
+                cooldown_until, tz=timezone.utc
+            ).isoformat(),
+        },
     )
     return delay
 
 
 def _reset_service_cooldown(settings: Settings, service_name: str) -> None:
     delete_runtime_value(settings.processed_log_file, _service_key(service_name, "cooldown_until_utc"))
-    set_runtime_value(settings.processed_log_file, _service_key(service_name, "failures"), 0)
-    set_runtime_value(settings.processed_log_file, _service_key(service_name, "last_success_utc"), datetime.now(timezone.utc).isoformat())
+    set_runtime_values(
+        settings.processed_log_file,
+        {
+            _service_key(service_name, "failures"): 0,
+            _service_key(service_name, "last_success_utc"): datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def _run_service_call(
@@ -1875,6 +1904,268 @@ def _resolve_cycle_time_context(settings: Settings) -> tuple[timezone | ZoneInfo
     return local_tz, now_local, now_utc, year_start_utc
 
 
+def _strava_period_stats_incremental_overlap_hours() -> int:
+    raw = str(
+        os.getenv(
+            "STRAVA_PERIOD_STATS_INCREMENTAL_OVERLAP_HOURS",
+            str(DEFAULT_STRAVA_PERIOD_STATS_INCREMENTAL_OVERLAP_HOURS),
+        )
+    ).strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_STRAVA_PERIOD_STATS_INCREMENTAL_OVERLAP_HOURS
+    return max(1, min(parsed, 24 * 14))
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_period_stats_activity(activity: dict[str, Any]) -> dict[str, Any] | None:
+    raw_id = activity.get("id")
+    if raw_id is None:
+        return None
+    activity_id = str(raw_id).strip()
+    if not activity_id:
+        return None
+
+    start_date_raw = activity.get("start_date") or activity.get("start_date_local")
+    if not isinstance(start_date_raw, str) or not start_date_raw.strip():
+        return None
+    start_date = start_date_raw.strip()
+    if _parse_utc_datetime(start_date) is None:
+        return None
+
+    raw_type = activity.get("sport_type")
+    if not isinstance(raw_type, str) or not raw_type.strip():
+        raw_type = activity.get("type")
+    activity_type = str(raw_type or "Unknown").strip() or "Unknown"
+
+    normalized: dict[str, Any] = {
+        "id": activity_id,
+        "start_date": start_date,
+        "sport_type": activity_type,
+        "type": activity_type,
+        "distance": float(_as_float(activity.get("distance")) or 0.0),
+        "moving_time": float(_as_float(activity.get("moving_time")) or 0.0),
+        "calories": float(_as_float(activity.get("calories")) or 0.0),
+    }
+    average_speed = _as_float(activity.get("average_speed"))
+    if average_speed is not None and average_speed > 0:
+        normalized["average_speed"] = float(average_speed)
+    gap_speed = _as_float(activity.get("average_grade_adjusted_speed"))
+    if gap_speed is not None and gap_speed > 0:
+        normalized["average_grade_adjusted_speed"] = float(gap_speed)
+    legacy_gap_speed = _as_float(activity.get("avgGradeAdjustedSpeed"))
+    if legacy_gap_speed is not None and legacy_gap_speed > 0:
+        normalized["avgGradeAdjustedSpeed"] = float(legacy_gap_speed)
+    return normalized
+
+
+def _filter_period_stats_history(
+    activities: list[dict[str, Any]],
+    *,
+    year_start_utc: datetime,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for item in activities:
+        start_utc = _parse_utc_datetime(item.get("start_date"))
+        if start_utc is None or start_utc < year_start_utc:
+            continue
+        filtered.append(item)
+    return sorted(filtered, key=lambda value: (str(value.get("start_date")), str(value.get("id"))))
+
+
+def _normalize_period_stats_activities(
+    raw_activities: list[dict[str, Any]],
+    *,
+    year_start_utc: datetime,
+) -> list[dict[str, Any]]:
+    deduped_by_id: dict[str, dict[str, Any]] = {}
+    for raw in raw_activities:
+        if not isinstance(raw, dict):
+            continue
+        normalized = _normalize_period_stats_activity(raw)
+        if normalized is None:
+            continue
+        deduped_by_id[normalized["id"]] = normalized
+    return _filter_period_stats_history(list(deduped_by_id.values()), year_start_utc=year_start_utc)
+
+
+def _period_stats_cache_marker(cache_payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    raw_id = cache_payload.get("latest_activity_id")
+    raw_start = cache_payload.get("latest_activity_start_date")
+    marker_id = str(raw_id).strip() if raw_id is not None else ""
+    marker_start = str(raw_start).strip() if raw_start is not None else ""
+    return marker_id or None, marker_start or None
+
+
+def _load_period_stats_cached_activities(
+    settings: Settings,
+    *,
+    year_start_utc: datetime,
+) -> tuple[list[dict[str, Any]] | None, tuple[str | None, str | None], int]:
+    cached = get_runtime_value(settings.processed_log_file, PERIOD_STATS_ACTIVITIES_CACHE_KEY)
+    if not isinstance(cached, dict):
+        return None, (None, None), 0
+    expected_year_start = year_start_utc.isoformat()
+    if str(cached.get("year_start_utc") or "").strip() != expected_year_start:
+        return None, _period_stats_cache_marker(cached), 0
+    activities_raw = cached.get("activities")
+    if not isinstance(activities_raw, list):
+        return None, _period_stats_cache_marker(cached), 0
+    normalized = _normalize_period_stats_activities(activities_raw, year_start_utc=year_start_utc)
+    return normalized, _period_stats_cache_marker(cached), len(activities_raw)
+
+
+def _save_period_stats_cache(
+    settings: Settings,
+    *,
+    year_start_utc: datetime,
+    latest_marker: tuple[str | None, str | None],
+    activities: list[dict[str, Any]],
+) -> None:
+    latest_id, latest_start = latest_marker
+    payload = {
+        "year_start_utc": year_start_utc.isoformat(),
+        "latest_activity_id": latest_id or "",
+        "latest_activity_start_date": latest_start or "",
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "activities": activities,
+    }
+    set_runtime_value(settings.processed_log_file, PERIOD_STATS_ACTIVITIES_CACHE_KEY, payload)
+
+
+def _fetch_period_stats_activities_full(
+    settings: Settings,
+    strava_client: StravaClient,
+    *,
+    year_start_utc: datetime,
+    latest_marker: tuple[str | None, str | None],
+    service_state: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw = _run_required_call(
+        settings,
+        "strava.get_activities_after",
+        strava_client.get_activities_after,
+        year_start_utc,
+        service_state=service_state,
+    )
+    activities = _normalize_period_stats_activities(raw, year_start_utc=year_start_utc)
+    _save_period_stats_cache(
+        settings,
+        year_start_utc=year_start_utc,
+        latest_marker=latest_marker,
+        activities=activities,
+    )
+    return activities, {
+        "mode": "full",
+        "fetched_records": int(len(raw)),
+        "cached_records": int(len(activities)),
+    }
+
+
+def _get_period_stats_activities(
+    settings: Settings,
+    strava_client: StravaClient,
+    *,
+    year_start_utc: datetime,
+    latest_marker: tuple[str | None, str | None],
+    service_state: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    latest_id, latest_start = latest_marker
+    cached_activities, cached_marker, cached_count = _load_period_stats_cached_activities(
+        settings,
+        year_start_utc=year_start_utc,
+    )
+    cached_latest_id, _cached_latest_start = cached_marker
+
+    if cached_activities is not None and latest_id and latest_id == cached_latest_id:
+        return cached_activities, {
+            "mode": "cache_hit",
+            "fetched_records": 0,
+            "cached_records": int(len(cached_activities)),
+        }
+
+    if cached_activities is None:
+        return _fetch_period_stats_activities_full(
+            settings,
+            strava_client,
+            year_start_utc=year_start_utc,
+            latest_marker=latest_marker,
+            service_state=service_state,
+        )
+
+    latest_start_utc = _parse_utc_datetime(latest_start)
+    if not latest_id or latest_start_utc is None:
+        return _fetch_period_stats_activities_full(
+            settings,
+            strava_client,
+            year_start_utc=year_start_utc,
+            latest_marker=latest_marker,
+            service_state=service_state,
+        )
+
+    overlap_hours = _strava_period_stats_incremental_overlap_hours()
+    fetch_after = latest_start_utc - timedelta(hours=overlap_hours)
+    if fetch_after < year_start_utc:
+        fetch_after = year_start_utc
+
+    raw_recent = _run_required_call(
+        settings,
+        "strava.get_activities_after",
+        strava_client.get_activities_after,
+        fetch_after,
+        service_state=service_state,
+    )
+    merged_by_id: dict[str, dict[str, Any]] = {item["id"]: dict(item) for item in cached_activities}
+    for raw in raw_recent:
+        if not isinstance(raw, dict):
+            continue
+        normalized = _normalize_period_stats_activity(raw)
+        if normalized is None:
+            continue
+        merged_by_id[normalized["id"]] = normalized
+
+    merged_activities = _filter_period_stats_history(
+        list(merged_by_id.values()),
+        year_start_utc=year_start_utc,
+    )
+    if latest_id not in merged_by_id:
+        full_activities, full_sync = _fetch_period_stats_activities_full(
+            settings,
+            strava_client,
+            year_start_utc=year_start_utc,
+            latest_marker=latest_marker,
+            service_state=service_state,
+        )
+        full_sync["fallback_reason"] = "incremental_missing_latest_marker"
+        return full_activities, full_sync
+
+    _save_period_stats_cache(
+        settings,
+        year_start_utc=year_start_utc,
+        latest_marker=latest_marker,
+        activities=merged_activities,
+    )
+    return merged_activities, {
+        "mode": "incremental",
+        "fetch_after": fetch_after.isoformat(),
+        "fetched_records": int(len(raw_recent)),
+        "cached_records": int(cached_count),
+        "merged_records": int(len(merged_activities)),
+    }
+
+
 def _select_strava_activity(
     settings: Settings,
     activities: list[dict[str, Any]],
@@ -2257,11 +2548,15 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
 
         _local_tz, now_local, now_utc, year_start = _resolve_cycle_time_context(settings)
 
-        strava_activities = _run_required_call(
+        latest_marker = (
+            str(latest.get("id")).strip() if latest.get("id") is not None else None,
+            str(latest.get("start_date") or latest.get("start_date_local") or "").strip() or None,
+        )
+        strava_activities, period_stats_sync = _get_period_stats_activities(
             settings,
-            "strava.get_activities_after",
-            strava_client.get_activities_after,
-            year_start,
+            strava_client,
+            year_start_utc=year_start,
+            latest_marker=latest_marker,
             service_state=service_state,
         )
 
@@ -2412,6 +2707,7 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             "description": description,
             "source": "standard",
             "period_stats": period_summaries,
+            "period_stats_sync": period_stats_sync,
             "weather": weather_details,
             "template_context": description_context,
             "service_calls": service_state,
