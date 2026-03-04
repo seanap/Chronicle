@@ -35,3 +35,8 @@ android/captures/
 chronicle-ui/node_modules/
 chronicle-ui/dist/
 chronicle-ui/coverage/
+
+# Local AI/dev orchestration artifacts
+.codex/
+_bmad*/
+tests/

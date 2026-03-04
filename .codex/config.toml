@@ -1,4 +1,0 @@
-model = "gpt-5.3-codex"
-model_reasoning_effort = "xhigh"
-[projects."/home/shipyard/src/Auto-Stat-Description"]
-trust_level = "trusted"
