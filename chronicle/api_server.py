@@ -877,7 +877,7 @@ def sources_page():
 
 @app.get("/")
 def landing_page():
-    return redirect("/dashboard", code=302)
+    return redirect("/view", code=302)
 
 
 @app.get("/dashboard")

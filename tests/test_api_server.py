@@ -149,10 +149,10 @@ class TestApiServer(unittest.TestCase):
         response = self.client.get("/setup")
         self.assertEqual(response.status_code, 200)
 
-    def test_root_redirects_to_dashboard(self) -> None:
+    def test_root_redirects_to_view(self) -> None:
         response = self.client.get("/", follow_redirects=False)
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(response.headers.get("Location"), "/dashboard")
+        self.assertEqual(response.headers.get("Location"), "/view")
 
     def test_dashboard_page_endpoint(self) -> None:
         response = self.client.get("/dashboard")

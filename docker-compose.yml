@@ -34,6 +34,7 @@ services:
       - .env
     environment:
       - SETUP_ENV_FILE=/app/.env
+      - UI_ROLLOUT_DEFAULT_MODE=${UI_ROLLOUT_DEFAULT_MODE:-spa}
     volumes:
       - ./data:/app/state
       - ./.env:/app/.env
