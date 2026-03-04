@@ -39,4 +39,10 @@ chronicle-ui/coverage/
 # Local AI/dev orchestration artifacts
 .codex/
 _bmad*/
-tests/
+
+# Python test/coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

@@ -31,11 +31,11 @@ jobs:
 
       - name: Run unit tests
         run: |
-          if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then
-            python -m unittest discover -s tests -p "test_*.py" -v
-          else
-            echo "No repository tests found; skipping unit tests."
+          if [ ! -d tests ] || ! ls tests/test_*.py >/dev/null 2>&1; then
+            echo "Required test suite is missing from repository."
+            exit 1
           fi
+          python -m unittest discover -s tests -p "test_*.py" -v
 
   docker:
     runs-on: ubuntu-latest

@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import os
+import unittest
+from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from chronicle.plan_data import METERS_PER_MILE, get_plan_payload
+
+
+def _settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        timezone="UTC",
+        processed_log_file=Path("/tmp/plan_test_runtime.log"),
+    )
+
+
+def _miles_to_meters(value: float) -> float:
+    return value * METERS_PER_MILE
+
+
+class TestPlanData(unittest.TestCase):
+    def test_get_plan_payload_uses_actual_for_past_and_planned_for_future(self) -> None:
+        payload = get_plan_payload(
+            _settings(),
+            center_date="2026-02-22",
+            window_days=7,
+            today_local=date(2026, 2, 22),
+            dashboard_payload={
+                "activities": [
+                    {"date": "2026-02-16", "type": "Run", "distance": _miles_to_meters(7.2)},
+                    {"date": "2026-02-17", "type": "Run", "distance": _miles_to_meters(9.0)},
+                    {"date": "2026-02-18", "type": "Run", "distance": _miles_to_meters(7.1)},
+                    {"date": "2026-02-19", "type": "Run", "distance": _miles_to_meters(4.5)},
+                    {"date": "2026-02-20", "type": "Run", "distance": _miles_to_meters(4.5)},
+                    {"date": "2026-02-21", "type": "Run", "distance": _miles_to_meters(13.1)},
+                    {"date": "2026-02-19", "type": "Ride", "distance": _miles_to_meters(60.0)},
+                ]
+            },
+            plan_day_rows=[
+                {
+                    "date_local": "2026-02-22",
+                    "run_type": "Easy",
+                    "planned_total_miles": 6.2,
+                    "is_complete": False,
+                },
+                {
+                    "date_local": "2026-02-23",
+                    "run_type": "Recovery",
+                    "planned_total_miles": 3.5,
+                    "is_complete": False,
+                },
+            ],
+        )
+
+        rows = payload["rows"]
+        by_date = {str(item["date"]): item for item in rows}
+
+        today_row = by_date["2026-02-22"]
+        self.assertAlmostEqual(today_row["actual_miles"], 0.0, places=3)
+        self.assertAlmostEqual(today_row["planned_miles"], 6.2, places=3)
+        self.assertAlmostEqual(today_row["effective_miles"], 6.2, places=3)
+        self.assertEqual(today_row["run_type"], "Easy")
+        self.assertFalse(today_row["is_complete"])
+        self.assertEqual(today_row["completion_source"], "manual")
+        self.assertEqual(today_row["planned_input"], "6.2")
+        self.assertAlmostEqual(today_row["weekly_total"], 51.6, places=1)
+        self.assertAlmostEqual(today_row["long_pct"], 13.1 / 51.6, places=3)
+        self.assertEqual(today_row["bands"]["long_pct"], "good")
+
+        future_row = by_date["2026-02-23"]
+        self.assertFalse(future_row["is_past_or_today"])
+        self.assertAlmostEqual(future_row["effective_miles"], 3.5, places=3)
+        self.assertEqual(future_row["run_type"], "Recovery")
+        self.assertEqual(future_row["is_complete"], False)
+
+        past_row = by_date["2026-02-21"]
+        self.assertTrue(past_row["is_past_or_today"])
+        self.assertAlmostEqual(past_row["actual_miles"], 13.1, places=2)
+        self.assertAlmostEqual(past_row["effective_miles"], 13.1, places=2)
+        self.assertEqual(past_row["completion_source"], "auto")
+        self.assertIn("run_type_options", payload)
+        self.assertIn("Easy", payload["run_type_options"])
+        self.assertIn("summary", payload)
+        self.assertIn("week_planned", payload["summary"])
+
+    def test_get_plan_payload_uses_session_sum_for_planned_and_planned_input(self) -> None:
+        payload = get_plan_payload(
+            _settings(),
+            center_date="2026-02-22",
+            window_days=7,
+            today_local=date(2026, 2, 22),
+            dashboard_payload={"activities": []},
+            plan_day_rows=[
+                {
+                    "date_local": "2026-02-23",
+                    "run_type": "Easy",
+                    "planned_total_miles": 9.0,
+                    "is_complete": False,
+                },
+            ],
+            plan_sessions_by_day={
+                "2026-02-23": [
+                    {"ordinal": 1, "planned_miles": 6.0},
+                    {"ordinal": 2, "planned_miles": 4.0},
+                ]
+            },
+        )
+        row = next(item for item in payload["rows"] if item["date"] == "2026-02-23")
+        self.assertAlmostEqual(row["planned_miles"], 10.0, places=3)
+        self.assertEqual(row["planned_input"], "6+4")
+        self.assertEqual(row["planned_sessions"], [6.0, 4.0])
+        self.assertEqual(
+            row["planned_sessions_detail"],
+            [
+                {"ordinal": 1, "planned_workout": "", "planned_miles": 6.0, "run_type": "", "workout_code": ""},
+                {"ordinal": 2, "planned_workout": "", "planned_miles": 4.0, "run_type": "", "workout_code": ""},
+            ],
+        )
+        self.assertAlmostEqual(row["day_delta"], -10.0, places=3)
+
+    def test_get_plan_payload_can_omit_meta(self) -> None:
+        payload = get_plan_payload(
+            _settings(),
+            center_date="2026-02-22",
+            window_days=14,
+            today_local=date(2026, 2, 22),
+            dashboard_payload={"activities": []},
+            plan_day_rows=[],
+            include_meta=False,
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertNotIn("run_type_options", payload)
+
+    def test_get_plan_payload_includes_planned_workout_alias(self) -> None:
+        payload = get_plan_payload(
+            _settings(),
+            center_date="2026-02-22",
+            window_days=7,
+            today_local=date(2026, 2, 22),
+            dashboard_payload={"activities": []},
+            plan_day_rows=[
+                {
+                    "date_local": "2026-02-23",
+                    "run_type": "SOS",
+                    "planned_total_miles": 6.0,
+                    "is_complete": False,
+                },
+            ],
+            plan_sessions_by_day={
+                "2026-02-23": [
+                    {"ordinal": 1, "planned_miles": 6.0, "run_type": "SOS", "planned_workout": "2E + 20T + 2E"}
+                ]
+            },
+        )
+        row = next(item for item in payload["rows"] if item["date"] == "2026-02-23")
+        self.assertEqual(len(row["planned_sessions_detail"]), 1)
+        detail = row["planned_sessions_detail"][0]
+        self.assertEqual(detail["run_type"], "SOS")
+        self.assertEqual(detail["planned_workout"], "2E + 20T + 2E")
+        self.assertEqual(detail["workout_code"], "2E + 20T + 2E")
+
+    def test_get_plan_payload_rejects_invalid_center_date(self) -> None:
+        with self.assertRaises(ValueError):
+            get_plan_payload(
+                _settings(),
+                center_date="02/22/2026",
+                window_days=14,
+                today_local=date(2026, 2, 22),
+                dashboard_payload={"activities": []},
+                plan_day_rows=[],
+            )
+
+    def test_window_days_is_clamped(self) -> None:
+        payload = get_plan_payload(
+            _settings(),
+            center_date="2026-02-22",
+            window_days=1,
+            today_local=date(2026, 2, 22),
+            dashboard_payload={"activities": []},
+            plan_day_rows=[],
+        )
+        self.assertEqual(payload["window_days"], 7)
+        self.assertEqual(len(payload["rows"]), 15)
+
+    def test_center_date_is_clamped_to_dashboard_bounds(self) -> None:
+        with patch.dict(os.environ, {"DASHBOARD_LOOKBACK_YEARS": "2"}, clear=False):
+            payload = get_plan_payload(
+                _settings(),
+                center_date="2010-01-01",
+                window_days=7,
+                today_local=date(2026, 2, 22),
+                dashboard_payload={"activities": []},
+                plan_day_rows=[],
+            )
+        self.assertEqual(payload["min_center_date"], "2025-01-01")
+        self.assertEqual(payload["center_date"], "2025-01-01")
+
+    def test_range_mode_uses_start_and_end_dates(self) -> None:
+        with patch.dict(os.environ, {"DASHBOARD_START_DATE": "2025-01-01"}, clear=False):
+            payload = get_plan_payload(
+                _settings(),
+                start_date="2025-01-01",
+                end_date="2026-02-24",
+                today_local=date(2026, 2, 22),
+                dashboard_payload={"activities": []},
+                plan_day_rows=[],
+            )
+        self.assertEqual(payload["start_date"], "2025-01-01")
+        self.assertEqual(payload["end_date"], "2026-02-24")
+        self.assertEqual(len(payload["rows"]), 420)
+
+    def test_range_mode_defaults_start_to_dashboard_start_date(self) -> None:
+        with patch.dict(os.environ, {"DASHBOARD_START_DATE": "2024-01-01"}, clear=False):
+            payload = get_plan_payload(
+                _settings(),
+                end_date="2026-02-24",
+                today_local=date(2026, 2, 22),
+                dashboard_payload={"activities": []},
+                plan_day_rows=[],
+            )
+        self.assertEqual(payload["start_date"], "2024-01-01")
+        self.assertEqual(payload["end_date"], "2026-02-24")
+
+    def test_range_mode_rejects_end_before_start(self) -> None:
+        with self.assertRaises(ValueError):
+            get_plan_payload(
+                _settings(),
+                start_date="2026-02-24",
+                end_date="2026-02-01",
+                today_local=date(2026, 2, 22),
+                dashboard_payload={"activities": []},
+                plan_day_rows=[],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
