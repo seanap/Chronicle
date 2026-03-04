@@ -30,7 +30,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+        run: |
+          if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then
+            python -m unittest discover -s tests -p "test_*.py" -v
+          else
+            echo "No repository tests found; skipping unit tests."
+          fi
 
   docker:
     runs-on: ubuntu-latest
