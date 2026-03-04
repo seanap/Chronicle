@@ -1343,6 +1343,22 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _parse_profile_import_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        integer = int(value)
+        if integer in {0, 1}:
+            return bool(integer)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError("value must be a boolean.")
+
+
 def _template_profiles_path(settings: Settings) -> Path:
     return _template_path(settings).parent / "template_profiles.json"
 
@@ -1429,6 +1445,22 @@ def _profile_record_shape(record: dict[str, Any], builtin: dict[str, Any]) -> di
     return shaped
 
 
+def _custom_profile_record_shape(record: dict[str, Any], profile_id: str) -> dict[str, Any]:
+    try:
+        priority = int(record.get("priority", 0))
+    except (TypeError, ValueError):
+        priority = 0
+    criteria_raw = record.get("criteria")
+    return {
+        "profile_id": profile_id,
+        "label": str(record.get("label") or profile_id.title()),
+        "enabled": _coerce_bool(record.get("enabled"), default=True),
+        "locked": False,
+        "priority": priority,
+        "criteria": deepcopy(criteria_raw if isinstance(criteria_raw, dict) else {}),
+    }
+
+
 def _load_template_profiles(settings: Settings) -> dict[str, Any] | None:
     payload = _read_json_file(_template_profiles_path(settings))
     if not isinstance(payload, dict):
@@ -1443,10 +1475,13 @@ def _load_template_profiles(settings: Settings) -> dict[str, Any] | None:
         if not isinstance(item, dict):
             continue
         profile_id = _normalize_profile_id(item.get("profile_id"))
-        if not profile_id or profile_id not in builtins or profile_id in seen:
+        if not profile_id or profile_id in seen:
             continue
         seen.add(profile_id)
-        shaped_profiles.append(_profile_record_shape(item, builtins[profile_id]))
+        if profile_id in builtins:
+            shaped_profiles.append(_profile_record_shape(item, builtins[profile_id]))
+        else:
+            shaped_profiles.append(_custom_profile_record_shape(item, profile_id))
 
     for profile_id, builtin in builtins.items():
         if profile_id in seen:
@@ -1572,12 +1607,60 @@ def set_working_template_profile(settings: Settings, profile_id: str) -> dict[st
     return updated
 
 
+def create_template_profile(
+    settings: Settings,
+    profile_id: str,
+    *,
+    label: str | None = None,
+    criteria: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    target = _normalize_profile_id(profile_id)
+    if not target:
+        raise ValueError("profile_id is required.")
+    if get_template_profile(settings, target) is not None:
+        raise ValueError(f"profile_id already exists: {target}")
+
+    if label is None:
+        normalized_label = target.title()
+    else:
+        normalized_label = str(label).strip()
+        if not normalized_label:
+            raise ValueError("label is required.")
+
+    if criteria is None:
+        normalized_criteria: dict[str, Any] = {}
+    elif isinstance(criteria, dict):
+        normalized_criteria = deepcopy(criteria)
+    else:
+        raise ValueError("criteria must be an object.")
+
+    config = _ensure_template_profiles(settings)
+    config["profiles"].append(
+        {
+            "profile_id": target,
+            "label": normalized_label,
+            "enabled": True,
+            "locked": False,
+            "priority": 0,
+            "criteria": normalized_criteria,
+        }
+    )
+    _save_template_profiles(settings, config)
+    _ensure_template_profiles(settings)
+    created = get_template_profile(settings, target)
+    if created is None:
+        raise ValueError(f"Unknown profile_id: {target}")
+    return created
+
+
 def update_template_profile(
     settings: Settings,
     profile_id: str,
     *,
     enabled: bool | None = None,
     priority: int | None = None,
+    label: str | None = None,
+    criteria: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = _normalize_profile_id(profile_id)
     if not target:
@@ -1591,7 +1674,23 @@ def update_template_profile(
     if found is None:
         raise ValueError(f"Unknown profile_id: {profile_id}")
 
+    parsed_label: str | None = None
+    if label is not None:
+        parsed_label = str(label).strip()
+        if not parsed_label:
+            raise ValueError("label is required.")
+    if criteria is not None and not isinstance(criteria, dict):
+        raise ValueError("criteria must be an object.")
+
     locked = bool(found.get("locked"))
+    if parsed_label is not None:
+        if locked:
+            raise ValueError("Default profile cannot be renamed.")
+        found["label"] = parsed_label
+    if criteria is not None:
+        if locked:
+            raise ValueError("Default profile criteria cannot be edited.")
+        found["criteria"] = deepcopy(criteria)
     if enabled is not None:
         if locked and not bool(enabled):
             raise ValueError("Default profile cannot be disabled.")
@@ -1610,6 +1709,170 @@ def update_template_profile(
     if updated is None:
         raise ValueError(f"Unknown profile_id: {profile_id}")
     return updated
+
+
+def export_template_profiles_bundle(
+    settings: Settings,
+    *,
+    profile_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    profiles = list_template_profiles(settings)
+    selected_ids: list[str] = []
+    selected_set: set[str] = set()
+    if profile_ids is not None:
+        for raw_id in profile_ids:
+            normalized = _normalize_profile_id(raw_id)
+            if not normalized or normalized in selected_set:
+                continue
+            selected_set.add(normalized)
+            selected_ids.append(normalized)
+        if selected_ids:
+            available_ids = {str(item.get("profile_id")) for item in profiles}
+            missing = [profile_id for profile_id in selected_ids if profile_id not in available_ids]
+            if missing:
+                raise ValueError(f"Unknown profile_id: {missing[0]}")
+
+    exported_profiles: list[dict[str, Any]] = []
+    for profile in profiles:
+        profile_id = str(profile.get("profile_id") or "")
+        if selected_ids and profile_id not in selected_set:
+            continue
+        exported_profiles.append(
+            {
+                "profile_id": profile_id,
+                "label": str(profile.get("label") or profile_id.title()),
+                "enabled": bool(profile.get("enabled")),
+                "locked": bool(profile.get("locked")),
+                "priority": int(profile.get("priority", 0)),
+                "criteria": deepcopy(profile.get("criteria") if isinstance(profile.get("criteria"), dict) else {}),
+            }
+        )
+
+    if not exported_profiles:
+        raise ValueError("No profiles matched the selected export filter.")
+
+    return {
+        "bundle_version": 1,
+        "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+        "working_profile_id": str(get_working_template_profile(settings).get("profile_id") or DEFAULT_PROFILE_ID),
+        "profiles": exported_profiles,
+    }
+
+
+def import_template_profiles_bundle(
+    settings: Settings,
+    *,
+    bundle: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(bundle, dict):
+        raise ValueError("bundle must be a JSON object.")
+
+    raw_profiles = bundle.get("profiles")
+    if not isinstance(raw_profiles, list) or not raw_profiles:
+        raise ValueError("bundle.profiles must be a non-empty array.")
+
+    config = _ensure_template_profiles(settings)
+    next_profiles = deepcopy(config.get("profiles") if isinstance(config.get("profiles"), list) else [])
+    index: dict[str, dict[str, Any]] = {}
+    for item in next_profiles:
+        if not isinstance(item, dict):
+            continue
+        profile_id = _normalize_profile_id(item.get("profile_id"))
+        if not profile_id:
+            continue
+        index[profile_id] = item
+
+    imported_profile_ids: list[str] = []
+    errors: list[str] = []
+
+    for idx, entry in enumerate(raw_profiles):
+        if not isinstance(entry, dict):
+            errors.append(f"profiles[{idx}] must be an object.")
+            continue
+
+        profile_id = _normalize_profile_id(entry.get("profile_id"))
+        if not profile_id:
+            errors.append(f"profiles[{idx}].profile_id is required.")
+            continue
+        if profile_id == DEFAULT_PROFILE_ID:
+            errors.append("default profile cannot be imported.")
+            continue
+
+        label_raw = entry.get("label")
+        label = str(label_raw).strip() if label_raw is not None else profile_id.title()
+        if not label:
+            errors.append(f"{profile_id}.label is required.")
+            continue
+
+        criteria_raw = entry.get("criteria")
+        if criteria_raw is None:
+            criteria: dict[str, Any] = {}
+        elif isinstance(criteria_raw, dict):
+            criteria = deepcopy(criteria_raw)
+        else:
+            errors.append(f"{profile_id}.criteria must be an object.")
+            continue
+
+        try:
+            enabled = _parse_profile_import_bool(entry.get("enabled", True))
+        except ValueError:
+            errors.append(f"{profile_id}.enabled must be a boolean.")
+            continue
+
+        try:
+            priority = int(entry.get("priority", 0))
+        except (TypeError, ValueError):
+            errors.append(f"{profile_id}.priority must be an integer.")
+            continue
+
+        existing = index.get(profile_id)
+        if existing is not None:
+            if bool(existing.get("locked")):
+                errors.append(f"{profile_id} is locked and cannot be imported.")
+                continue
+            existing["label"] = label
+            existing["enabled"] = enabled
+            existing["priority"] = priority
+            existing["criteria"] = criteria
+        else:
+            created = {
+                "profile_id": profile_id,
+                "label": label,
+                "enabled": enabled,
+                "locked": False,
+                "priority": priority,
+                "criteria": criteria,
+            }
+            next_profiles.append(created)
+            index[profile_id] = created
+        imported_profile_ids.append(profile_id)
+
+    if not imported_profile_ids and errors:
+        raise ValueError(errors[0])
+    if not imported_profile_ids and not errors:
+        raise ValueError("No importable profiles found in bundle.")
+
+    next_working_profile_id = _normalize_profile_id(config.get("working_profile_id")) or DEFAULT_PROFILE_ID
+    requested_working = _normalize_profile_id(bundle.get("working_profile_id"))
+    if requested_working and requested_working in index and bool(index[requested_working].get("enabled")):
+        next_working_profile_id = requested_working
+    if next_working_profile_id not in index or not bool(index[next_working_profile_id].get("enabled")):
+        next_working_profile_id = DEFAULT_PROFILE_ID
+
+    _save_template_profiles(
+        settings,
+        {
+            "version": PROFILE_CONFIG_VERSION,
+            "working_profile_id": next_working_profile_id,
+            "profiles": next_profiles,
+        },
+    )
+    _ensure_template_profiles(settings)
+    return {
+        "imported_profile_ids": imported_profile_ids,
+        "errors": errors,
+        "working_profile_id": next_working_profile_id,
+    }
 
 
 def _template_path_for_profile(settings: Settings, profile_id: str) -> Path:

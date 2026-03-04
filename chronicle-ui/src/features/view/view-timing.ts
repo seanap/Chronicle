@@ -1,0 +1,38 @@
+const UI_TIMING_EVENT = "chronicle:ui-timing";
+
+interface UiTimingDetail {
+  source: "view-dashboard";
+  metric: string;
+  duration_ms: number;
+}
+
+function nowMs(): number {
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+export function recordViewTiming(metric: string, durationMs: number): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return;
+  }
+  const detail: UiTimingDetail = {
+    source: "view-dashboard",
+    metric,
+    duration_ms: Math.round(durationMs * 100) / 100
+  };
+  window.dispatchEvent(new CustomEvent(UI_TIMING_EVENT, { detail }));
+}
+
+export async function timeViewOperation<T>(metric: string, action: () => Promise<T>): Promise<T> {
+  const startedAt = nowMs();
+  try {
+    return await action();
+  } finally {
+    recordViewTiming(metric, nowMs() - startedAt);
+  }
+}

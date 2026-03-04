@@ -53,6 +53,40 @@ def _should_refresh_dashboard(result: object) -> bool:
     return str(result.get("status") or "").strip().lower() == "updated"
 
 
+def _activity_detection_runtime_updates(
+    result: object,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, object]:
+    now = now_utc.astimezone(timezone.utc) if now_utc else datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    updates: dict[str, object] = {
+        "worker.activity_detection.last_checked_at_utc": now_iso,
+    }
+    if not isinstance(result, dict):
+        updates["worker.activity_detection.status"] = "unknown"
+        return updates
+
+    raw_status = str(result.get("status") or "").strip().lower()
+    if raw_status == "updated":
+        updates["worker.activity_detection.status"] = "new_activity_detected"
+        updates["worker.activity_detection.new_activity_available"] = True
+        updates["worker.activity_detection.last_detected_at_utc"] = now_iso
+        raw_activity_id = result.get("activity_id")
+        activity_id = str(raw_activity_id).strip() if raw_activity_id is not None else ""
+        if activity_id:
+            updates["worker.activity_detection.last_activity_id"] = activity_id
+        return updates
+
+    if raw_status in {"already_processed", "no_activities"}:
+        updates["worker.activity_detection.status"] = "no_new_activity"
+        updates["worker.activity_detection.new_activity_available"] = False
+        return updates
+
+    updates["worker.activity_detection.status"] = raw_status or "unknown"
+    return updates
+
+
 def _parse_utc(raw: object) -> datetime | None:
     if not isinstance(raw, str) or not raw.strip():
         return None
@@ -193,7 +227,13 @@ def main() -> None:
         try:
             set_runtime_values(settings.processed_log_file, {"worker.state": "running_cycle"})
             result = run_once(force_update=False)
-            set_runtime_values(settings.processed_log_file, {"worker.last_cycle_result": result})
+            set_runtime_values(
+                settings.processed_log_file,
+                {
+                    "worker.last_cycle_result": result,
+                    **_activity_detection_runtime_updates(result),
+                },
+            )
             if _should_refresh_dashboard(result):
                 try:
                     get_dashboard_payload(settings, force_refresh=True)

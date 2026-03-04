@@ -70,3 +70,17 @@ http://localhost:1609
 - Android widget companion: [`docs/ANDROID_WIDGET_COMPANION.md`](docs/ANDROID_WIDGET_COMPANION.md)
 - Android widget APK downloads: [GitHub Releases](https://github.com/seanap/Chronicle/releases)
 - Misery Index report: [`docs/MISERY_INDEX_REPORT.md`](docs/MISERY_INDEX_REPORT.md)
+
+## SPA Scaffold (Story 1.1)
+
+A parallel SPA workspace now exists at `chronicle-ui/` (Vite + React + TypeScript + MUI).
+
+### Run frontend locally
+```bash
+cd chronicle-ui
+npm install
+npm run dev
+```
+
+- Vite proxy defaults to `http://localhost:1609` and can be overridden with `VITE_API_PROXY_TARGET`.
+- Backend endpoints and response contracts remain source-of-truth and unchanged.

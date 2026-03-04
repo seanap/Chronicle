@@ -43,6 +43,17 @@ class TestApiServer(unittest.TestCase):
         api_server.settings = api_server.Settings.from_env()
         api_server.settings.ensure_state_paths()
 
+    def _set_ui_rollout_mode(self, mode: str, *, source: str = "test-suite") -> dict:
+        response = self.client.post(
+            "/ops/ui-rollout/mode",
+            json={"mode": mode, "source": source},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json() or {}
+        self.assertEqual(payload.get("status"), "ok")
+        self.assertEqual(payload.get("mode"), mode)
+        return payload
+
     def test_rerun_latest_endpoint(self) -> None:
         refresh_calls: list[tuple[tuple, dict]] = []
         api_server.run_once = lambda **kwargs: {"status": "updated", "kwargs": kwargs}
@@ -62,6 +73,8 @@ class TestApiServer(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["result"]["kwargs"]["force_update"], True)
+        self.assertEqual(payload.get("status_code"), "updated")
+        self.assertIn("T", str(payload.get("timestamp_utc") or ""))
         self.assertEqual(payload.get("dashboard_refresh"), "updated")
         self.assertEqual(len(refresh_calls), 1)
         self.assertTrue(refresh_calls[0][1].get("force_refresh"))
@@ -84,8 +97,26 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["result"]["kwargs"]["activity_id"], 123456)
+        self.assertEqual(payload.get("status_code"), "updated")
+        self.assertIn("T", str(payload.get("timestamp_utc") or ""))
         self.assertEqual(payload.get("dashboard_refresh"), "updated")
         self.assertEqual(len(refresh_calls), 1)
+
+    def test_rerun_activity_returns_retry_guidance_for_locked_status(self) -> None:
+        api_server.run_once = lambda **kwargs: {
+            "status": "locked",
+            "lock_owner": "run_once:def",
+            "kwargs": kwargs,
+        }
+        response = self.client.post("/rerun/activity/654321")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload.get("status"), "ok")
+        self.assertEqual(payload.get("status_code"), "locked")
+        self.assertEqual(payload.get("result", {}).get("kwargs", {}).get("activity_id"), 654321)
+        self.assertIn("T", str(payload.get("timestamp_utc") or ""))
+        self.assertIn("already in progress", str(payload.get("retry_guidance") or ""))
+        self.assertIn("run_once:def", str(payload.get("retry_guidance") or ""))
 
     def test_rerun_latest_skips_dashboard_refresh_when_not_updated(self) -> None:
         refresh_calls: list[tuple[tuple, dict]] = []
@@ -95,8 +126,34 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload.get("status_code"), "already_processed")
+        self.assertIn("T", str(payload.get("timestamp_utc") or ""))
         self.assertNotIn("dashboard_refresh", payload)
         self.assertEqual(len(refresh_calls), 0)
+
+    def test_rerun_latest_returns_retry_guidance_for_locked_status(self) -> None:
+        api_server.run_once = lambda **_kwargs: {"status": "locked", "lock_owner": "run_once:abc"}
+        response = self.client.post("/rerun/latest")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload.get("status"), "ok")
+        self.assertEqual(payload.get("status_code"), "locked")
+        self.assertIn("T", str(payload.get("timestamp_utc") or ""))
+        self.assertIn("already in progress", str(payload.get("retry_guidance") or ""))
+        self.assertIn("run_once:abc", str(payload.get("retry_guidance") or ""))
+
+    def test_rerun_latest_error_includes_status_code_and_timestamp(self) -> None:
+        def _raise(**_kwargs):
+            raise RuntimeError("rerun exploded")
+
+        api_server.run_once = _raise
+        response = self.client.post("/rerun/latest")
+        self.assertEqual(response.status_code, 500)
+        payload = response.get_json()
+        self.assertEqual(payload.get("status"), "error")
+        self.assertEqual(payload.get("status_code"), "error")
+        self.assertIn("T", str(payload.get("timestamp_utc") or ""))
+        self.assertIn("rerun exploded", str(payload.get("error") or ""))
 
     def test_rerun_generic_with_invalid_id(self) -> None:
         response = self.client.post("/rerun", json={"activity_id": "abc"})
@@ -162,6 +219,175 @@ class TestApiServer(unittest.TestCase):
         response = self.client.get("/control")
         self.assertEqual(response.status_code, 200)
 
+    def test_ui_rollout_core_flows_default_to_mpa_and_keep_legacy_fallback_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            self._set_ui_rollout_mode("mpa", source="test-mpa")
+
+            status_response = self.client.get("/ops/ui-rollout/status")
+            self.assertEqual(status_response.status_code, 200)
+            status_payload = status_response.get_json() or {}
+            self.assertEqual(status_payload.get("status"), "ok")
+            self.assertEqual(status_payload.get("mode"), "mpa")
+
+            flow_targets = {
+                str(item.get("flow") or ""): str(item.get("target_path") or "")
+                for item in status_payload.get("flows") or []
+                if isinstance(item, dict)
+            }
+            self.assertEqual(flow_targets.get("sources"), "/legacy/sources")
+            self.assertEqual(flow_targets.get("build"), "/legacy/build")
+            self.assertEqual(flow_targets.get("plan"), "/legacy/plan")
+            self.assertEqual(flow_targets.get("view"), "/legacy/view")
+            self.assertEqual(flow_targets.get("control"), "/legacy/control")
+
+            for path in ["/sources", "/build", "/plan", "/view", "/control"]:
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200, path)
+
+            for path in ["/legacy/sources", "/legacy/build", "/legacy/plan", "/legacy/view", "/legacy/control"]:
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200, path)
+
+    def test_ui_rollout_spa_mode_redirects_core_flows_and_preserves_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            self._set_ui_rollout_mode("spa", source="test-spa")
+            status_payload = (self.client.get("/ops/ui-rollout/status").get_json() or {})
+            spa_base_path = str(status_payload.get("spa_base_path") or "/app").rstrip("/")
+            if not spa_base_path:
+                spa_base_path = "/app"
+
+            expected_redirects = {
+                "/sources": f"{spa_base_path}/sources",
+                "/build": f"{spa_base_path}/build",
+                "/plan": f"{spa_base_path}/plan",
+                "/view": f"{spa_base_path}/view",
+                "/control": f"{spa_base_path}/control",
+            }
+            for path, expected_target in expected_redirects.items():
+                response = self.client.get(path, follow_redirects=False)
+                self.assertEqual(response.status_code, 302, path)
+                self.assertEqual(response.headers.get("Location"), expected_target)
+
+            response = self.client.get(f"{spa_base_path}/sources", follow_redirects=False)
+            if response.status_code == 302:
+                # When SPA assets are unavailable, app entry routes back to MPA fallback.
+                self.assertEqual(response.headers.get("Location"), "/legacy/sources")
+            else:
+                # When SPA assets exist, app entry serves the built SPA index.
+                self.assertEqual(response.status_code, 200)
+                response.close()
+
+            for path in ["/legacy/sources", "/legacy/build", "/legacy/plan", "/legacy/view", "/legacy/control"]:
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200, path)
+
+    def test_ui_rollout_rollback_endpoint_forces_mpa_mode_with_guardrail_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            self._set_ui_rollout_mode("spa", source="test-pre-rollback")
+
+            rollback_response = self.client.post(
+                "/ops/ui-rollout/rollback",
+                json={"source": "test-rollback", "reason": "regression"},
+            )
+            self.assertEqual(rollback_response.status_code, 200)
+            rollback_payload = rollback_response.get_json() or {}
+            self.assertEqual(rollback_payload.get("status"), "ok")
+            self.assertEqual(rollback_payload.get("mode"), "mpa")
+            self.assertEqual(rollback_payload.get("rollback_target_minutes"), 15)
+            self.assertLess(int(rollback_payload.get("elapsed_ms") or 0), 15 * 60 * 1000)
+            self.assertIn("T", str(rollback_payload.get("rolled_back_at_utc") or ""))
+            self.assertIn("T", str(rollback_payload.get("rollback_deadline_utc") or ""))
+
+            checklist = rollback_payload.get("verification_checklist") or []
+            self.assertEqual(len(checklist), 5)
+
+            # After rollback, canonical core routes should resolve back to legacy flow behavior.
+            for path in ["/sources", "/build", "/plan", "/view", "/control"]:
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200, path)
+
+    def test_ui_rollout_mode_rejects_invalid_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.post(
+                "/ops/ui-rollout/mode",
+                json={"mode": "invalid", "source": "test-invalid-mode"},
+            )
+            self.assertEqual(response.status_code, 400)
+            payload = response.get_json() or {}
+            self.assertEqual(payload.get("status"), "error")
+            error = payload.get("error") or {}
+            self.assertEqual(error.get("code"), "UI_ROLLOUT_MODE_INVALID")
+
+    def test_legacy_core_flow_rejects_unknown_flow(self) -> None:
+        response = self.client.get("/legacy/unknown-flow")
+        self.assertEqual(response.status_code, 404)
+        payload = response.get_json() or {}
+        self.assertEqual(payload.get("status"), "error")
+        error = payload.get("error") or {}
+        self.assertEqual(error.get("code"), "LEGACY_FLOW_NOT_FOUND")
+
+    def test_control_activity_detection_endpoint_reports_new_activity_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            now_iso = api_server.datetime.now(api_server.timezone.utc).isoformat()
+            api_server.set_runtime_value(
+                api_server.settings.processed_log_file,
+                "worker.last_heartbeat_utc",
+                now_iso,
+            )
+            api_server.set_runtime_value(
+                api_server.settings.processed_log_file,
+                "worker.activity_detection.status",
+                "new_activity_detected",
+            )
+            api_server.set_runtime_value(
+                api_server.settings.processed_log_file,
+                "worker.activity_detection.new_activity_available",
+                True,
+            )
+            api_server.set_runtime_value(
+                api_server.settings.processed_log_file,
+                "worker.activity_detection.last_activity_id",
+                "17455368360",
+            )
+            api_server.set_runtime_value(
+                api_server.settings.processed_log_file,
+                "worker.activity_detection.last_checked_at_utc",
+                now_iso,
+            )
+            api_server.set_runtime_value(
+                api_server.settings.processed_log_file,
+                "worker.activity_detection.last_detected_at_utc",
+                now_iso,
+            )
+
+            response = self.client.get("/control/activity-detection")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json() or {}
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertTrue(bool(payload.get("worker_heartbeat_healthy")))
+            detection = payload.get("activity_detection") or {}
+            self.assertEqual(str(detection.get("status") or ""), "new_activity_detected")
+            self.assertTrue(bool(detection.get("new_activity_available")))
+            self.assertEqual(str(detection.get("last_activity_id") or ""), "17455368360")
+
+    def test_control_activity_detection_endpoint_defaults_without_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.get("/control/activity-detection")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json() or {}
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertFalse(bool(payload.get("worker_heartbeat_healthy")))
+            detection = payload.get("activity_detection") or {}
+            self.assertEqual(str(detection.get("status") or ""), "unknown")
+            self.assertFalse(bool(detection.get("new_activity_available")))
+            self.assertIsNone(detection.get("last_activity_id"))
+
     def test_plan_page_endpoint(self) -> None:
         response = self.client.get("/plan")
         self.assertEqual(response.status_code, 200)
@@ -222,6 +448,95 @@ class TestApiServer(unittest.TestCase):
             payload = response.get_json()
             self.assertEqual(payload.get("status"), "error")
             self.assertIn("distance", str(payload.get("error")))
+
+    def test_plan_workouts_endpoint_defaults_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.get("/plan/workouts")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("workouts"), [])
+
+    def test_plan_workouts_put_creates_and_updates_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            create_response = self.client.put(
+                "/plan/workouts/2E-5x1k-I",
+                json={
+                    "title": "2E + 5x1k @I + 2E",
+                    "structure": "warmup: 2E\nmain: 5x1k @I w/3:00 jog\ncooldown: 2E",
+                },
+            )
+            self.assertEqual(create_response.status_code, 200)
+            create_payload = create_response.get_json()
+            self.assertEqual(create_payload.get("status"), "ok")
+            workout = create_payload.get("workout") if isinstance(create_payload, dict) else {}
+            self.assertEqual(str(workout.get("workout_code") or ""), "2E-5x1k-I")
+            self.assertEqual(str(workout.get("title") or ""), "2E + 5x1k @I + 2E")
+            self.assertIn("warmup:", str(workout.get("structure") or ""))
+
+            list_response = self.client.get("/plan/workouts")
+            self.assertEqual(list_response.status_code, 200)
+            list_payload = list_response.get_json()
+            workouts = list_payload.get("workouts") if isinstance(list_payload, dict) else []
+            self.assertEqual(len(workouts), 1)
+            self.assertEqual(str(workouts[0].get("workout_code") or ""), "2E-5x1k-I")
+
+            update_response = self.client.put(
+                "/plan/workouts/2E-5x1k-I",
+                json={
+                    "workout_code": "2E-5x1k-I",
+                    "title": "2E + 6x1k @I + 2E",
+                    "structure": "warmup: 2E\nmain: 6x1k @I w/3:00 jog\ncooldown: 2E",
+                },
+            )
+            self.assertEqual(update_response.status_code, 200)
+            update_payload = update_response.get_json()
+            update_workout = update_payload.get("workout") if isinstance(update_payload, dict) else {}
+            self.assertEqual(str(update_workout.get("workout_code") or ""), "2E-5x1k-I")
+            self.assertEqual(str(update_workout.get("title") or ""), "2E + 6x1k @I + 2E")
+            self.assertIn("6x1k", str(update_workout.get("structure") or ""))
+
+            verify_response = self.client.get("/plan/workouts")
+            self.assertEqual(verify_response.status_code, 200)
+            verify_payload = verify_response.get_json()
+            verify_workouts = verify_payload.get("workouts") if isinstance(verify_payload, dict) else []
+            self.assertEqual(len(verify_workouts), 1)
+            self.assertIn("6x1k", str(verify_workouts[0].get("structure") or ""))
+
+    def test_plan_workouts_put_rejects_missing_required_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            missing_structure = self.client.put(
+                "/plan/workouts/tempo-day",
+                json={"title": "Tempo day"},
+            )
+            self.assertEqual(missing_structure.status_code, 400)
+            missing_payload = missing_structure.get_json()
+            self.assertEqual(missing_payload.get("status"), "error")
+            self.assertIn("structure", str(missing_payload.get("error")))
+
+            mismatch = self.client.put(
+                "/plan/workouts/tempo-day",
+                json={"workout_code": "different-code", "structure": "main: tempo"},
+            )
+            self.assertEqual(mismatch.status_code, 400)
+            mismatch_payload = mismatch.get_json()
+            self.assertEqual(mismatch_payload.get("status"), "error")
+            self.assertIn("match path", str(mismatch_payload.get("error")))
+
+    def test_plan_workouts_put_rejects_invalid_workout_code_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.put(
+                "/plan/workouts/tempo%5Cbad",
+                json={"workout_code": "tempo\\bad", "structure": "main: tempo"},
+            )
+            self.assertEqual(response.status_code, 400)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("cannot contain", str(payload.get("error")))
 
     def test_dashboard_data_endpoint(self) -> None:
         api_server.get_dashboard_payload = lambda *_args, **_kwargs: {
@@ -440,6 +755,65 @@ class TestApiServer(unittest.TestCase):
             self.assertEqual(payload.get("status"), "error")
             self.assertIn("distance", str(payload.get("error")))
 
+    def test_plan_day_put_rejects_unsupported_run_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.put(
+                "/plan/day/2026-02-22",
+                json={
+                    "distance": "6",
+                    "run_type": "Tempo Builder",
+                },
+            )
+            self.assertEqual(response.status_code, 400)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("run_type", str(payload.get("error")))
+
+    def test_plan_day_put_normalizes_supported_run_type_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.put(
+                "/plan/day/2026-02-22",
+                json={
+                    "distance": "6",
+                    "run_type": "longtrail",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("run_type"), "Long Trail")
+
+    def test_plan_day_put_allows_distance_update_when_legacy_run_type_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            from chronicle.storage import upsert_plan_day
+
+            upsert_plan_day(
+                api_server.settings.processed_log_file,
+                date_local="2026-02-22",
+                timezone_name=api_server.settings.timezone,
+                run_type="Tempo Builder",
+                planned_total_miles=5.0,
+                actual_total_miles=None,
+                is_complete=False,
+                notes=None,
+            )
+
+            response = self.client.put(
+                "/plan/day/2026-02-22",
+                json={
+                    "distance": "6",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("run_type"), "Tempo Builder")
+            self.assertEqual(payload.get("distance_saved"), "6")
+
     def test_plan_day_put_accepts_is_complete_null_for_auto_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             self._set_temp_state_dir(temp_dir)
@@ -536,6 +910,652 @@ class TestApiServer(unittest.TestCase):
                 "15WU + 4x4min @LT2 / 3min easy + 10CD",
             )
 
+    def test_plan_days_bulk_endpoint_accepts_workout_association(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 7,
+                                    "workout_code": "2E + 20T + 2E",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            days = payload.get("days") or []
+            self.assertEqual(len(days), 1)
+            sessions = days[0].get("sessions") if isinstance(days[0], dict) else []
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(str(sessions[0].get("workout_code") or ""), "2E + 20T + 2E")
+
+            metrics = self.client.get("/plan/day/2026-02-22/metrics")
+            self.assertEqual(metrics.status_code, 200)
+            metrics_payload = metrics.get_json()
+            row = metrics_payload.get("row") if isinstance(metrics_payload, dict) else {}
+            session_detail = row.get("planned_sessions_detail") if isinstance(row, dict) else []
+            self.assertTrue(isinstance(session_detail, list) and len(session_detail) == 1)
+            self.assertEqual(str(session_detail[0].get("workout_code") or ""), "2E + 20T + 2E")
+
+    def test_plan_day_garmin_sync_endpoint_initiates_pending_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 7,
+                                    "run_type": "SOS",
+                                    "workout_code": "2E + 20T + 2E",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed.status_code, 200)
+
+            response = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("date_local"), "2026-02-22")
+            sync = payload.get("sync") if isinstance(payload, dict) else {}
+            self.assertEqual(str(sync.get("workout_code") or ""), "2E + 20T + 2E")
+            self.assertEqual(str(sync.get("status") or ""), "pending")
+            self.assertEqual(str(sync.get("status_code") or ""), "queued")
+            self.assertTrue(str(sync.get("request_id") or "").startswith("sync-"))
+
+    def test_plan_day_garmin_sync_endpoint_is_idempotent_for_pending_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 7,
+                                    "run_type": "SOS",
+                                    "workout_code": "2E + 20T + 2E",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed.status_code, 200)
+
+            first = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            second = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            first_payload = first.get_json()
+            second_payload = second.get_json()
+            first_sync = first_payload.get("sync") if isinstance(first_payload, dict) else {}
+            second_sync = second_payload.get("sync") if isinstance(second_payload, dict) else {}
+            self.assertEqual(str(first_sync.get("request_id") or ""), str(second_sync.get("request_id") or ""))
+            self.assertEqual(str(first_sync.get("status") or ""), "pending")
+            self.assertEqual(str(second_sync.get("status") or ""), "pending")
+
+    def test_plan_day_garmin_sync_endpoint_rejects_missing_workout_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed = self.client.put(
+                "/plan/day/2026-02-22",
+                json={
+                    "distance": "7",
+                    "run_type": "Easy",
+                },
+            )
+            self.assertEqual(seed.status_code, 200)
+
+            response = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(response.status_code, 400)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("No workout is attached", str(payload.get("error") or ""))
+
+    def test_plan_day_garmin_sync_endpoint_rejects_workout_not_on_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "2E + 20T + 2E",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed.status_code, 200)
+
+            response = self.client.post(
+                "/plan/day/2026-02-22/garmin-sync",
+                json={"workout_code": "5k-intervals"},
+            )
+            self.assertEqual(response.status_code, 400)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("not attached", str(payload.get("error") or ""))
+
+    def test_plan_day_garmin_sync_run_creates_missing_workout_and_advances_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+
+            initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(initiated.status_code, 200)
+
+            run_response = self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={})
+            self.assertEqual(run_response.status_code, 200)
+            run_payload = run_response.get_json()
+            self.assertEqual(run_payload.get("status"), "ok")
+            sync = run_payload.get("sync") if isinstance(run_payload, dict) else {}
+            garmin_workout = run_payload.get("garmin_workout") if isinstance(run_payload, dict) else {}
+
+            self.assertEqual(str(sync.get("status") or ""), "in-progress")
+            self.assertEqual(str(sync.get("status_code") or ""), "workout_created")
+            self.assertEqual(str(sync.get("workout_code") or ""), "Tempo-6x1k")
+            self.assertEqual(str(sync.get("next_step") or ""), "schedule_workout_on_calendar")
+            self.assertTrue(bool(sync.get("garmin_workout_created")))
+            self.assertTrue(str(sync.get("garmin_workout_id") or "").startswith("gw-"))
+
+            self.assertEqual(str(garmin_workout.get("workout_code") or ""), "Tempo-6x1k")
+            self.assertEqual(
+                str(garmin_workout.get("garmin_workout_id") or ""),
+                str(sync.get("garmin_workout_id") or ""),
+            )
+
+    def test_plan_day_garmin_sync_run_reuses_existing_garmin_workout_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day_1 = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day_1.status_code, 200)
+
+            first_initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(first_initiated.status_code, 200)
+            first_run = self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={})
+            self.assertEqual(first_run.status_code, 200)
+            first_payload = first_run.get_json()
+            first_sync = first_payload.get("sync") if isinstance(first_payload, dict) else {}
+            first_workout_id = str(first_sync.get("garmin_workout_id") or "")
+            self.assertTrue(first_workout_id.startswith("gw-"))
+
+            seed_day_2 = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-23",
+                            "sessions": [
+                                {
+                                    "planned_miles": 7,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day_2.status_code, 200)
+
+            second_initiated = self.client.post("/plan/day/2026-02-23/garmin-sync", json={})
+            self.assertEqual(second_initiated.status_code, 200)
+            second_run = self.client.post("/plan/day/2026-02-23/garmin-sync/run", json={})
+            self.assertEqual(second_run.status_code, 200)
+            second_payload = second_run.get_json()
+            second_sync = second_payload.get("sync") if isinstance(second_payload, dict) else {}
+
+            self.assertEqual(str(second_sync.get("status") or ""), "in-progress")
+            self.assertEqual(str(second_sync.get("status_code") or ""), "workout_exists")
+            self.assertFalse(bool(second_sync.get("garmin_workout_created")))
+            self.assertEqual(str(second_sync.get("garmin_workout_id") or ""), first_workout_id)
+
+    def test_plan_day_garmin_sync_run_is_idempotent_for_existing_processed_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed.status_code, 200)
+
+            initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(initiated.status_code, 200)
+            first_run = self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={})
+            second_run = self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={})
+            self.assertEqual(first_run.status_code, 200)
+            self.assertEqual(second_run.status_code, 200)
+
+            first_sync = (first_run.get_json() or {}).get("sync") or {}
+            second_sync = (second_run.get_json() or {}).get("sync") or {}
+            self.assertEqual(str(first_sync.get("request_id") or ""), str(second_sync.get("request_id") or ""))
+            self.assertEqual(
+                str(first_sync.get("garmin_workout_id") or ""),
+                str(second_sync.get("garmin_workout_id") or ""),
+            )
+            self.assertEqual(str(second_sync.get("status") or ""), "in-progress")
+
+    def test_plan_day_garmin_sync_run_requires_existing_sync_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+
+            run_response = self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={})
+            self.assertEqual(run_response.status_code, 400)
+            run_payload = run_response.get_json()
+            self.assertEqual(run_payload.get("status"), "error")
+            self.assertIn("Send to Garmin first", str(run_payload.get("error") or ""))
+
+    def test_plan_day_garmin_sync_schedule_schedules_calendar_entry_for_plan_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+            initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(initiated.status_code, 200)
+            run_response = self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={})
+            self.assertEqual(run_response.status_code, 200)
+
+            schedule_response = self.client.post("/plan/day/2026-02-22/garmin-sync/schedule", json={})
+            self.assertEqual(schedule_response.status_code, 200)
+            payload = schedule_response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            sync = payload.get("sync") if isinstance(payload, dict) else {}
+            calendar_entry = payload.get("calendar_entry") if isinstance(payload, dict) else {}
+
+            self.assertEqual(str(sync.get("status") or ""), "succeeded")
+            self.assertEqual(str(sync.get("status_code") or ""), "calendar_scheduled")
+            self.assertEqual(str(sync.get("next_step") or ""), "report_sync_result")
+            self.assertTrue(str(sync.get("calendar_entry_id") or "").startswith("gcal-"))
+            self.assertEqual(str(calendar_entry.get("date_local") or ""), "2026-02-22")
+            self.assertEqual(str(calendar_entry.get("workout_code") or ""), "Tempo-6x1k")
+            self.assertEqual(
+                str(calendar_entry.get("calendar_entry_id") or ""),
+                str(sync.get("calendar_entry_id") or ""),
+            )
+
+    def test_plan_day_garmin_sync_schedule_uses_requested_workout_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                },
+                                {
+                                    "planned_miles": 6,
+                                    "run_type": "SOS",
+                                    "workout_code": "Threshold-3x10",
+                                },
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+
+            send_tempo = self.client.post(
+                "/plan/day/2026-02-22/garmin-sync",
+                json={"workout_code": "Tempo-6x1k"},
+            )
+            send_threshold = self.client.post(
+                "/plan/day/2026-02-22/garmin-sync",
+                json={"workout_code": "Threshold-3x10"},
+            )
+            self.assertEqual(send_tempo.status_code, 200)
+            self.assertEqual(send_threshold.status_code, 200)
+
+            run_tempo = self.client.post(
+                "/plan/day/2026-02-22/garmin-sync/run",
+                json={"workout_code": "Tempo-6x1k"},
+            )
+            run_threshold = self.client.post(
+                "/plan/day/2026-02-22/garmin-sync/run",
+                json={"workout_code": "Threshold-3x10"},
+            )
+            self.assertEqual(run_tempo.status_code, 200)
+            self.assertEqual(run_threshold.status_code, 200)
+
+            schedule_response = self.client.post(
+                "/plan/day/2026-02-22/garmin-sync/schedule",
+                json={"workout_code": "Threshold-3x10"},
+            )
+            self.assertEqual(schedule_response.status_code, 200)
+            payload = schedule_response.get_json() or {}
+            sync = payload.get("sync") or {}
+            calendar_entry = payload.get("calendar_entry") or {}
+            self.assertEqual(str(sync.get("workout_code") or ""), "Threshold-3x10")
+            self.assertEqual(str(calendar_entry.get("workout_code") or ""), "Threshold-3x10")
+
+    def test_plan_day_garmin_sync_schedule_reuses_existing_calendar_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+            self.assertEqual(self.client.post("/plan/day/2026-02-22/garmin-sync", json={}).status_code, 200)
+            self.assertEqual(self.client.post("/plan/day/2026-02-22/garmin-sync/run", json={}).status_code, 200)
+
+            first = self.client.post("/plan/day/2026-02-22/garmin-sync/schedule", json={})
+            second = self.client.post("/plan/day/2026-02-22/garmin-sync/schedule", json={})
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            first_sync = (first.get_json() or {}).get("sync") or {}
+            second_sync = (second.get_json() or {}).get("sync") or {}
+            self.assertEqual(
+                str(first_sync.get("calendar_entry_id") or ""),
+                str(second_sync.get("calendar_entry_id") or ""),
+            )
+            self.assertEqual(str(second_sync.get("status_code") or ""), "calendar_scheduled")
+
+    def test_plan_day_garmin_sync_schedule_requires_run_phase_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+            initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(initiated.status_code, 200)
+
+            schedule_response = self.client.post("/plan/day/2026-02-22/garmin-sync/schedule", json={})
+            self.assertEqual(schedule_response.status_code, 400)
+            payload = schedule_response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("Run Garmin sync first", str(payload.get("error") or ""))
+
+    def test_plan_day_garmin_sync_schedule_requires_existing_sync_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            schedule_response = self.client.post("/plan/day/2026-02-22/garmin-sync/schedule", json={})
+            self.assertEqual(schedule_response.status_code, 400)
+            payload = schedule_response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("Send to Garmin first", str(payload.get("error") or ""))
+
+    def test_plan_day_garmin_sync_result_returns_scheduled_confirmation_with_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+            initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(initiated.status_code, 200)
+
+            result_response = self.client.post("/plan/day/2026-02-22/garmin-sync/result", json={})
+            self.assertEqual(result_response.status_code, 200)
+            payload = result_response.get_json() or {}
+            self.assertEqual(payload.get("status"), "ok")
+            result = payload.get("result") if isinstance(payload, dict) else {}
+            sync = payload.get("sync") if isinstance(payload, dict) else {}
+            self.assertEqual(str(result.get("outcome") or ""), "scheduled")
+            self.assertEqual(str(sync.get("status") or ""), "succeeded")
+            self.assertIn(str(result.get("status_code") or ""), {"calendar_scheduled", "calendar_exists"})
+            self.assertIn("T", str(result.get("timestamp_utc") or ""))
+
+    def test_plan_day_garmin_sync_result_returns_retry_guidance_when_schedule_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed_day = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 8,
+                                    "run_type": "SOS",
+                                    "workout_code": "Tempo-6x1k",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed_day.status_code, 200)
+            initiated = self.client.post("/plan/day/2026-02-22/garmin-sync", json={})
+            self.assertEqual(initiated.status_code, 200)
+
+            with patch("chronicle.api_server.schedule_garmin_sync_request", side_effect=RuntimeError("schedule unavailable")):
+                result_response = self.client.post("/plan/day/2026-02-22/garmin-sync/result", json={})
+
+            self.assertEqual(result_response.status_code, 200)
+            payload = result_response.get_json() or {}
+            self.assertEqual(payload.get("status"), "error")
+            result = payload.get("result") if isinstance(payload, dict) else {}
+            sync = payload.get("sync") if isinstance(payload, dict) else {}
+            self.assertEqual(str(result.get("outcome") or ""), "failed")
+            self.assertEqual(str(sync.get("status") or ""), "failed")
+            self.assertEqual(str(sync.get("status_code") or ""), "schedule_failed")
+            self.assertIn("Retry Garmin sync from Plan", str(result.get("retry_guidance") or ""))
+            self.assertIn("Retry Garmin sync from Plan", str(sync.get("retry_guidance") or ""))
+
+    def test_plan_day_garmin_sync_result_requires_existing_sync_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            result_response = self.client.post("/plan/day/2026-02-22/garmin-sync/result", json={})
+            self.assertEqual(result_response.status_code, 400)
+            payload = result_response.get_json() or {}
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("Send to Garmin first", str(payload.get("error") or ""))
+
+    def test_plan_day_put_run_type_only_preserves_existing_workout_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            seed = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {
+                            "date_local": "2026-02-22",
+                            "sessions": [
+                                {
+                                    "planned_miles": 7,
+                                    "run_type": "SOS",
+                                    "workout_code": "2E + 20T + 2E",
+                                }
+                            ],
+                            "run_type": "SOS",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(seed.status_code, 200)
+
+            response = self.client.put(
+                "/plan/day/2026-02-22",
+                json={
+                    "run_type": "Easy",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "ok")
+            self.assertEqual(payload.get("run_type"), "Easy")
+            sessions = payload.get("sessions") or []
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(str(sessions[0].get("workout_code") or ""), "2E + 20T + 2E")
+
+            metrics = self.client.get("/plan/day/2026-02-22/metrics")
+            self.assertEqual(metrics.status_code, 200)
+            metrics_payload = metrics.get_json()
+            row = metrics_payload.get("row") if isinstance(metrics_payload, dict) else {}
+            session_detail = row.get("planned_sessions_detail") if isinstance(row, dict) else []
+            self.assertTrue(isinstance(session_detail, list) and len(session_detail) == 1)
+            self.assertEqual(str(session_detail[0].get("workout_code") or ""), "2E + 20T + 2E")
+
     def test_plan_day_put_rejects_invalid_sessions_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             self._set_temp_state_dir(temp_dir)
@@ -586,6 +1606,32 @@ class TestApiServer(unittest.TestCase):
             payload = response.get_json()
             self.assertEqual(payload.get("status"), "error")
             self.assertIn("date_local", str(payload.get("error")))
+
+            from chronicle.storage import list_plan_days
+
+            rows = list_plan_days(
+                api_server.settings.processed_log_file,
+                start_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+            self.assertEqual(rows, [])
+
+    def test_plan_days_bulk_endpoint_is_atomic_on_unsupported_run_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.post(
+                "/plan/days/bulk",
+                json={
+                    "days": [
+                        {"date_local": "2026-02-22", "sessions": [6, 4], "run_type": "Easy"},
+                        {"date_local": "2026-02-23", "sessions": [5], "run_type": "Tempo Builder"},
+                    ]
+                },
+            )
+            self.assertEqual(response.status_code, 400)
+            payload = response.get_json()
+            self.assertEqual(payload.get("status"), "error")
+            self.assertIn("run_type", str(payload.get("error")))
 
             from chronicle.storage import list_plan_days
 
@@ -783,6 +1829,180 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(reset_response.status_code, 200)
         self.client.put("/editor/profiles/pet", json={"enabled": False})
 
+    def test_editor_profiles_export_endpoint_honors_selected_profile_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            create_response = self.client.post(
+                "/editor/profiles",
+                json={
+                    "profile_id": "tempo_focus",
+                    "label": "Tempo Focus",
+                    "criteria": {"kind": "activity", "keywords": ["tempo"]},
+                },
+            )
+            self.assertEqual(create_response.status_code, 200)
+
+            response = self.client.get("/editor/profiles/export?profile_id=default&profile_id=tempo_focus")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["bundle_version"], 1)
+            self.assertIn("exported_at_utc", payload)
+            profile_ids = [item.get("profile_id") for item in payload["profiles"]]
+            self.assertEqual(set(profile_ids), {"default", "tempo_focus"})
+
+    def test_editor_profiles_export_endpoint_rejects_unknown_profile_filter(self) -> None:
+        response = self.client.get("/editor/profiles/export?profile_id=does-not-exist")
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("Unknown profile_id", str(payload.get("error", "")))
+
+    def test_editor_profiles_import_endpoint_imports_valid_profiles_and_reports_invalid_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            response = self.client.post(
+                "/editor/profiles/import",
+                json={
+                    "bundle": {
+                        "bundle_version": 1,
+                        "exported_at_utc": "2026-03-03T12:00:00+00:00",
+                        "working_profile_id": "tempo_focus",
+                        "profiles": [
+                            {
+                                "profile_id": "tempo_focus",
+                                "label": "Tempo Focus",
+                                "enabled": True,
+                                "priority": 70,
+                                "criteria": {"kind": "activity", "keywords": ["tempo"]},
+                            },
+                            {
+                                "profile_id": "default",
+                                "label": "Default Override",
+                                "enabled": True,
+                                "priority": 10,
+                                "criteria": {"kind": "fallback", "description": "override"},
+                            },
+                        ],
+                    }
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["imported_count"], 1)
+            self.assertEqual(payload["imported_profile_ids"], ["tempo_focus"])
+            self.assertEqual(payload["working_profile_id"], "tempo_focus")
+            self.assertTrue(any("default profile cannot be imported" in str(item) for item in payload["errors"]))
+
+            list_response = self.client.get("/editor/profiles")
+            self.assertEqual(list_response.status_code, 200)
+            list_payload = list_response.get_json()
+            self.assertTrue(any(item.get("profile_id") == "tempo_focus" for item in list_payload["profiles"]))
+            self.assertEqual(list_payload["working_profile_id"], "tempo_focus")
+
+    def test_editor_profiles_import_endpoint_rejects_invalid_bundle(self) -> None:
+        response = self.client.post(
+            "/editor/profiles/import",
+            json={"bundle": {"bundle_version": 1, "profiles": []}},
+        )
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("bundle.profiles", str(payload.get("error", "")))
+
+    def test_editor_working_profile_rejects_disabled_profile(self) -> None:
+        enable_response = self.client.put(
+            "/editor/profiles/pet",
+            json={"enabled": True},
+        )
+        self.assertEqual(enable_response.status_code, 200)
+
+        disable_response = self.client.put(
+            "/editor/profiles/pet",
+            json={"enabled": False},
+        )
+        self.assertEqual(disable_response.status_code, 200)
+
+        working_response = self.client.post(
+            "/editor/profiles/working",
+            json={"profile_id": "pet"},
+        )
+        self.assertEqual(working_response.status_code, 400)
+        working_payload = working_response.get_json()
+        self.assertEqual(working_payload["status"], "error")
+        self.assertIn("disabled", str(working_payload.get("error", "")).lower())
+
+        reset_response = self.client.post(
+            "/editor/profiles/working",
+            json={"profile_id": "default"},
+        )
+        self.assertEqual(reset_response.status_code, 200)
+
+    def test_editor_profile_preview_endpoint_returns_match_for_sample_context(self) -> None:
+        response = self.client.post(
+            "/editor/profiles/preview",
+            json={"context_mode": "sample", "fixture_name": "strength_training"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["context_source"], "sample:strength_training")
+        self.assertEqual(payload["profile_match"]["profile_id"], "strength_training")
+        self.assertTrue(len(payload["profile_match"].get("reasons") or []) > 0)
+        self.assertIsInstance(payload["profile_match"].get("criteria"), dict)
+
+    def test_editor_profile_preview_endpoint_returns_404_when_latest_context_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            response = self.client.post(
+                "/editor/profiles/preview",
+                json={"context_mode": "latest"},
+            )
+            self.assertEqual(response.status_code, 404)
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "error")
+            self.assertIn("No template context", str(payload.get("error", "")))
+
+    def test_editor_profile_preview_endpoint_uses_latest_context_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            latest_context = api_server.get_sample_template_context("strength_training")
+            api_server.write_json(
+                api_server.settings.latest_json_file,
+                {"template_context": latest_context},
+            )
+            response = self.client.post(
+                "/editor/profiles/preview",
+                json={"context_mode": "latest"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["context_source"], "latest")
+            self.assertEqual(payload["profile_match"]["profile_id"], "strength_training")
+
+    def test_editor_profile_preview_excludes_disabled_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            disable_response = self.client.put(
+                "/editor/profiles/strength_training",
+                json={"enabled": False},
+            )
+            self.assertEqual(disable_response.status_code, 200)
+
+            response = self.client.post(
+                "/editor/profiles/preview",
+                json={"context_mode": "sample", "fixture_name": "strength_training"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "ok")
+            self.assertNotEqual(payload["profile_match"]["profile_id"], "strength_training")
+
     def test_editor_profile_put_accepts_string_false(self) -> None:
         response = self.client.put(
             "/editor/profiles/long_run",
@@ -801,6 +2021,196 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         payload = response.get_json()
         self.assertEqual(payload["status"], "error")
+
+    def test_editor_profile_priority_updates_affect_list_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            create_trail = self.client.post(
+                "/editor/profiles",
+                json={"profile_id": "trail_focus", "label": "Trail Focus", "criteria": {"kind": "activity"}},
+            )
+            self.assertEqual(create_trail.status_code, 200)
+            create_tempo = self.client.post(
+                "/editor/profiles",
+                json={"profile_id": "tempo_focus", "label": "Tempo Focus", "criteria": {"kind": "activity"}},
+            )
+            self.assertEqual(create_tempo.status_code, 200)
+
+            raise_tempo = self.client.put(
+                "/editor/profiles/tempo_focus",
+                json={"priority": 120},
+            )
+            self.assertEqual(raise_tempo.status_code, 200)
+
+            lower_trail = self.client.put(
+                "/editor/profiles/trail_focus",
+                json={"priority": 10},
+            )
+            self.assertEqual(lower_trail.status_code, 200)
+
+            list_response = self.client.get("/editor/profiles")
+            self.assertEqual(list_response.status_code, 200)
+            payload = list_response.get_json()
+            self.assertEqual(payload["status"], "ok")
+
+            profile_order = [item.get("profile_id") for item in payload["profiles"]]
+            self.assertLess(profile_order.index("tempo_focus"), profile_order.index("trail_focus"))
+
+    def test_editor_profile_put_rejects_invalid_priority_without_partial_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            create_response = self.client.post(
+                "/editor/profiles",
+                json={
+                    "profile_id": "tempo_focus",
+                    "label": "Tempo Focus",
+                    "criteria": {"kind": "activity", "keywords": ["tempo"]},
+                },
+            )
+            self.assertEqual(create_response.status_code, 200)
+
+            invalid_update = self.client.put(
+                "/editor/profiles/tempo_focus",
+                json={"priority": "not-an-int"},
+            )
+            self.assertEqual(invalid_update.status_code, 400)
+            invalid_payload = invalid_update.get_json()
+            self.assertEqual(invalid_payload["status"], "error")
+
+            list_response = self.client.get("/editor/profiles")
+            self.assertEqual(list_response.status_code, 200)
+            list_payload = list_response.get_json()
+            profile = next(
+                (item for item in list_payload["profiles"] if item.get("profile_id") == "tempo_focus"),
+                None,
+            )
+            self.assertIsNotNone(profile)
+            self.assertEqual(profile.get("priority"), 0)
+
+    def test_editor_profile_create_and_edit_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            create_response = self.client.post(
+                "/editor/profiles",
+                json={
+                    "profile_id": "tempo_focus",
+                    "label": "Tempo Focus",
+                    "criteria": {
+                        "kind": "activity",
+                        "keywords": ["tempo", "threshold"],
+                    },
+                },
+            )
+            self.assertEqual(create_response.status_code, 200)
+            create_payload = create_response.get_json()
+            self.assertEqual(create_payload["status"], "ok")
+            self.assertEqual(create_payload["profile"]["profile_id"], "tempo_focus")
+            self.assertEqual(create_payload["profile"]["label"], "Tempo Focus")
+            self.assertEqual(
+                create_payload["profile"]["criteria"],
+                {"kind": "activity", "keywords": ["tempo", "threshold"]},
+            )
+
+            list_response = self.client.get("/editor/profiles")
+            self.assertEqual(list_response.status_code, 200)
+            list_payload = list_response.get_json()
+            created_profile = next(
+                (item for item in list_payload["profiles"] if item.get("profile_id") == "tempo_focus"),
+                None,
+            )
+            self.assertIsNotNone(created_profile)
+            self.assertEqual(created_profile["label"], "Tempo Focus")
+
+            update_response = self.client.put(
+                "/editor/profiles/tempo_focus",
+                json={
+                    "label": "Tempo Builder",
+                    "criteria": {"kind": "activity", "sport_types": ["Run"]},
+                },
+            )
+            self.assertEqual(update_response.status_code, 200)
+            update_payload = update_response.get_json()
+            self.assertEqual(update_payload["status"], "ok")
+            self.assertEqual(update_payload["profile"]["label"], "Tempo Builder")
+            self.assertEqual(update_payload["profile"]["criteria"], {"kind": "activity", "sport_types": ["Run"]})
+
+    def test_editor_profile_create_rejects_invalid_or_conflicting_payload_without_partial_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            create_response = self.client.post(
+                "/editor/profiles",
+                json={
+                    "profile_id": "tempo_focus",
+                    "label": "Tempo Focus",
+                    "criteria": {"kind": "activity", "keywords": ["tempo"]},
+                },
+            )
+            self.assertEqual(create_response.status_code, 200)
+
+            duplicate_response = self.client.post(
+                "/editor/profiles",
+                json={
+                    "profile_id": "tempo_focus",
+                    "label": "Tempo Focus Copy",
+                    "criteria": {"kind": "activity", "keywords": ["copy"]},
+                },
+            )
+            self.assertEqual(duplicate_response.status_code, 400)
+            duplicate_payload = duplicate_response.get_json()
+            self.assertEqual(duplicate_payload["status"], "error")
+
+            invalid_criteria_response = self.client.put(
+                "/editor/profiles/tempo_focus",
+                json={"criteria": ["not", "an", "object"]},
+            )
+            self.assertEqual(invalid_criteria_response.status_code, 400)
+            invalid_criteria_payload = invalid_criteria_response.get_json()
+            self.assertEqual(invalid_criteria_payload["status"], "error")
+
+            list_response = self.client.get("/editor/profiles")
+            self.assertEqual(list_response.status_code, 200)
+            list_payload = list_response.get_json()
+            created_profile = next(
+                (item for item in list_payload["profiles"] if item.get("profile_id") == "tempo_focus"),
+                None,
+            )
+            self.assertIsNotNone(created_profile)
+            self.assertEqual(created_profile["label"], "Tempo Focus")
+            self.assertEqual(created_profile["criteria"], {"kind": "activity", "keywords": ["tempo"]})
+
+    def test_editor_profile_put_rejects_default_profile_label_or_criteria_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+
+            rename_response = self.client.put(
+                "/editor/profiles/default",
+                json={"label": "Default Updated"},
+            )
+            self.assertEqual(rename_response.status_code, 400)
+            rename_payload = rename_response.get_json()
+            self.assertEqual(rename_payload["status"], "error")
+
+            criteria_response = self.client.put(
+                "/editor/profiles/default",
+                json={"criteria": {"kind": "activity", "keywords": ["new"]}},
+            )
+            self.assertEqual(criteria_response.status_code, 400)
+            criteria_payload = criteria_response.get_json()
+            self.assertEqual(criteria_payload["status"], "error")
+
+            list_response = self.client.get("/editor/profiles")
+            self.assertEqual(list_response.status_code, 200)
+            list_payload = list_response.get_json()
+            default_profile = next(
+                (item for item in list_payload["profiles"] if item.get("profile_id") == "default"),
+                None,
+            )
+            self.assertIsNotNone(default_profile)
+            self.assertEqual(default_profile["label"], "Default")
 
     def test_editor_repository_endpoints(self) -> None:
         list_response = self.client.get("/editor/repository/templates")
@@ -898,6 +2308,62 @@ class TestApiServer(unittest.TestCase):
         self.assertIn("bundle_version", payload)
         self.assertIn("template", payload)
         self.assertIn("exported_at_utc", payload)
+
+    def test_editor_template_export_endpoint_honors_profile_versions_and_limit(self) -> None:
+        save_response = self.client.put(
+            "/editor/template",
+            json={
+                "template": "Trail Export {{ activity.distance_miles }}",
+                "author": "tester",
+                "name": "Trail Export Template",
+                "source": "test",
+                "context_mode": "sample",
+                "profile_id": "trail",
+            },
+        )
+        self.assertEqual(save_response.status_code, 200)
+
+        response = self.client.get("/editor/template/export?profile_id=trail&include_versions=true&limit=1")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["profile_id"], "trail")
+        self.assertIn("versions", payload)
+        self.assertEqual(len(payload["versions"]), 1)
+        self.assertIn("template", payload)
+        self.assertIn("bundle_version", payload)
+
+    def test_editor_template_export_endpoint_supports_repository_template_id(self) -> None:
+        save_as_response = self.client.post(
+            "/editor/repository/save_as",
+            json={
+                "template": "Repo Export {{ activity.distance_miles }}",
+                "name": "Repo Export Template",
+                "author": "tester",
+                "context_mode": "sample",
+            },
+        )
+        self.assertEqual(save_as_response.status_code, 200)
+        template_id = save_as_response.get_json()["template_record"]["template_id"]
+
+        response = self.client.get(
+            f"/editor/template/export?template_id={template_id}&include_versions=true&limit=1"
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["template_id"], template_id)
+        self.assertEqual(payload["bundle_version"], 2)
+        self.assertIn("exported_at_utc", payload)
+        self.assertIn("versions", payload)
+        self.assertEqual(len(payload["versions"]), 1)
+
+    def test_editor_template_export_endpoint_rejects_unknown_repository_template_id(self) -> None:
+        response = self.client.get("/editor/template/export?template_id=does-not-exist")
+        self.assertEqual(response.status_code, 404)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("Unknown template_id", str(payload.get("error", "")))
 
     def test_editor_template_import_endpoint(self) -> None:
         response = self.client.post(
@@ -1018,6 +2484,39 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(load_payload["profile_id"], "trail")
         self.assertIn("Trail", load_payload["template"])
 
+    def test_editor_template_get_uses_working_profile_when_profile_id_omitted(self) -> None:
+        save_response = self.client.put(
+            "/editor/template",
+            json={
+                "template": "Trail Working {{ activity.distance_miles }}",
+                "author": "tester",
+                "name": "Trail Working Template",
+                "source": "test",
+                "context_mode": "sample",
+                "profile_id": "trail",
+            },
+        )
+        self.assertEqual(save_response.status_code, 200)
+
+        working_response = self.client.post(
+            "/editor/profiles/working",
+            json={"profile_id": "trail"},
+        )
+        self.assertEqual(working_response.status_code, 200)
+
+        load_response = self.client.get("/editor/template")
+        self.assertEqual(load_response.status_code, 200)
+        load_payload = load_response.get_json()
+        self.assertEqual(load_payload["status"], "ok")
+        self.assertEqual(load_payload["profile_id"], "trail")
+        self.assertIn("Trail Working", load_payload["template"])
+
+        reset_response = self.client.post(
+            "/editor/profiles/working",
+            json={"profile_id": "default"},
+        )
+        self.assertEqual(reset_response.status_code, 200)
+
     def test_editor_template_put_rejects_invalid_context_mode(self) -> None:
         response = self.client.put(
             "/editor/template",
@@ -1062,6 +2561,108 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(rollback_response.status_code, 200)
         rollback_payload = rollback_response.get_json()
         self.assertEqual(rollback_payload["status"], "ok")
+
+    def test_editor_template_rollback_requires_version_id(self) -> None:
+        response = self.client.post("/editor/template/rollback", json={"author": "tester"})
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["error"], "version_id is required.")
+
+    def test_editor_template_rollback_rejects_unknown_version(self) -> None:
+        response = self.client.post(
+            "/editor/template/rollback",
+            json={"version_id": "does-not-exist", "author": "tester"},
+        )
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("Unknown template version", str(payload["error"]))
+
+    def test_editor_template_versions_respects_limit_query(self) -> None:
+        save_one = self.client.put(
+            "/editor/template",
+            json={
+                "template": "Version 1 {{ activity.distance_miles }}",
+                "author": "tester",
+                "name": "Template One",
+                "source": "test",
+            },
+        )
+        self.assertEqual(save_one.status_code, 200)
+        save_two = self.client.put(
+            "/editor/template",
+            json={
+                "template": "Version 2 {{ activity.distance_miles }}",
+                "author": "tester",
+                "name": "Template Two",
+                "source": "test",
+            },
+        )
+        self.assertEqual(save_two.status_code, 200)
+
+        response = self.client.get("/editor/template/versions?limit=1")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(len(payload["versions"]), 1)
+
+    def test_editor_template_versions_profile_scoping(self) -> None:
+        save_default = self.client.put(
+            "/editor/template",
+            json={
+                "template": "Default Scope {{ activity.distance_miles }}",
+                "author": "tester",
+                "name": "Default Scope Template",
+                "source": "test",
+            },
+        )
+        self.assertEqual(save_default.status_code, 200)
+        default_payload = save_default.get_json()
+        self.assertEqual(default_payload["status"], "ok")
+        default_saved_version = default_payload["saved_version"]
+        default_version_id = (
+            default_saved_version["version_id"]
+            if isinstance(default_saved_version, dict)
+            else str(default_saved_version)
+        )
+
+        save_trail = self.client.put(
+            "/editor/template",
+            json={
+                "template": "Trail Scope {{ activity.distance_miles }}",
+                "author": "tester",
+                "name": "Trail Scope Template",
+                "source": "test",
+                "profile_id": "trail",
+                "context_mode": "sample",
+            },
+        )
+        self.assertEqual(save_trail.status_code, 200)
+        trail_payload = save_trail.get_json()
+        self.assertEqual(trail_payload["status"], "ok")
+        trail_saved_version = trail_payload["saved_version"]
+        trail_version_id = (
+            trail_saved_version["version_id"]
+            if isinstance(trail_saved_version, dict)
+            else str(trail_saved_version)
+        )
+
+        default_versions_response = self.client.get("/editor/template/versions?profile_id=default")
+        self.assertEqual(default_versions_response.status_code, 200)
+        default_versions_payload = default_versions_response.get_json()
+        self.assertEqual(default_versions_payload["status"], "ok")
+        default_version_ids = {row["version_id"] for row in default_versions_payload["versions"]}
+        self.assertIn(default_version_id, default_version_ids)
+        self.assertNotIn(trail_version_id, default_version_ids)
+
+        trail_versions_response = self.client.get("/editor/template/versions?profile_id=trail")
+        self.assertEqual(trail_versions_response.status_code, 200)
+        trail_versions_payload = trail_versions_response.get_json()
+        self.assertEqual(trail_versions_payload["status"], "ok")
+        trail_version_ids = {row["version_id"] for row in trail_versions_payload["versions"]}
+        self.assertIn(trail_version_id, trail_version_ids)
+        self.assertNotIn(default_version_id, trail_version_ids)
 
 
 if __name__ == "__main__":

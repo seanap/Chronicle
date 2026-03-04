@@ -30,3 +30,8 @@ android/captures/
 *.jks
 *.keystore
 *.aab
+
+# SPA workspace artifacts
+chronicle-ui/node_modules/
+chronicle-ui/dist/
+chronicle-ui/coverage/

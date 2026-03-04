@@ -55,6 +55,73 @@ curl http://localhost:1609/service-metrics
 ### GET `/control`
 - Purpose: Control page (GUI for API operations).
 
+### GET `/sources`
+- Purpose: Canonical Sources journey route guarded by rollout mode (`mpa` or `spa`).
+
+### GET `/build`
+- Purpose: Canonical Build journey route guarded by rollout mode.
+
+### GET `/view`
+- Purpose: Canonical View journey route guarded by rollout mode.
+
+### GET `/legacy/<flow_name>`
+- Purpose: Force legacy MPA fallback route for a core flow.
+- Supported `flow_name` values:
+  - `sources`
+  - `build`
+  - `plan`
+  - `view`
+  - `control`
+
+### GET `/app` and GET `/app/<path>`
+- Purpose: SPA entry route for canonical flows.
+- Behavior:
+  - Serves `chronicle-ui/dist/index.html` when built SPA assets exist.
+  - Falls back to `/legacy/<flow_name>` when built assets are unavailable.
+
+## UI Rollout Guardrails
+
+### GET `/ops/ui-rollout/status`
+- Purpose: Return active rollout mode, route targets, and rollback metadata.
+- Response highlights:
+  - `mode`: `mpa` or `spa`
+  - `flows`: canonical path + active target for each core journey
+  - `rollback_target_minutes`: rollback SLO target (15 minutes)
+- Example:
+```bash
+curl http://localhost:1609/ops/ui-rollout/status
+```
+
+### POST `/ops/ui-rollout/mode`
+- Purpose: Switch rollout mode for controlled release simulation.
+- Body:
+  - `mode`: `mpa` or `spa` (required)
+  - `source`: caller identifier (optional)
+  - `reason`: change reason (optional)
+- Example:
+```bash
+curl -X POST http://localhost:1609/ops/ui-rollout/mode \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"spa","source":"release-check"}'
+```
+
+### POST `/ops/ui-rollout/rollback`
+- Purpose: Trigger rollback to legacy MPA route targets.
+- Body:
+  - `source`: caller identifier (optional)
+  - `reason`: rollback reason (optional)
+- Response highlights:
+  - `mode`: always `mpa`
+  - `rollback_target_minutes`: `15`
+  - `elapsed_ms`: rollback execution duration
+  - `verification_checklist`: executable route verification targets
+- Example:
+```bash
+curl -X POST http://localhost:1609/ops/ui-rollout/rollback \
+  -H "Content-Type: application/json" \
+  -d '{"source":"oncall","reason":"regression"}'
+```
+
 ## Dashboard Data
 
 ### GET `/dashboard/data.json`

@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chronicle UX Design Directions</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg-0: #050505;
+      --bg-1: #0b0b0f;
+      --bg-2: #111116;
+      --panel: rgba(18, 18, 24, 0.94);
+      --panel-2: rgba(26, 26, 34, 0.92);
+      --ghost: #23232d;
+      --line: rgba(255, 255, 255, 0.08);
+      --text: #f1f1f4;
+      --muted: #a4a5b4;
+      --accent: #ff6a00;
+      --accent-soft: rgba(255, 106, 0, 0.18);
+      --success: #3bd27f;
+      --warn: #ffb020;
+      --radius: 16px;
+      --radius-sm: 12px;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+      --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: "Space Grotesk", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(900px 500px at 15% 5%, rgba(255, 106, 0, 0.14), transparent 55%),
+        radial-gradient(760px 420px at 85% -10%, rgba(255, 106, 0, 0.12), transparent 55%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-0));
+      min-height: 100vh;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(9, 9, 12, 0.88);
+      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+    }
+
+    header .wrap {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #ff6a00, #ff9f3d);
+      box-shadow: 0 8px 20px rgba(255, 106, 0, 0.35);
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0.02em;
+    }
+
+    .brand span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .badge-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    main {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      gap: 28px;
+    }
+
+    .dir {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: linear-gradient(180deg, rgba(20, 20, 26, 0.85), rgba(12, 12, 16, 0.96));
+      box-shadow: var(--shadow);
+    }
+
+    .dir h2 {
+      margin: 0;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .dir h2 span {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .canvas {
+      padding: 24px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .frame {
+      background: rgba(10, 10, 14, 0.98);
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line);
+      overflow: hidden;
+    }
+
+    .frame-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 18px;
+      background: rgba(18, 18, 24, 0.95);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .frame-title {
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .nav {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .nav a {
+      font-size: 12px;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+    }
+
+    .nav a.active {
+      color: var(--text);
+      border-color: var(--line);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .frame-body {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .row {
+      display: grid;
+      gap: 12px;
+    }
+
+    .row.cols-2 { grid-template-columns: 1.2fr 1fr; }
+    .row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .row.cols-4 { grid-template-columns: repeat(4, 1fr); }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: 14px;
+      min-height: 100px;
+      transition: transform 0.25s ease, border-color 0.25s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255, 106, 0, 0.35);
+    }
+
+    .card h3 {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .chip.accent { color: #140b05; background: var(--accent); border-color: transparent; font-weight: 700; }
+
+    .cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: none;
+      background: var(--accent);
+      color: #140b05;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+    .table {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 6px;
+    }
+
+    .cell {
+      height: 24px;
+      border-radius: 6px;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+    }
+
+    .cell.hot { background: rgba(255, 106, 0, 0.28); border-color: rgba(255, 106, 0, 0.35); }
+
+    .list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .list .item {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+
+    .tag { font-family: var(--mono); font-size: 11px; color: #ffb06b; }
+
+    .split {
+      display: grid;
+      grid-template-columns: 240px 1fr;
+      gap: 14px;
+    }
+
+    .drawer {
+      background: rgba(15, 15, 20, 0.98);
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .drawer .drawer-head { font-weight: 600; font-size: 13px; }
+
+    .grid-heat {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+    }
+
+    .grid-heat .cell { height: 18px; }
+
+    .legend {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .legend span {
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .banner {
+      padding: 10px 14px;
+      border-radius: 12px;
+      background: var(--accent-soft);
+      border: 1px solid rgba(255, 106, 0, 0.3);
+      color: #ffd0ad;
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .row.cols-2, .row.cols-3, .row.cols-4, .split { grid-template-columns: 1fr; }
+      .frame-header { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div>
+          <h1>Chronicle · UX Design Directions</h1>
+          <span>Your training timeline, automated.</span>
+        </div>
+      </div>
+      <div class="badge-row">
+        <span class="badge">Neon Orange</span>
+        <span class="badge">Dark Luxury</span>
+        <span class="badge">Premium / Porsche</span>
+        <span class="badge">MPA Today</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="dir">
+      <h2>Direction 1 — “Chronicle Blackbox” <span>Balanced · all pages equally weighted</span></h2>
+      <div class="canvas">
+        <div class="frame">
+          <div class="frame-header">
+            <div class="frame-title">Chronicle</div>
+            <nav class="nav">
+              <a class="active" href="#">View</a>
+              <a href="#">Plan</a>
+              <a href="#">Build</a>
+              <a href="#">Control</a>
+              <a href="#">Sources</a>
+            </nav>
+          </div>
+          <div class="frame-body row cols-2">
+            <div class="row">
+              <div class="card">
+                <h3>Heatmap Story</h3>
+                <div class="grid-heat">
+                  <div class="cell"></div><div class="cell"></div><div class="cell hot"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell hot"></div>
+                  <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell hot"></div><div class="cell"></div><div class="cell"></div>
+                </div>
+                <div class="legend" style="margin-top:8px;">
+                  <span>Low</span><span>Optimal</span><span>Risk</span>
+                </div>
+              </div>
+              <div class="card">
+                <h3>Latest Description</h3>
+                <p class="muted">“8.2 mi — 1.9 banana μSv · hill score +12 · VO₂ steady.”</p>
+                <span class="tag">auto-description ✓</span>
+              </div>
+            </div>
+            <div class="row">
+              <div class="card">
+                <h3>Plan Snapshot</h3>
+                <div class="table">
+                  <div class="cell"></div><div class="cell"></div><div class="cell hot"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+                </div>
+                <div class="mono" style="margin-top:8px;">Trailing 2w / Next 2w</div>
+              </div>
+              <div class="card">
+                <h3>Automation</h3>
+                <div class="list">
+                  <div class="item"><span>Detect → Classify → Render</span><span class="tag">ready</span></div>
+                  <div class="item"><span>Strava write-back</span><span class="tag">queued</span></div>
+                </div>
+                <button class="cta" style="margin-top:10px;">Run Test</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="dir">
+      <h2>Direction 2 — “Porsche Cockpit” <span>Hero actions + fast status</span></h2>
+      <div class="canvas">
+        <div class="frame">
+          <div class="frame-header">
+            <div class="frame-title">Chronicle · Control</div>
+            <nav class="nav">
+              <a href="#">View</a>
+              <a href="#">Plan</a>
+              <a href="#">Build</a>
+              <a class="active" href="#">Control</a>
+              <a href="#">Sources</a>
+            </nav>
+          </div>
+          <div class="frame-body">
+            <div class="row cols-3">
+              <div class="card">
+                <h3>Today</h3>
+                <p><span class="chip">8 mi Easy</span> <span class="chip accent">Garmin Ready</span></p>
+                <button class="cta">Send to Garmin</button>
+              </div>
+              <div class="card">
+                <h3>Status</h3>
+                <p class="muted">All sources connected · Last sync 12m ago</p>
+                <span class="tag">heartbeat ✓</span>
+              </div>
+              <div class="card">
+                <h3>Ops Queue</h3>
+                <div class="list">
+                  <div class="item"><span>Write Description</span><span class="tag">ok</span></div>
+                  <div class="item"><span>Refresh Plan</span><span class="tag">idle</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="card">
+              <h3>Operations</h3>
+              <div class="row cols-4">
+                <div class="chip">Filter</div>
+                <div class="chip">Clear Status</div>
+                <div class="chip">Run Selected</div>
+                <div class="chip">View Logs</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="dir">
+      <h2>Direction 3 — “Workshop Focus” <span>Build page as a creative studio</span></h2>
+      <div class="canvas">
+        <div class="frame">
+          <div class="frame-header">
+            <div class="frame-title">Chronicle · Build</div>
+            <nav class="nav">
+              <a href="#">View</a>
+              <a href="#">Plan</a>
+              <a class="active" href="#">Build</a>
+              <a href="#">Control</a>
+              <a href="#">Sources</a>
+            </nav>
+          </div>
+          <div class="frame-body split">
+            <div class="drawer">
+              <div class="drawer-head">Workshop</div>
+              <span class="chip">Profile Workspace</span>
+              <span class="chip">Template Controls</span>
+              <span class="chip">Template Repository</span>
+              <span class="chip">History + Rollback</span>
+              <span class="chip">Jinja Reference</span>
+            </div>
+            <div class="row">
+              <div class="card">
+                <h3>Editor</h3>
+                <p class="mono">{{ activity.distance_miles }} mi · {{ run_type }}</p>
+                <div class="banner" style="margin-top:8px;">Live preview + Jinja hints + auto-preview.</div>
+              </div>
+              <div class="row cols-2">
+                <div class="card"><h3>Preview</h3><p class="muted">“2.1 banana μSv · 52°F · cadence 176.”</p></div>
+                <div class="card"><h3>Template Stats</h3><p class="muted">Errors: 0 · Render: 120ms</p></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="dir">
+      <h2>Direction 4 — “Plan Ledger” <span>Dense planning with clarity</span></h2>
+      <div class="canvas">
+        <div class="frame">
+          <div class="frame-header">
+            <div class="frame-title">Chronicle · Plan</div>
+            <nav class="nav">
+              <a href="#">View</a>
+              <a class="active" href="#">Plan</a>
+              <a href="#">Build</a>
+              <a href="#">Control</a>
+              <a href="#">Sources</a>
+            </nav>
+          </div>
+          <div class="frame-body">
+            <div class="row cols-2">
+              <div class="card">
+                <h3>Plan Controls</h3>
+                <div class="row cols-2">
+                  <span class="chip">Center Date</span>
+                  <span class="chip">Reload</span>
+                </div>
+              </div>
+              <div class="card">
+                <h3>Pace Workshop</h3>
+                <p class="muted">Goal time → training paces</p>
+                <button class="cta">Open Pace Drawer</button>
+              </div>
+            </div>
+            <div class="card">
+              <h3>Plan Table</h3>
+              <div class="table">
+                <div class="cell"></div><div class="cell"></div><div class="cell hot"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+                <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell hot"></div><div class="cell"></div><div class="cell"></div>
+              </div>
+              <div class="legend" style="margin-top:8px;">
+                <span>Low</span><span>Optimal</span><span>Risk</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="dir">
+      <h2>Direction 5 — “Sources Atelier” <span>Onboarding + reliability focus</span></h2>
+      <div class="canvas">
+        <div class="frame">
+          <div class="frame-header">
+            <div class="frame-title">Chronicle · Sources</div>
+            <nav class="nav">
+              <a href="#">View</a>
+              <a href="#">Plan</a>
+              <a href="#">Build</a>
+              <a href="#">Control</a>
+              <a class="active" href="#">Sources</a>
+            </nav>
+          </div>
+          <div class="frame-body row cols-2">
+            <div class="row">
+              <div class="card">
+                <h3>Provider Grid</h3>
+                <div class="row cols-2">
+                  <span class="chip">Strava · Connected</span>
+                  <span class="chip">Garmin · Ready</span>
+                  <span class="chip">Smashrun · Token</span>
+                  <span class="chip">Intervals.icu · Linked</span>
+                </div>
+              </div>
+              <div class="card">
+                <h3>Status</h3>
+                <p class="muted">OAuth healthy · next heartbeat in 6m</p>
+                <span class="tag">self-hosted ✓</span>
+              </div>
+            </div>
+            <div class="card">
+              <h3>.env Snapshot</h3>
+              <p class="mono">STRAVA_CLIENT_ID=••••</p>
+              <p class="mono">STRAVA_CLIENT_SECRET=••••</p>
+              <p class="mono">GARMIN_USERNAME=••••</p>
+              <p class="mono">GARMIN_PASSWORD=••••</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="dir">
+      <h2>Direction 6 — “Heatmap Gallery” <span>View page: story + trends</span></h2>
+      <div class="canvas">
+        <div class="frame">
+          <div class="frame-header">
+            <div class="frame-title">Chronicle · View</div>
+            <nav class="nav">
+              <a class="active" href="#">View</a>
+              <a href="#">Plan</a>
+              <a href="#">Build</a>
+              <a href="#">Control</a>
+              <a href="#">Sources</a>
+            </nav>
+          </div>
+          <div class="frame-body">
+            <div class="row cols-3">
+              <div class="card"><h3>Year Heatmap</h3><div class="grid-heat">
+                <div class="cell"></div><div class="cell hot"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell hot"></div><div class="cell"></div>
+              </div></div>
+              <div class="card"><h3>Summary</h3><p class="muted">Volume 48 mi · Streak 6</p></div>
+              <div class="card"><h3>Latest Story</h3><p class="muted">“Cadence 176 · 2.1 banana μSv.”</p></div>
+            </div>
+            <div class="card">
+              <h3>Trend Panels</h3>
+              <div class="row cols-4">
+                <div class="chip">VO₂max</div>
+                <div class="chip">Hill Score</div>
+                <div class="chip">TSS</div>
+                <div class="chip">Sleep</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

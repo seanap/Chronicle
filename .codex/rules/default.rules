@@ -1,0 +1,4 @@
+prefix_rule(pattern=["npm", "install"], decision="allow")
+prefix_rule(pattern=["npm", "view"], decision="allow")
+prefix_rule(pattern=["npm", "cache", "clean", "--force"], decision="allow")
+prefix_rule(pattern=["rm", "-rf", "/home/shipyard/.gradle/caches", "/home/shipyard/.npm/_cacache"], decision="allow")

@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
-from flask import Flask, redirect, render_template, request
+from flask import Flask, redirect, render_template, request, send_from_directory
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .activity_pipeline import run_once
+from .activity_pipeline import preview_profile_match, run_once
 from .config import Settings
 from .dashboard_data import get_dashboard_payload
-from .plan_data import get_plan_payload
+from .garmin_sync_queue import (
+    initiate_garmin_sync_request,
+    mark_garmin_sync_request_failed,
+    run_garmin_sync_request,
+    schedule_garmin_sync_request,
+)
+from .plan_data import RUN_TYPE_OPTIONS, get_plan_payload
 from .pace_workshop import (
     DEFAULT_MARATHON_GOAL,
     calculate_race_equivalency,
@@ -37,6 +44,7 @@ from .storage import (
     delete_runtime_value,
     get_plan_day,
     get_runtime_value,
+    get_runtime_values,
     get_worker_heartbeat,
     is_worker_healthy,
     list_plan_sessions,
@@ -49,8 +57,11 @@ from .storage import (
     write_json,
 )
 from .template_profiles import (
+    create_template_profile,
+    export_template_profiles_bundle,
     get_template_profile,
     get_working_template_profile,
+    import_template_profiles_bundle,
     list_template_profiles,
     set_working_template_profile,
     update_template_profile,
@@ -76,6 +87,7 @@ from .template_repository import (
 )
 from .template_rendering import normalize_template_context, render_template_text, validate_template_text
 from .template_schema import build_context_schema
+from .workout_workshop import list_workout_definitions, upsert_workout_definition
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -86,6 +98,28 @@ app = Flask(
     static_folder=str(PROJECT_ROOT / "static"),
     static_url_path="/static",
 )
+
+_PLAN_RUN_TYPE_OPTIONS = [str(item).strip() for item in RUN_TYPE_OPTIONS if str(item).strip()]
+_PLAN_RUN_TYPE_OPTIONS_BY_KEY = {
+    "".join(ch for ch in option.lower() if ch.isalnum()): option
+    for option in _PLAN_RUN_TYPE_OPTIONS
+}
+
+
+def _normalize_plan_run_type_key(value: object) -> str:
+    return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
+
+
+def _coerce_plan_run_type(raw_value: object) -> str | None:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    normalized_key = _normalize_plan_run_type_key(text)
+    canonical = _PLAN_RUN_TYPE_OPTIONS_BY_KEY.get(normalized_key)
+    if canonical is None:
+        allowed = ", ".join(_PLAN_RUN_TYPE_OPTIONS)
+        raise ValueError(f"run_type must be one of: {allowed}.")
+    return canonical
 settings = Settings.from_env()
 settings.ensure_state_paths()
 
@@ -95,6 +129,128 @@ STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 METERS_PER_MILE = 1609.34
 PLAN_PACE_WORKSHOP_GOAL_KEY = "pace_workshop.marathon_goal"
+UI_ROLLOUT_RUNTIME_KEY = "ui.rollout.mode"
+UI_ROLLOUT_LAST_MODE_CHANGE_KEY = "ui.rollout.last_mode_change"
+UI_ROLLOUT_LAST_ROLLBACK_KEY = "ui.rollout.last_rollback"
+UI_ROLLOUT_ALLOWED_MODES = {"mpa", "spa"}
+UI_ROLLBACK_TARGET_MINUTES = 15
+CORE_UI_FLOW_LEGACY_PATHS = {
+    "sources": "/setup",
+    "build": "/editor",
+    "plan": "/plan",
+    "view": "/dashboard",
+    "control": "/control",
+}
+
+
+def _normalize_ui_flow(value: object) -> str | None:
+    flow = str(value or "").strip().lower()
+    if flow in CORE_UI_FLOW_LEGACY_PATHS:
+        return flow
+    return None
+
+
+def _normalize_ui_rollout_mode(value: object) -> str | None:
+    mode = str(value or "").strip().lower()
+    if mode in UI_ROLLOUT_ALLOWED_MODES:
+        return mode
+    return None
+
+
+def _ui_rollout_default_mode() -> str:
+    configured = _normalize_ui_rollout_mode(os.getenv("UI_ROLLOUT_DEFAULT_MODE", "mpa"))
+    return configured or "mpa"
+
+
+def _ui_rollout_spa_base_path() -> str:
+    configured = str(os.getenv("UI_SPA_BASE_PATH", "/app") or "").strip()
+    if not configured:
+        return "/app"
+    if not configured.startswith("/"):
+        configured = f"/{configured}"
+    return configured.rstrip("/") or "/app"
+
+
+def _legacy_flow_path(flow_name: str) -> str:
+    return f"/legacy/{flow_name}"
+
+
+def _spa_flow_path(flow_name: str) -> str:
+    return f"{_ui_rollout_spa_base_path()}/{flow_name}"
+
+
+def _ui_rollout_targets(mode: str) -> dict[str, str]:
+    normalized_mode = _normalize_ui_rollout_mode(mode) or "mpa"
+    if normalized_mode == "spa":
+        return {flow_name: _spa_flow_path(flow_name) for flow_name in CORE_UI_FLOW_LEGACY_PATHS}
+    return {flow_name: _legacy_flow_path(flow_name) for flow_name in CORE_UI_FLOW_LEGACY_PATHS}
+
+
+def _current_ui_rollout_mode(current: Settings | None = None) -> str:
+    effective = current or _effective_settings()
+    runtime_mode = _normalize_ui_rollout_mode(get_runtime_value(effective.processed_log_file, UI_ROLLOUT_RUNTIME_KEY))
+    if runtime_mode is not None:
+        return runtime_mode
+    return _ui_rollout_default_mode()
+
+
+def _set_ui_rollout_mode(
+    current: Settings,
+    mode: str,
+    *,
+    source: str,
+    reason: str | None = None,
+) -> str:
+    normalized_mode = _normalize_ui_rollout_mode(mode)
+    if normalized_mode is None:
+        raise ValueError("mode must be one of: mpa, spa.")
+
+    timestamp_utc = datetime.now(timezone.utc).isoformat()
+    set_runtime_value(current.processed_log_file, UI_ROLLOUT_RUNTIME_KEY, normalized_mode)
+    set_runtime_value(
+        current.processed_log_file,
+        UI_ROLLOUT_LAST_MODE_CHANGE_KEY,
+        {
+            "mode": normalized_mode,
+            "source": source,
+            "reason": reason or "",
+            "changed_at_utc": timestamp_utc,
+        },
+    )
+    return timestamp_utc
+
+
+def _render_legacy_core_flow(flow_name: str) -> str:
+    if flow_name == "sources":
+        return render_template("setup.html")
+    if flow_name == "build":
+        return render_template("editor.html")
+    if flow_name == "plan":
+        return render_template("plan.html")
+    if flow_name == "view":
+        return render_template("dashboard.html")
+    if flow_name == "control":
+        return render_template("control.html")
+    raise ValueError(f"Unsupported core flow '{flow_name}'.")
+
+
+def _core_flow_entrypoint(flow_name: str):
+    normalized_flow = _normalize_ui_flow(flow_name)
+    if normalized_flow is None:
+        return {
+            "status": "error",
+            "error": {
+                "code": "CORE_FLOW_NOT_FOUND",
+                "message": "Unknown core flow.",
+                "details": {"flow": flow_name},
+            },
+        }, 404
+
+    current = _effective_settings()
+    mode = _current_ui_rollout_mode(current)
+    if mode == "spa":
+        return redirect(_spa_flow_path(normalized_flow), code=302)
+    return _render_legacy_core_flow(normalized_flow)
 
 
 def _effective_settings() -> Settings:
@@ -274,6 +430,24 @@ def _resolve_profile_id(raw_profile_id: str | None) -> str:
     return str(get_working_template_profile(settings).get("profile_id") or "default")
 
 
+def _resolve_profile_id_filters() -> list[str] | None:
+    raw_values: list[str] = []
+    raw_values.extend(request.args.getlist("profile_id"))
+    csv_ids = str(request.args.get("profile_ids") or "").strip()
+    if csv_ids:
+        raw_values.extend(csv_ids.split(","))
+
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        normalized = str(raw_value or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        filtered.append(normalized)
+    return filtered or None
+
+
 def _parse_enabled_value(raw_value: object) -> bool:
     if isinstance(raw_value, bool):
         return raw_value
@@ -287,6 +461,18 @@ def _parse_enabled_value(raw_value: object) -> bool:
         if normalized in {"0", "false", "no", "n", "off"}:
             return False
     raise ValueError("enabled must be a boolean (true/false).")
+
+
+def _parse_profile_label(raw_value: object) -> str:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError("label is required.")
+    return raw_value.strip()
+
+
+def _parse_profile_criteria(raw_value: object) -> dict:
+    if not isinstance(raw_value, dict):
+        raise ValueError("criteria must be an object.")
+    return raw_value
 
 
 def _resolve_plan_date(raw_date: str) -> str:
@@ -366,7 +552,7 @@ def _parse_plan_sessions_input(raw_value: object) -> tuple[list[dict[str, object
         workout_code: str | None = None
         if isinstance(item, dict):
             planned_raw = item.get("planned_miles")
-            run_type = str(item.get("run_type") or "").strip() or None
+            run_type = _coerce_plan_run_type(item.get("run_type"))
             workout_code = str(item.get("planned_workout") or item.get("workout_code") or "").strip() or None
         else:
             planned_raw = item
@@ -410,8 +596,10 @@ def _coerce_plan_day_payload(
     *,
     existing_day: dict[str, object],
 ) -> tuple[str | None, str | None, bool | None, float | int | str | None, list[dict[str, object]] | None]:
-    raw_run_type = body.get("run_type", existing_day.get("run_type"))
-    run_type = str(raw_run_type or "").strip() or None
+    if "run_type" in body:
+        run_type = _coerce_plan_run_type(body.get("run_type"))
+    else:
+        run_type = str(existing_day.get("run_type") or "").strip() or None
     raw_notes = body.get("notes", existing_day.get("notes"))
     notes = str(raw_notes or "").strip() or None
 
@@ -682,6 +870,11 @@ def setup_page() -> str:
     return render_template("setup.html")
 
 
+@app.get("/sources")
+def sources_page():
+    return _core_flow_entrypoint("sources")
+
+
 @app.get("/")
 def landing_page():
     return redirect("/dashboard", code=302)
@@ -692,14 +885,230 @@ def dashboard_page() -> str:
     return render_template("dashboard.html")
 
 
+@app.get("/view")
+def view_page():
+    return _core_flow_entrypoint("view")
+
+
+@app.get("/build")
+def build_page():
+    return _core_flow_entrypoint("build")
+
+
 @app.get("/plan")
-def plan_page() -> str:
-    return render_template("plan.html")
+def plan_page():
+    return _core_flow_entrypoint("plan")
 
 
 @app.get("/control")
-def control_page() -> str:
-    return render_template("control.html")
+def control_page():
+    return _core_flow_entrypoint("control")
+
+
+@app.get("/legacy/<string:flow_name>")
+def legacy_core_flow_page(flow_name: str):
+    normalized_flow = _normalize_ui_flow(flow_name)
+    if normalized_flow is None:
+        return {
+            "status": "error",
+            "error": {
+                "code": "LEGACY_FLOW_NOT_FOUND",
+                "message": "Unknown legacy core flow.",
+                "details": {"flow": flow_name},
+            },
+        }, 404
+    return _render_legacy_core_flow(normalized_flow)
+
+
+@app.get("/app")
+@app.get("/app/")
+@app.get("/app/<path:spa_path>")
+def spa_app_entry(spa_path: str = ""):
+    dist_dir = PROJECT_ROOT / "chronicle-ui" / "dist"
+    index_file = dist_dir / "index.html"
+    if index_file.exists():
+        return send_from_directory(str(dist_dir), "index.html")
+
+    first_segment = str(spa_path or "").strip("/").split("/", 1)[0]
+    normalized_flow = _normalize_ui_flow(first_segment)
+    if normalized_flow is None:
+        return redirect(_legacy_flow_path("view"), code=302)
+    return redirect(_legacy_flow_path(normalized_flow), code=302)
+
+
+@app.get("/ops/ui-rollout/status")
+def ui_rollout_status_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    mode = _current_ui_rollout_mode(current)
+    targets = _ui_rollout_targets(mode)
+    last_mode_change = get_runtime_value(current.processed_log_file, UI_ROLLOUT_LAST_MODE_CHANGE_KEY)
+    last_rollback = get_runtime_value(current.processed_log_file, UI_ROLLOUT_LAST_ROLLBACK_KEY)
+
+    return {
+        "status": "ok",
+        "mode": mode,
+        "default_mode": _ui_rollout_default_mode(),
+        "spa_base_path": _ui_rollout_spa_base_path(),
+        "rollback_target_minutes": UI_ROLLBACK_TARGET_MINUTES,
+        "flows": [
+            {
+                "flow": flow_name,
+                "canonical_path": f"/{flow_name}",
+                "target_path": targets[flow_name],
+                "legacy_path": _legacy_flow_path(flow_name),
+            }
+            for flow_name in CORE_UI_FLOW_LEGACY_PATHS
+        ],
+        "last_mode_change": last_mode_change if isinstance(last_mode_change, dict) else None,
+        "last_rollback": last_rollback if isinstance(last_rollback, dict) else None,
+    }, 200
+
+
+@app.post("/ops/ui-rollout/mode")
+def ui_rollout_mode_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    requested_mode = _normalize_ui_rollout_mode(body.get("mode"))
+    if requested_mode is None:
+        return {
+            "status": "error",
+            "error": {
+                "code": "UI_ROLLOUT_MODE_INVALID",
+                "message": "mode must be one of: mpa, spa.",
+                "details": {
+                    "provided": body.get("mode"),
+                    "allowed_modes": sorted(UI_ROLLOUT_ALLOWED_MODES),
+                },
+            },
+        }, 400
+
+    source = str(body.get("source") or "ui-rollout-mode-api").strip() or "ui-rollout-mode-api"
+    reason = str(body.get("reason") or "").strip() or None
+    current = _effective_settings()
+    try:
+        changed_at_utc = _set_ui_rollout_mode(current, requested_mode, source=source, reason=reason)
+    except OSError as exc:
+        return {
+            "status": "error",
+            "error": {
+                "code": "UI_ROLLOUT_STATE_WRITE_FAILED",
+                "message": "Failed to persist rollout mode.",
+                "details": {"reason": str(exc)},
+            },
+        }, 500
+    targets = _ui_rollout_targets(requested_mode)
+
+    return {
+        "status": "ok",
+        "mode": requested_mode,
+        "changed_at_utc": changed_at_utc,
+        "source": source,
+        "reason": reason,
+        "targets": targets,
+    }, 200
+
+
+@app.post("/ops/ui-rollout/rollback")
+def ui_rollout_rollback_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    source = str(body.get("source") or "ui-rollout-rollback-api").strip() or "ui-rollout-rollback-api"
+    reason = str(body.get("reason") or "regression-detected").strip() or "regression-detected"
+    started = time.monotonic()
+    current = _effective_settings()
+    try:
+        rolled_back_at_utc = _set_ui_rollout_mode(current, "mpa", source=source, reason=reason)
+    except OSError as exc:
+        return {
+            "status": "error",
+            "error": {
+                "code": "UI_ROLLBACK_FAILED",
+                "message": "Failed to trigger UI rollback.",
+                "details": {"reason": str(exc)},
+            },
+        }, 500
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    rollback_deadline_utc = (datetime.now(timezone.utc) + timedelta(minutes=UI_ROLLBACK_TARGET_MINUTES)).isoformat()
+    targets = _ui_rollout_targets("mpa")
+    verification_checklist = [
+        {
+            "flow": flow_name,
+            "canonical_path": f"/{flow_name}",
+            "expected_target": targets[flow_name],
+            "fallback_path": _legacy_flow_path(flow_name),
+        }
+        for flow_name in CORE_UI_FLOW_LEGACY_PATHS
+    ]
+    rollback_record = {
+        "rolled_back_to_mode": "mpa",
+        "source": source,
+        "reason": reason,
+        "rolled_back_at_utc": rolled_back_at_utc,
+        "elapsed_ms": elapsed_ms,
+        "rollback_target_minutes": UI_ROLLBACK_TARGET_MINUTES,
+    }
+    set_runtime_value(current.processed_log_file, UI_ROLLOUT_LAST_ROLLBACK_KEY, rollback_record)
+
+    return {
+        "status": "ok",
+        "mode": "mpa",
+        "rolled_back_at_utc": rolled_back_at_utc,
+        "rollback_deadline_utc": rollback_deadline_utc,
+        "rollback_target_minutes": UI_ROLLBACK_TARGET_MINUTES,
+        "elapsed_ms": elapsed_ms,
+        "verification_checklist": verification_checklist,
+    }, 200
+
+
+@app.get("/control/activity-detection")
+def control_activity_detection_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    heartbeat = get_worker_heartbeat(current.processed_log_file)
+    heartbeat_healthy = is_worker_healthy(
+        current.processed_log_file,
+        max_age_seconds=current.worker_health_max_age_seconds,
+    )
+    runtime_values = get_runtime_values(
+        current.processed_log_file,
+        [
+            "worker.activity_detection.status",
+            "worker.activity_detection.new_activity_available",
+            "worker.activity_detection.last_activity_id",
+            "worker.activity_detection.last_checked_at_utc",
+            "worker.activity_detection.last_detected_at_utc",
+        ],
+    )
+
+    raw_available = runtime_values.get("worker.activity_detection.new_activity_available")
+    if isinstance(raw_available, bool):
+        new_activity_available = raw_available
+    elif isinstance(raw_available, str):
+        new_activity_available = raw_available.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        new_activity_available = bool(raw_available)
+
+    status = str(runtime_values.get("worker.activity_detection.status") or "").strip() or "unknown"
+    last_activity_id_raw = runtime_values.get("worker.activity_detection.last_activity_id")
+    last_activity_id = str(last_activity_id_raw).strip() if last_activity_id_raw is not None else ""
+    last_checked_raw = runtime_values.get("worker.activity_detection.last_checked_at_utc")
+    last_checked_at_utc = str(last_checked_raw).strip() if last_checked_raw is not None else ""
+    last_detected_raw = runtime_values.get("worker.activity_detection.last_detected_at_utc")
+    last_detected_at_utc = str(last_detected_raw).strip() if last_detected_raw is not None else ""
+
+    return (
+        {
+            "status": "ok",
+            "time_utc": datetime.now(timezone.utc).isoformat(),
+            "worker_last_heartbeat_utc": heartbeat.isoformat() if heartbeat else None,
+            "worker_heartbeat_healthy": bool(heartbeat_healthy),
+            "activity_detection": {
+                "status": status,
+                "new_activity_available": new_activity_available,
+                "last_activity_id": last_activity_id or None,
+                "last_checked_at_utc": last_checked_at_utc or None,
+                "last_detected_at_utc": last_detected_at_utc or None,
+            },
+        },
+        200,
+    )
 
 
 @app.get("/dashboard/data.json")
@@ -862,6 +1271,40 @@ def plan_pace_workshop_calculate_post() -> tuple[dict, int]:
     }, 200
 
 
+@app.get("/plan/workouts")
+def plan_workouts_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    workouts = list_workout_definitions(current.processed_log_file)
+    return {"status": "ok", "workouts": workouts}, 200
+
+
+@app.put("/plan/workouts/<string:workout_code>")
+def plan_workouts_put(workout_code: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    path_code = str(workout_code or "").strip()
+    if not path_code:
+        return {"status": "error", "error": "workout_code is required."}, 400
+    body_code = str(body.get("workout_code") or path_code).strip()
+    if body_code and body_code.lower() != path_code.lower():
+        return {"status": "error", "error": "workout_code in body must match path."}, 400
+
+    current = _effective_settings()
+    payload = dict(body)
+    payload["workout_code"] = path_code
+    try:
+        workout = upsert_workout_definition(current.processed_log_file, payload)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    workouts = list_workout_definitions(current.processed_log_file)
+    return {"status": "ok", "workout": workout, "workouts": workouts}, 200
+
+
 @app.put("/plan/day/<string:date_local>")
 def plan_day_put(date_local: str) -> tuple[dict, int]:
     body = request.get_json(silent=True) or {}
@@ -874,6 +1317,237 @@ def plan_day_put(date_local: str) -> tuple[dict, int]:
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}, 400
     return _save_plan_day_record(current, date_key=date_key, body=body)
+
+
+@app.post("/plan/day/<string:date_local>/garmin-sync")
+def plan_day_garmin_sync_post(date_local: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    current = _effective_settings()
+    try:
+        date_key = _resolve_plan_date(date_local)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    day_sessions_map = list_plan_sessions(
+        current.processed_log_file,
+        start_date=date_key,
+        end_date=date_key,
+    )
+    raw_sessions = day_sessions_map.get(date_key, []) if isinstance(day_sessions_map, dict) else []
+
+    attached_workouts: list[str] = []
+    for session in raw_sessions:
+        if not isinstance(session, dict):
+            continue
+        workout_code = str(session.get("planned_workout") or session.get("workout_code") or "").strip()
+        if not workout_code:
+            continue
+        attached_workouts.append(workout_code)
+
+    if not attached_workouts:
+        return {
+            "status": "error",
+            "error": "No workout is attached to this plan day. Attach a workout before sending to Garmin.",
+        }, 400
+
+    requested_workout = str(body.get("workout_code") or "").strip()
+    selected_workout = attached_workouts[0]
+    if requested_workout:
+        selected_match = next(
+            (
+                candidate
+                for candidate in attached_workouts
+                if candidate.lower() == requested_workout.lower()
+            ),
+            None,
+        )
+        if selected_match is None:
+            return {
+                "status": "error",
+                "error": "workout_code is not attached to the requested plan day.",
+            }, 400
+        selected_workout = selected_match
+
+    try:
+        sync_record = initiate_garmin_sync_request(
+            current.processed_log_file,
+            date_local=date_key,
+            workout_code=selected_workout,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    return {
+        "status": "ok",
+        "date_local": date_key,
+        "sync": sync_record,
+    }, 200
+
+
+@app.post("/plan/day/<string:date_local>/garmin-sync/run")
+def plan_day_garmin_sync_run_post(date_local: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    current = _effective_settings()
+    try:
+        date_key = _resolve_plan_date(date_local)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    requested_workout = str(body.get("workout_code") or "").strip() or None
+    try:
+        sync_record, garmin_workout = run_garmin_sync_request(
+            current.processed_log_file,
+            date_local=date_key,
+            workout_code=requested_workout,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    return {
+        "status": "ok",
+        "date_local": date_key,
+        "sync": sync_record,
+        "garmin_workout": garmin_workout,
+    }, 200
+
+
+@app.post("/plan/day/<string:date_local>/garmin-sync/schedule")
+def plan_day_garmin_sync_schedule_post(date_local: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    current = _effective_settings()
+    try:
+        date_key = _resolve_plan_date(date_local)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    requested_workout = str(body.get("workout_code") or "").strip() or None
+    try:
+        sync_record, garmin_workout, calendar_entry = schedule_garmin_sync_request(
+            current.processed_log_file,
+            date_local=date_key,
+            workout_code=requested_workout,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    return {
+        "status": "ok",
+        "date_local": date_key,
+        "sync": sync_record,
+        "garmin_workout": garmin_workout,
+        "calendar_entry": calendar_entry,
+    }, 200
+
+
+@app.post("/plan/day/<string:date_local>/garmin-sync/result")
+def plan_day_garmin_sync_result_post(date_local: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    current = _effective_settings()
+    try:
+        date_key = _resolve_plan_date(date_local)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    requested_workout = str(body.get("workout_code") or "").strip() or None
+    attempt_count = 0
+    max_attempts = 2
+    run_phase_completed = False
+    last_error: ValueError | RuntimeError | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_count = attempt
+        try:
+            run_garmin_sync_request(
+                current.processed_log_file,
+                date_local=date_key,
+                workout_code=requested_workout,
+            )
+            run_phase_completed = True
+            sync_record, garmin_workout, calendar_entry = schedule_garmin_sync_request(
+                current.processed_log_file,
+                date_local=date_key,
+                workout_code=requested_workout,
+            )
+            timestamp_utc = str(sync_record.get("updated_at_utc") or "").strip() or datetime.now(timezone.utc).replace(
+                microsecond=0
+            ).isoformat()
+            status_code = str(sync_record.get("status_code") or "").strip() or "calendar_scheduled"
+            return {
+                "status": "ok",
+                "date_local": date_key,
+                "sync": sync_record,
+                "garmin_workout": garmin_workout,
+                "calendar_entry": calendar_entry,
+                "result": {
+                    "outcome": "scheduled",
+                    "status_code": status_code,
+                    "timestamp_utc": timestamp_utc,
+                    "message": "Workout scheduled on Garmin calendar.",
+                    "attempt_count": attempt_count,
+                },
+            }, 200
+        except (ValueError, RuntimeError) as exc:
+            last_error = exc
+            if "Send to Garmin first" in str(exc):
+                return {"status": "error", "error": str(exc)}, 400
+            if attempt < max_attempts:
+                time.sleep(0.2 * attempt)
+
+    if last_error is None:
+        return {"status": "error", "error": "Garmin sync result could not be resolved."}, 500
+
+    failure_code = "schedule_failed" if run_phase_completed else "run_failed"
+    retry_guidance = (
+        "Retry Garmin sync from Plan. If this keeps failing, verify Garmin connection settings and that the workout is attached to the day."
+    )
+    try:
+        failed_sync = mark_garmin_sync_request_failed(
+            current.processed_log_file,
+            date_local=date_key,
+            workout_code=requested_workout,
+            status_code=failure_code,
+            error_message=str(last_error),
+            retry_guidance=retry_guidance,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    timestamp_utc = str(failed_sync.get("updated_at_utc") or "").strip() or datetime.now(timezone.utc).replace(
+        microsecond=0
+    ).isoformat()
+    return {
+        "status": "error",
+        "date_local": date_key,
+        "sync": failed_sync,
+        "result": {
+            "outcome": "failed",
+            "status_code": str(failed_sync.get("status_code") or failure_code),
+            "timestamp_utc": timestamp_utc,
+            "message": str(last_error),
+            "retry_guidance": retry_guidance,
+            "attempt_count": attempt_count,
+        },
+    }, 200
 
 
 @app.post("/plan/days/bulk")
@@ -1287,6 +1961,47 @@ def editor_profiles_get() -> tuple[dict, int]:
     }, 200
 
 
+@app.post("/editor/profiles")
+def editor_profiles_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    profile_id = body.get("profile_id")
+    if not isinstance(profile_id, str) or not profile_id.strip():
+        return {"status": "error", "error": "profile_id is required."}, 400
+
+    label = body.get("label")
+    parsed_label: str | None = None
+    if label is not None:
+        try:
+            parsed_label = _parse_profile_label(label)
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+
+    criteria = body.get("criteria")
+    parsed_criteria: dict | None = None
+    if criteria is not None:
+        try:
+            parsed_criteria = _parse_profile_criteria(criteria)
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+
+    try:
+        created = create_template_profile(
+            settings,
+            profile_id,
+            label=parsed_label,
+            criteria=parsed_criteria,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    return {
+        "status": "ok",
+        "profile": created,
+        "working_profile_id": get_working_template_profile(settings).get("profile_id"),
+        "profiles": list_template_profiles(settings),
+    }, 200
+
+
 @app.put("/editor/profiles/<string:profile_id>")
 def editor_profile_put(profile_id: str) -> tuple[dict, int]:
     body = request.get_json(silent=True) or {}
@@ -1298,14 +2013,36 @@ def editor_profile_put(profile_id: str) -> tuple[dict, int]:
         except ValueError as exc:
             return {"status": "error", "error": str(exc)}, 400
     priority = body.get("priority")
-    if parsed_enabled is None and priority is None:
-        return {"status": "error", "error": "Provide enabled and/or priority."}, 400
+    parsed_priority: int | None = None
+    if priority is not None:
+        try:
+            parsed_priority = int(priority)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "priority must be an integer."}, 400
+    label = body.get("label")
+    parsed_label: str | None = None
+    if label is not None:
+        try:
+            parsed_label = _parse_profile_label(label)
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+    criteria = body.get("criteria")
+    parsed_criteria: dict | None = None
+    if criteria is not None:
+        try:
+            parsed_criteria = _parse_profile_criteria(criteria)
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+    if parsed_enabled is None and parsed_priority is None and parsed_label is None and parsed_criteria is None:
+        return {"status": "error", "error": "Provide enabled, priority, label, and/or criteria."}, 400
     try:
         updated = update_template_profile(
             settings,
             profile_id,
             enabled=parsed_enabled,
-            priority=int(priority) if priority is not None else None,
+            priority=parsed_priority,
+            label=parsed_label,
+            criteria=parsed_criteria,
         )
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}, 400
@@ -1330,6 +2067,76 @@ def editor_working_profile_post() -> tuple[dict, int]:
         "status": "ok",
         "working_profile_id": profile.get("profile_id"),
         "profile": profile,
+    }, 200
+
+
+@app.post("/editor/profiles/preview")
+def editor_profile_preview_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    try:
+        context_mode = _resolve_context_mode(body.get("context_mode"))
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    context, context_source = _context_for_mode(
+        context_mode,
+        fixture_name=body.get("fixture_name"),
+    )
+    if context is None:
+        return {
+            "status": "error",
+            "error": "No template context is available yet. Run one update cycle first.",
+        }, 404
+
+    try:
+        match = preview_profile_match(settings, context)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    return {
+        "status": "ok",
+        "context_source": context_source,
+        "profile_match": match,
+    }, 200
+
+
+@app.get("/editor/profiles/export")
+def editor_profiles_export_get() -> tuple[dict, int]:
+    selected_profile_ids = _resolve_profile_id_filters()
+    try:
+        payload = export_template_profiles_bundle(
+            settings,
+            profile_ids=selected_profile_ids,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    return {"status": "ok", **payload}, 200
+
+
+@app.post("/editor/profiles/import")
+def editor_profiles_import_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    bundle = body.get("bundle")
+    if bundle is None:
+        bundle = body
+    if not isinstance(bundle, dict):
+        return {"status": "error", "error": "bundle must be a JSON object."}, 400
+
+    try:
+        result = import_template_profiles_bundle(settings, bundle=bundle)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    return {
+        "status": "ok",
+        "imported_count": len(result["imported_profile_ids"]),
+        "imported_profile_ids": result["imported_profile_ids"],
+        "errors": result["errors"],
+        "working_profile_id": result["working_profile_id"],
+        "profiles": list_template_profiles(settings),
     }, 200
 
 
@@ -1961,6 +2768,29 @@ def editor_catalog() -> tuple[dict, int]:
     }, 200
 
 
+def _rerun_status_code(result: object) -> str:
+    if isinstance(result, dict):
+        code = str(result.get("status") or "").strip().lower()
+        if code:
+            return code
+    return "unknown"
+
+
+def _rerun_retry_guidance(status_code: str, result: object) -> str | None:
+    if status_code != "locked":
+        return None
+    owner = ""
+    if isinstance(result, dict):
+        owner = str(result.get("lock_owner") or "").strip()
+    base = (
+        "Another rerun is already in progress. Wait a few seconds, then retry "
+        "'Rerun latest activity'."
+    )
+    if owner:
+        return f"{base} Active lock owner: {owner}."
+    return base
+
+
 def _run_rerun(force_update: bool, activity_id: int | None = None) -> tuple[dict, int]:
     try:
         if activity_id is None:
@@ -1968,8 +2798,17 @@ def _run_rerun(force_update: bool, activity_id: int | None = None) -> tuple[dict
         else:
             result = run_once(force_update=force_update, activity_id=activity_id)
 
-        response: dict[str, object] = {"status": "ok", "result": result}
-        if isinstance(result, dict) and str(result.get("status") or "").strip().lower() == "updated":
+        status_code = _rerun_status_code(result)
+        response: dict[str, object] = {
+            "status": "ok",
+            "result": result,
+            "status_code": status_code,
+            "timestamp_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        }
+        retry_guidance = _rerun_retry_guidance(status_code, result)
+        if retry_guidance:
+            response["retry_guidance"] = retry_guidance
+        if status_code == "updated":
             try:
                 get_dashboard_payload(_effective_settings(), force_refresh=True)
                 response["dashboard_refresh"] = "updated"
@@ -1977,7 +2816,12 @@ def _run_rerun(force_update: bool, activity_id: int | None = None) -> tuple[dict
                 response["dashboard_refresh"] = f"error: {exc}"
         return response, 200
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}, 500
+        return {
+            "status": "error",
+            "error": str(exc),
+            "status_code": "error",
+            "timestamp_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        }, 500
 
 
 @app.post("/rerun/latest")

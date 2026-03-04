@@ -97,12 +97,6 @@ def _resolve_optional_date(value: Any, *, field_name: str) -> date | None:
 
 
 def _dashboard_config_min_date(today: date) -> date:
-    start_date_raw = str(os.getenv("DASHBOARD_START_DATE", "")).strip()
-    if start_date_raw:
-        parsed = _parse_date(start_date_raw)
-        if parsed is not None:
-            return parsed
-
     lookback_raw = str(os.getenv("DASHBOARD_LOOKBACK_YEARS", "")).strip()
     if lookback_raw:
         try:
@@ -111,6 +105,12 @@ def _dashboard_config_min_date(today: date) -> date:
             return date(target_year, 1, 1)
         except ValueError:
             pass
+
+    start_date_raw = str(os.getenv("DASHBOARD_START_DATE", "")).strip()
+    if start_date_raw:
+        parsed = _parse_date(start_date_raw)
+        if parsed is not None:
+            return parsed
 
     return today - timedelta(days=365)
 
@@ -317,7 +317,8 @@ def get_plan_payload(
     range_end = _resolve_optional_date(end_date, field_name="end_date")
 
     if range_start is not None or range_end is not None:
-        display_start = range_start if range_start is not None else min_center
+        dashboard_start_default = _parse_date(str(os.getenv("DASHBOARD_START_DATE", "")).strip())
+        display_start = range_start if range_start is not None else (dashboard_start_default or min_center)
         display_end = range_end if range_end is not None else (today + timedelta(days=365))
         if display_start < min_center:
             display_start = min_center

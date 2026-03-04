@@ -48,7 +48,7 @@ from .storage import (
     write_config_snapshot,
     write_json,
 )
-from .template_profiles import list_template_profiles
+from .template_profiles import get_template_profile, list_template_profiles
 from .template_rendering import render_with_active_template
 from .strava_client import StravaClient, get_gap_speed_mps, mps_to_pace
 
@@ -1338,6 +1338,69 @@ def _text_blob(activity: dict[str, Any]) -> str:
     return " ".join(parts).strip().lower()
 
 
+def _duration_to_seconds(value: Any) -> int | None:
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return max(0, int(text))
+    parts = text.split(":")
+    if len(parts) not in {2, 3}:
+        return None
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        if minutes < 0 or seconds < 0:
+            return None
+        return minutes * 60 + seconds
+    hours, minutes, seconds = numbers
+    if hours < 0 or minutes < 0 or seconds < 0:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _activity_for_profile_preview(context: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    activity: dict[str, Any] = {}
+    training: dict[str, Any] | None = None
+
+    raw = context.get("raw")
+    if isinstance(raw, dict):
+        raw_activity = raw.get("activity")
+        if isinstance(raw_activity, dict):
+            activity.update(raw_activity)
+        raw_training = raw.get("training")
+        if isinstance(raw_training, dict):
+            training = raw_training
+
+    context_activity = context.get("activity")
+    if isinstance(context_activity, dict):
+        for key, value in context_activity.items():
+            activity.setdefault(str(key), value)
+
+    if "distance" not in activity:
+        distance_miles = _as_float(activity.get("distance_miles"))
+        if distance_miles is not None:
+            activity["distance"] = distance_miles * 1609.34
+
+    if "total_elevation_gain" not in activity:
+        elevation_feet = _as_float(activity.get("elevation_feet"))
+        if elevation_feet is not None:
+            activity["total_elevation_gain"] = elevation_feet / 3.28084
+
+    moving_seconds = _duration_to_seconds(activity.get("moving_time"))
+    if moving_seconds is not None:
+        activity["moving_time"] = moving_seconds
+
+    return activity, training
+
+
 def _profile_match_reasons(
     profile_id: str,
     activity: dict[str, Any],
@@ -1482,6 +1545,33 @@ def _select_activity_profile(
         }
 
     return {"profile_id": "default", "profile_label": "Default", "reasons": ["fallback"]}
+
+
+def preview_profile_match(
+    settings: Settings,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise ValueError("Template context is required.")
+
+    activity, training = _activity_for_profile_preview(context)
+    if not isinstance(activity, dict) or not activity:
+        raise ValueError("Template context must include activity data for profile preview.")
+
+    selected = _select_activity_profile(settings, activity, training=training)
+    profile_id = str(selected.get("profile_id") or "default")
+    profile = get_template_profile(settings, profile_id)
+    criteria = profile.get("criteria") if isinstance(profile, dict) else {}
+    reasons = selected.get("reasons")
+
+    return {
+        "profile_id": profile_id,
+        "profile_label": str(selected.get("profile_label") or profile_id.title()),
+        "reasons": list(reasons) if isinstance(reasons, list) else [],
+        "criteria": dict(criteria) if isinstance(criteria, dict) else {},
+        "enabled": bool(profile.get("enabled")) if isinstance(profile, dict) else profile_id == "default",
+        "priority": int(profile.get("priority", 0)) if isinstance(profile, dict) else 0,
+    }
 
 
 def _profile_activity_update_payload(profile_id: str, detailed_activity: dict[str, Any], description: str) -> dict[str, Any]:
