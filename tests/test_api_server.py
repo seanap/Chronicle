@@ -154,6 +154,31 @@ class TestApiServer(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers.get("Location"), "/view")
 
+    def test_spa_entry_serves_dist_asset_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dist_dir = root / "chronicle-ui" / "dist"
+            assets_dir = dist_dir / "assets"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            (dist_dir / "index.html").write_text("<html><body><div id='root'></div></body></html>", encoding="utf-8")
+            (assets_dir / "index.js").write_text("console.log('spa boot');", encoding="utf-8")
+
+            with patch.object(api_server, "PROJECT_ROOT", root):
+                response = self.client.get("/app/assets/index.js")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("spa boot", response.get_data(as_text=True))
+
+    def test_spa_entry_returns_404_for_missing_dist_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dist_dir = root / "chronicle-ui" / "dist"
+            dist_dir.mkdir(parents=True, exist_ok=True)
+            (dist_dir / "index.html").write_text("<html><body><div id='root'></div></body></html>", encoding="utf-8")
+
+            with patch.object(api_server, "PROJECT_ROOT", root):
+                response = self.client.get("/app/assets/missing.js")
+                self.assertEqual(response.status_code, 404)
+
     def test_dashboard_page_endpoint(self) -> None:
         response = self.client.get("/dashboard")
         self.assertEqual(response.status_code, 200)

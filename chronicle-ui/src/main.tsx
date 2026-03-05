@@ -8,6 +8,8 @@ import { AppRoutes } from "./app-routes";
 import { appTheme } from "./theme/app-theme";
 import { useAppReady } from "./hooks/use-app-ready";
 
+const routerBasePath = (import.meta.env.BASE_URL || "/").replace(/\/+$/, "") || "/";
+
 function AppRoot() {
   const appReady = useAppReady();
   if (!appReady) {
@@ -17,7 +19,7 @@ function AppRoot() {
   return (
     <ThemeProvider theme={appTheme}>
       <CssBaseline />
-      <BrowserRouter>
+      <BrowserRouter basename={routerBasePath}>
         <AppShell>
           <AppRoutes />
         </AppShell>

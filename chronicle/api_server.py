@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
-from flask import Flask, redirect, render_template, request, send_from_directory
+from flask import Flask, abort, redirect, render_template, request, send_from_directory
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .activity_pipeline import preview_profile_match, run_once
@@ -926,10 +926,18 @@ def legacy_core_flow_page(flow_name: str):
 def spa_app_entry(spa_path: str = ""):
     dist_dir = PROJECT_ROOT / "chronicle-ui" / "dist"
     index_file = dist_dir / "index.html"
+    requested_path = str(spa_path or "").strip("/")
     if index_file.exists():
+        if requested_path:
+            requested_file = dist_dir / requested_path
+            if requested_file.is_file():
+                return send_from_directory(str(dist_dir), requested_path)
+            if "." in Path(requested_path).name:
+                # Missing concrete asset (JS/CSS/map/etc.) should not return HTML fallback.
+                return abort(404)
         return send_from_directory(str(dist_dir), "index.html")
 
-    first_segment = str(spa_path or "").strip("/").split("/", 1)[0]
+    first_segment = requested_path.split("/", 1)[0]
     normalized_flow = _normalize_ui_flow(first_segment)
     if normalized_flow is None:
         return redirect(_legacy_flow_path("view"), code=302)

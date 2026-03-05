@@ -8,3 +8,11 @@ state/
 data/
 stat_modules/__pycache__/
 .venv/
+chronicle-ui/node_modules/
+chronicle-ui/dist/
+chronicle-ui/*.tsbuildinfo
+chronicle-ui/vite.config.d.ts
+.agents/
+_bmad/
+_bmad-output/
+docs/
