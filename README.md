@@ -26,7 +26,7 @@ Chronicle automatically builds rich Strava activity descriptions by combining da
 - Exposes local API endpoints for automation and reruns.
 
 ## Screenshots
-<img width="2387" height="1931" alt="Screenshot 2026-02-20 115406" src="https://github.com/user-attachments/assets/dc7746bf-d08b-4c40-844b-39b128888ae6" />
+<img width="1915" height="1923" alt="Screenshot 2026-03-07 120436" src="https://github.com/user-attachments/assets/d44ccc82-9439-4a38-b034-c07406f1743e" />
 <img width="2900" height="1922" alt="Screenshot 2026-02-22 231607" src="https://github.com/user-attachments/assets/35f5f8e6-4cc4-4787-9f08-c2a7687e2398" />
 <img width="2006" height="1943" alt="Screenshot 2026-02-20 115619" src="https://github.com/user-attachments/assets/ec734164-a7e0-4b60-8131-9c4968b4f858" />
 <img width="2399" height="926" alt="Screenshot 2026-02-20 115710" src="https://github.com/user-attachments/assets/9ef5e175-ea91-42b6-b430-faa68060493e" />
