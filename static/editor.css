@@ -1037,6 +1037,180 @@ label[for="templateEditor"] {
   padding-right: 0;
 }
 
+.profile-workshop-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.profile-workshop-row-primary {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.profile-select-shell {
+  display: grid;
+  gap: 6px;
+}
+
+.profile-workshop-row select,
+.profile-yaml-editor,
+.profile-validation-row input {
+  min-width: 0;
+  width: 100%;
+}
+
+.profile-workshop-row select {
+  appearance: none;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(135deg, rgba(252, 76, 2, 0.12), transparent 46%),
+    linear-gradient(180deg, color-mix(in srgb, var(--panel) 78%, black 22%), color-mix(in srgb, var(--panel-soft) 90%, black 10%));
+  background-repeat: no-repeat;
+  background-position: left top, center;
+  background-size: 100% 100%, 100% 100%;
+  color: var(--ink);
+  padding: 10px 40px 10px 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 10px 24px rgba(0, 0, 0, 0.12);
+  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  background-image:
+    linear-gradient(135deg, rgba(252, 76, 2, 0.12), transparent 46%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14' fill='none'%3E%3Cpath d='M3 5.25L7 9.25L11 5.25' stroke='%23fc4c02' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"),
+    linear-gradient(180deg, color-mix(in srgb, var(--panel) 78%, black 22%), color-mix(in srgb, var(--panel-soft) 90%, black 10%));
+  background-position: left top, right 12px center, center;
+  background-size: 100% 100%, 14px 14px, 100% 100%;
+}
+
+.profile-workshop-row select option {
+  background: color-mix(in srgb, var(--panel-soft) 94%, #090909);
+  color: var(--ink);
+}
+
+.profile-workshop-row select.profile-select-enabled {
+  border-color: color-mix(in srgb, var(--primary) 44%, var(--line));
+  box-shadow: 0 0 0 1px rgba(252, 76, 2, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.profile-workshop-row select.profile-select-disabled {
+  border-color: color-mix(in srgb, var(--muted) 38%, var(--line));
+  color: color-mix(in srgb, var(--ink) 74%, var(--muted));
+}
+
+.profile-workshop-row select.profile-select-invalid {
+  border-color: color-mix(in srgb, var(--secondary) 62%, var(--line));
+  box-shadow: 0 0 0 1px rgba(255, 155, 74, 0.1);
+}
+
+.profile-workshop-row select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--primary) 60%, var(--line));
+  box-shadow: 0 0 0 3px rgba(252, 76, 2, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.profile-workshop-actions {
+  margin-bottom: 10px;
+}
+
+.profile-workshop-top-actions {
+  justify-content: flex-end;
+  align-self: end;
+}
+
+.btn-profile-enabled {
+  background: linear-gradient(120deg, rgba(252, 76, 2, 0.18), rgba(252, 76, 2, 0.08));
+  border-color: rgba(252, 76, 2, 0.3);
+  color: var(--ink);
+}
+
+.btn-profile-disabled {
+  background: linear-gradient(120deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
+  border-color: color-mix(in srgb, var(--muted) 48%, var(--line));
+  color: color-mix(in srgb, var(--ink) 76%, var(--muted));
+}
+
+.btn-profile-locked {
+  background: color-mix(in srgb, var(--panel-soft) 94%, black 6%);
+  border-color: var(--line);
+  color: color-mix(in srgb, var(--ink) 72%, var(--muted));
+}
+
+.profile-yaml-editor {
+  min-height: 360px;
+  resize: vertical;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.92rem;
+  line-height: 1.45;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(9, 17, 34, 0.72);
+  color: var(--ink);
+  padding: 12px;
+  margin-top: 6px;
+}
+
+.profile-yaml-editor[readonly] {
+  opacity: 0.82;
+  cursor: not-allowed;
+}
+
+.profile-validation-shell {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel-soft) 90%, black 10%);
+}
+
+.profile-validation-head {
+  display: grid;
+  gap: 4px;
+}
+
+.profile-validation-head h4 {
+  margin: 0;
+  font-size: 0.88rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--secondary);
+}
+
+.profile-validation-row {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.profile-validation-row input {
+  appearance: none;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 78%, black 22%), color-mix(in srgb, var(--panel-soft) 90%, black 10%));
+  color: var(--ink);
+  padding: 10px 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 18px rgba(0, 0, 0, 0.1);
+}
+
+.profile-validation-row input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--primary) 60%, var(--line));
+  box-shadow: 0 0 0 3px rgba(252, 76, 2, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+@media (max-width: 900px) {
+  .profile-workshop-row-primary,
+  .profile-validation-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .profile-workshop-top-actions {
+    justify-content: flex-start;
+  }
+}
+
 .left-drawer .meta,
 .left-drawer .field-key,
 .left-drawer .field-type,

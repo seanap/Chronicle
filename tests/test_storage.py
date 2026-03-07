@@ -26,6 +26,7 @@ from chronicle.storage import (
     requeue_expired_jobs,
     start_activity_job_run,
     read_json,
+    record_activity_output,
     release_runtime_lock,
     replace_plan_sessions_for_day,
     register_activity_discovery,
@@ -306,6 +307,86 @@ class TestStorage(unittest.TestCase):
             assert state is not None
             self.assertEqual(state["state"], "succeeded")
             self.assertEqual(state["last_result_status"], "succeeded")
+
+    def test_record_activity_output_persists_template_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "processed.log"
+            record_activity_output(
+                path,
+                123,
+                state="succeeded",
+                result_status="updated",
+                profile_id="walk",
+                title="Walk",
+                description="Walk output",
+                template_hash="abc123",
+                template_path="/app/state/template_profiles/walk.j2",
+                template_version="ver-1",
+                template_name="Walk Template",
+                working_profile_id="walk",
+                selection_mode="criteria_match",
+                is_custom_template=True,
+            )
+            state = get_activity_state(path, 123)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["last_profile_id"], "walk")
+            self.assertEqual(state["last_template_hash"], "abc123")
+            self.assertEqual(state["last_template_path"], "/app/state/template_profiles/walk.j2")
+            self.assertEqual(state["last_template_version"], "ver-1")
+            self.assertEqual(state["last_template_name"], "Walk Template")
+            self.assertEqual(state["last_working_profile_id"], "walk")
+            self.assertEqual(state["last_selection_mode"], "criteria_match")
+            self.assertEqual(state["last_is_custom_template"], True)
+
+    def test_runtime_schema_migrates_activity_state_for_template_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "processed.log"
+            db_path = path.parent / "runtime_state.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE activity_state (
+                        activity_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        last_job_id TEXT,
+                        last_run_id TEXT,
+                        last_profile_id TEXT,
+                        last_title TEXT,
+                        last_description_hash TEXT,
+                        last_result_status TEXT,
+                        last_error TEXT,
+                        updated_at_utc TEXT NOT NULL
+                    )
+                    """
+                )
+
+            record_activity_output(
+                path,
+                456,
+                state="succeeded",
+                result_status="updated",
+                profile_id="strength_training",
+                description="Strength output",
+                template_hash="def456",
+                template_path="/app/state/template_profiles/strength_training.j2",
+                template_version="ver-2",
+                template_name="Strength Template",
+                working_profile_id="default",
+                selection_mode="criteria_match",
+                is_custom_template=True,
+            )
+
+            state = get_activity_state(path, 456)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["last_template_hash"], "def456")
+            self.assertEqual(
+                state["last_template_path"],
+                "/app/state/template_profiles/strength_training.j2",
+            )
+            self.assertEqual(state["last_selection_mode"], "criteria_match")
+            self.assertEqual(state["last_is_custom_template"], True)
 
     def test_activity_job_retry_wait_promotes_to_failed_when_attempts_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

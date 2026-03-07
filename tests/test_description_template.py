@@ -7,10 +7,13 @@ from types import SimpleNamespace
 from chronicle.description_template import (
     PROFILE_TEMPLATE_DEFAULTS,
     build_context_schema,
+    create_template_profile,
     create_template_repository_template,
+    create_template_profile_from_yaml,
     duplicate_template_repository_template,
     export_template_repository_bundle,
     get_template_repository_template,
+    get_template_profile_document,
     get_template_version,
     get_editor_snippets,
     get_starter_templates,
@@ -29,6 +32,7 @@ from chronicle.description_template import (
     render_template_text,
     render_with_active_template,
     rollback_template_version,
+    save_template_profile_yaml,
     save_active_template,
     set_working_template_profile,
     update_template_profile,
@@ -223,6 +227,34 @@ class TestDescriptionTemplate(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertFalse(result["fallback_used"])
             self.assertTrue(isinstance(result.get("error"), str) and result["error"])
+
+    def test_render_with_active_template_exposes_template_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+            saved = save_active_template(
+                settings,
+                "Strength Custom {{ value }}",
+                profile_id="strength_training",
+                name="Strength Custom Template",
+                author="tester",
+                source="test",
+            )
+
+            result = render_with_active_template(
+                settings,
+                {"value": "42"},
+                profile_id="strength_training",
+                allow_seed_fallback=False,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["is_custom_template"])
+            self.assertEqual(result["profile_id"], "strength_training")
+            self.assertEqual(result["template_path"], saved["path"])
+            self.assertEqual(result["template_hash"], saved["template_hash"])
+            self.assertEqual(result["template_version"], saved["current_version"])
+            self.assertEqual(result["template_name"], saved["name"])
 
     def test_schema_builder(self) -> None:
         context = {
@@ -430,13 +462,21 @@ class TestDescriptionTemplate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 update_template_profile(settings, "default", enabled=False)
 
-            updated_pet = update_template_profile(settings, "pet", enabled=True)
-            self.assertTrue(updated_pet["enabled"])
+            updated_pet = update_template_profile(settings, "pet", enabled=False)
+            self.assertFalse(updated_pet["enabled"])
 
-            working_pet = set_working_template_profile(settings, "pet")
-            self.assertEqual(working_pet["profile_id"], "pet")
+            created = create_template_profile(
+                settings,
+                "custom-pet",
+                label="Custom Pet",
+                criteria={"text_contains_any": ["dog"]},
+            )
+            self.assertEqual(created["profile_id"], "custom-pet")
 
-            disabled_pet = update_template_profile(settings, "pet", enabled=False)
+            working_pet = set_working_template_profile(settings, "custom-pet")
+            self.assertEqual(working_pet["profile_id"], "custom-pet")
+
+            disabled_pet = update_template_profile(settings, "custom-pet", enabled=False)
             self.assertFalse(disabled_pet["enabled"])
             working = get_working_template_profile(settings)
             self.assertEqual(working["profile_id"], "default")
@@ -452,6 +492,12 @@ class TestDescriptionTemplate(unittest.TestCase):
                 "profiles": [
                     {"profile_id": "default", "enabled": True},
                     {"profile_id": "long_run", "enabled": "false"},
+                    {
+                        "profile_id": "weekday-commute",
+                        "label": "Weekday Commute",
+                        "enabled": "false",
+                        "criteria": {"strava_tags_any": ["commute"]},
+                    },
                 ],
             }
             (template_path.parent / "template_profiles.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -459,6 +505,184 @@ class TestDescriptionTemplate(unittest.TestCase):
             profiles = list_template_profiles(settings)
             long_run = next(item for item in profiles if str(item.get("profile_id")) == "long_run")
             self.assertFalse(long_run["enabled"])
+            weekday_commute = next(item for item in profiles if str(item.get("profile_id")) == "weekday-commute")
+            self.assertFalse(weekday_commute["enabled"])
+
+    def test_profile_yaml_store_is_materialized_on_first_load(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+
+            profiles = list_template_profiles(settings)
+            self.assertTrue(any(str(item.get("profile_id")) == "walk" for item in profiles))
+            self.assertTrue((template_path.parent / "profile_rules" / "walk.yaml").exists())
+            self.assertTrue((template_path.parent / "profile_rules" / "_workshop_state.yaml").exists())
+
+    def test_profile_yaml_document_round_trip_for_custom_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+
+            created = create_template_profile_from_yaml(
+                settings,
+                yaml_text="\n".join(
+                    [
+                        "profile_id: evening-run",
+                        "label: Evening Run",
+                        "priority: 25",
+                        "criteria:",
+                        "  sport_type:",
+                        "    - run",
+                        "  time_of_day_after: '17:00'",
+                        "",
+                    ]
+                ),
+                profile_name="Evening Run",
+            )
+            self.assertEqual(created["profile"]["profile_id"], "evening-run")
+
+            updated = save_template_profile_yaml(
+                settings,
+                "evening-run",
+                yaml_text="\n".join(
+                    [
+                        "profile_id: evening-run",
+                        "label: Evening Run",
+                        "priority: 30",
+                        "criteria:",
+                        "  sport_type:",
+                        "    - run",
+                        "  day_of_week_in:",
+                        "    - monday",
+                        "",
+                    ]
+                ),
+            )
+            self.assertIn("day_of_week_in", updated["profile"]["criteria"])
+            self.assertTrue(updated["profile"]["enabled"])
+
+            loaded = get_template_profile_document(settings, "evening-run")
+            self.assertIn("profile_id: evening-run", loaded["yaml_text"])
+            self.assertNotIn("enabled:", loaded["yaml_text"])
+            self.assertFalse(loaded["read_only"])
+
+    def test_profile_yaml_migrates_from_legacy_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+
+            legacy_payload = {
+                "version": 1,
+                "working_profile_id": "trail",
+                "profiles": [
+                    {"profile_id": "default", "enabled": True},
+                    {
+                        "profile_id": "trail",
+                        "label": "Trail",
+                        "enabled": True,
+                        "priority": 70,
+                        "criteria": {"sport_type": ["trailrun"]},
+                    },
+                ],
+            }
+            (template_path.parent / "template_profiles.json").write_text(
+                json.dumps(legacy_payload, indent=2),
+                encoding="utf-8",
+            )
+
+            profiles = list_template_profiles(settings)
+            trail = next(item for item in profiles if str(item.get("profile_id")) == "trail")
+            self.assertEqual(trail["priority"], 70)
+            self.assertTrue((template_path.parent / "profile_rules" / "trail.yaml").exists())
+            self.assertTrue((template_path.parent / "profile_rules" / "_workshop_state.yaml").exists())
+            state_text = (template_path.parent / "profile_rules" / "_workshop_state.yaml").read_text(encoding="utf-8")
+            self.assertIn("working_profile_id: trail", state_text)
+            self.assertIn("profile_enabled:", state_text)
+
+    def test_profile_yaml_document_for_builtin_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+
+            document = get_template_profile_document(settings, "walk")
+            self.assertTrue(document["read_only"])
+            self.assertEqual(document["storage_format"], "yaml")
+            self.assertTrue(str(document["source_path"]).endswith("profile_rules/walk.yaml"))
+            self.assertIn("profile_id: walk", document["yaml_text"])
+            self.assertNotIn("enabled:", document["yaml_text"])
+
+    def test_profile_yaml_save_rejects_builtin_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+
+            with self.assertRaises(ValueError):
+                save_template_profile_yaml(
+                    settings,
+                    "walk",
+                    yaml_text="\n".join(
+                        [
+                            "profile_id: walk",
+                            "label: Walk",
+                            "priority: 50",
+                            "criteria:",
+                            "  sport_type:",
+                            "    - walk",
+                            "",
+                        ]
+                    ),
+                )
+
+    def test_profile_yaml_rejects_empty_custom_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+
+            with self.assertRaises(ValueError):
+                create_template_profile_from_yaml(
+                    settings,
+                    yaml_text="\n".join(
+                        [
+                            "profile_id: blank-custom",
+                            "label: Blank Custom",
+                            "priority: 5",
+                            "criteria:",
+                            "  kind: activity",
+                            "  description: Missing executable rules.",
+                            "",
+                        ]
+                    ),
+                    profile_name="Blank Custom",
+                )
+
+    def test_invalid_custom_profile_yaml_surfaces_as_disabled_record(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "description_template.j2"
+            settings = _settings_for(template_path)
+            rules_dir = template_path.parent / "profile_rules"
+            rules_dir.mkdir(parents=True, exist_ok=True)
+            (rules_dir / "broken-profile.yaml").write_text(
+                "\n".join(
+                    [
+                        "profile_id: broken-profile",
+                        "label: Broken Profile",
+                        "criteria:",
+                        "  time_of_day_after: '25:61'",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            profiles = list_template_profiles(settings)
+            broken = next(item for item in profiles if str(item.get("profile_id")) == "broken-profile")
+            self.assertFalse(broken["enabled"])
+            self.assertTrue(broken["invalid"])
+            self.assertIn("HH:MM", broken["load_error"])
+
+            document = get_template_profile_document(settings, "broken-profile")
+            self.assertTrue(document["invalid"])
+            self.assertIn("25:61", document["yaml_text"])
 
     def test_editor_snippets_shape(self) -> None:
         snippets = get_editor_snippets()

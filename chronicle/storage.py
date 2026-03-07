@@ -39,6 +39,16 @@ _TRANSIENT_RUNTIME_KEYS_TO_PRUNE = (
     "cycle.period_stats.activities_cache",
 )
 
+_ACTIVITY_STATE_EXTRA_COLUMNS: dict[str, str] = {
+    "last_template_hash": "TEXT",
+    "last_template_path": "TEXT",
+    "last_template_version": "TEXT",
+    "last_template_name": "TEXT",
+    "last_working_profile_id": "TEXT",
+    "last_selection_mode": "TEXT",
+    "last_is_custom_template": "INTEGER",
+}
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -197,6 +207,7 @@ def _initialize_runtime_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_activity_state_columns(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS config_snapshots (
@@ -221,6 +232,18 @@ def _initialize_runtime_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _ensure_activity_state_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(activity_state)").fetchall()
+        if len(row) > 1
+    }
+    for column_name, column_type in _ACTIVITY_STATE_EXTRA_COLUMNS.items():
+        if column_name in existing:
+            continue
+        conn.execute(f"ALTER TABLE activity_state ADD COLUMN {column_name} {column_type}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS plan_sessions (
@@ -566,6 +589,13 @@ def _upsert_activity_state(
     last_description_hash: str | None = None,
     last_result_status: str | None = None,
     last_error: str | None = None,
+    last_template_hash: str | None = None,
+    last_template_path: str | None = None,
+    last_template_version: str | None = None,
+    last_template_name: str | None = None,
+    last_working_profile_id: str | None = None,
+    last_selection_mode: str | None = None,
+    last_is_custom_template: bool | None = None,
 ) -> None:
     conn.execute(
         """
@@ -579,9 +609,16 @@ def _upsert_activity_state(
             last_description_hash,
             last_result_status,
             last_error,
+            last_template_hash,
+            last_template_path,
+            last_template_version,
+            last_template_name,
+            last_working_profile_id,
+            last_selection_mode,
+            last_is_custom_template,
             updated_at_utc
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(activity_id) DO UPDATE SET
             state = excluded.state,
             last_job_id = COALESCE(excluded.last_job_id, activity_state.last_job_id),
@@ -591,6 +628,13 @@ def _upsert_activity_state(
             last_description_hash = COALESCE(excluded.last_description_hash, activity_state.last_description_hash),
             last_result_status = COALESCE(excluded.last_result_status, activity_state.last_result_status),
             last_error = excluded.last_error,
+            last_template_hash = COALESCE(excluded.last_template_hash, activity_state.last_template_hash),
+            last_template_path = COALESCE(excluded.last_template_path, activity_state.last_template_path),
+            last_template_version = COALESCE(excluded.last_template_version, activity_state.last_template_version),
+            last_template_name = COALESCE(excluded.last_template_name, activity_state.last_template_name),
+            last_working_profile_id = COALESCE(excluded.last_working_profile_id, activity_state.last_working_profile_id),
+            last_selection_mode = COALESCE(excluded.last_selection_mode, activity_state.last_selection_mode),
+            last_is_custom_template = COALESCE(excluded.last_is_custom_template, activity_state.last_is_custom_template),
             updated_at_utc = excluded.updated_at_utc
         """,
         (
@@ -603,6 +647,13 @@ def _upsert_activity_state(
             last_description_hash,
             last_result_status,
             last_error,
+            last_template_hash,
+            last_template_path,
+            last_template_version,
+            last_template_name,
+            last_working_profile_id,
+            last_selection_mode,
+            (1 if last_is_custom_template else 0) if isinstance(last_is_custom_template, bool) else None,
             updated_at_utc,
         ),
     )
@@ -1108,6 +1159,13 @@ def record_activity_output(
     job_id: str | None = None,
     run_id: str | None = None,
     error: str | None = None,
+    template_hash: str | None = None,
+    template_path: str | None = None,
+    template_version: str | None = None,
+    template_name: str | None = None,
+    working_profile_id: str | None = None,
+    selection_mode: str | None = None,
+    is_custom_template: bool | None = None,
 ) -> None:
     activity_id_str = str(activity_id).strip()
     if not activity_id_str:
@@ -1115,6 +1173,23 @@ def record_activity_output(
     now_iso = _utc_now_iso()
     try:
         with _connect_runtime_db(path) as conn:
+            conn.execute(
+                """
+                INSERT INTO activities (
+                    activity_id,
+                    first_seen_at_utc,
+                    last_seen_at_utc,
+                    sport_type,
+                    start_date_utc,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?, NULL, NULL, ?)
+                ON CONFLICT(activity_id) DO UPDATE SET
+                    last_seen_at_utc = excluded.last_seen_at_utc,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (activity_id_str, now_iso, now_iso, now_iso),
+            )
             _upsert_activity_state(
                 conn,
                 activity_id=activity_id_str,
@@ -1127,6 +1202,13 @@ def record_activity_output(
                 last_description_hash=_description_hash(description),
                 last_result_status=result_status.strip() if isinstance(result_status, str) and result_status.strip() else None,
                 last_error=error,
+                last_template_hash=template_hash.strip() if isinstance(template_hash, str) and template_hash.strip() else None,
+                last_template_path=template_path.strip() if isinstance(template_path, str) and template_path.strip() else None,
+                last_template_version=template_version.strip() if isinstance(template_version, str) and template_version.strip() else None,
+                last_template_name=template_name.strip() if isinstance(template_name, str) and template_name.strip() else None,
+                last_working_profile_id=working_profile_id.strip() if isinstance(working_profile_id, str) and working_profile_id.strip() else None,
+                last_selection_mode=selection_mode.strip() if isinstance(selection_mode, str) and selection_mode.strip() else None,
+                last_is_custom_template=is_custom_template if isinstance(is_custom_template, bool) else None,
             )
     except sqlite3.Error:
         return
@@ -1356,6 +1438,13 @@ def get_activity_state(path: Path, activity_id: int | str) -> dict[str, Any] | N
                     last_description_hash,
                     last_result_status,
                     last_error,
+                    last_template_hash,
+                    last_template_path,
+                    last_template_version,
+                    last_template_name,
+                    last_working_profile_id,
+                    last_selection_mode,
+                    last_is_custom_template,
                     updated_at_utc
                 FROM activity_state
                 WHERE activity_id = ?
@@ -1381,6 +1470,27 @@ def get_activity_state(path: Path, activity_id: int | str) -> dict[str, Any] | N
             str(row["last_result_status"]) if row["last_result_status"] is not None else None
         ),
         "last_error": str(row["last_error"]) if row["last_error"] is not None else None,
+        "last_template_hash": (
+            str(row["last_template_hash"]) if row["last_template_hash"] is not None else None
+        ),
+        "last_template_path": (
+            str(row["last_template_path"]) if row["last_template_path"] is not None else None
+        ),
+        "last_template_version": (
+            str(row["last_template_version"]) if row["last_template_version"] is not None else None
+        ),
+        "last_template_name": (
+            str(row["last_template_name"]) if row["last_template_name"] is not None else None
+        ),
+        "last_working_profile_id": (
+            str(row["last_working_profile_id"]) if row["last_working_profile_id"] is not None else None
+        ),
+        "last_selection_mode": (
+            str(row["last_selection_mode"]) if row["last_selection_mode"] is not None else None
+        ),
+        "last_is_custom_template": (
+            bool(int(row["last_is_custom_template"])) if row["last_is_custom_template"] is not None else None
+        ),
         "updated_at_utc": str(row["updated_at_utc"]),
     }
 

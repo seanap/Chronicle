@@ -42,7 +42,6 @@
 
 - [README](../README.md) - Project overview and quick start
 - [API Documentation](./API_DOCUMENTATION.md) - API reference and UI routes
-- [UI Rollout Rollback Playbook](./ui-rollout-rollback.md) - MPA/SPA coexistence rollback procedure
 - [Android Widget Companion](./ANDROID_WIDGET_COMPANION.md) - Widget companion app overview
 - [Misery Index Report](./MISERY_INDEX_REPORT.md) - Misery index math and rationale
 

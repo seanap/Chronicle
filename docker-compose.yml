@@ -1,6 +1,9 @@
 services:
   chronicle-worker:
-    image: ${DOCKER_IMAGE:-seanap/chronicle:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${DOCKER_IMAGE:-chronicle-local:latest}
     container_name: chronicle-worker
     command: ["python", "-m", "chronicle.worker"]
     network_mode: bridge
@@ -21,7 +24,10 @@ services:
     restart: unless-stopped
 
   chronicle-api:
-    image: ${DOCKER_IMAGE:-seanap/chronicle:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${DOCKER_IMAGE:-chronicle-local:latest}
     container_name: chronicle-api
     command:
       [
@@ -34,7 +40,6 @@ services:
       - .env
     environment:
       - SETUP_ENV_FILE=/app/.env
-      - UI_ROLLOUT_DEFAULT_MODE=${UI_ROLLOUT_DEFAULT_MODE:-spa}
     volumes:
       - ./data:/app/state
       - ./.env:/app/.env

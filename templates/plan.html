@@ -17,12 +17,16 @@
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='chronicle.png') }}">
   <link rel="stylesheet" href="/static/ui-theme.css">
   <link rel="stylesheet" href="/static/plan.css">
+  {% if review_variant_css_url %}
+  <link rel="stylesheet" href="{{ review_variant_css_url }}">
+  {% endif %}
 </head>
 <body class="plan-page">
   {% include "_app_shell_nav.html" %}
 
   <div class="plan-pace-handles">
     <button id="planPaceDrawerTab" class="plan-pace-tab" type="button" aria-label="Open pace workshop">Pace Workshop</button>
+    <button id="planWorkoutDrawerTab" class="plan-pace-tab" type="button" aria-label="Open workout workshop">Workout Workshop</button>
   </div>
   <aside id="planPaceDrawer" class="plan-pace-drawer" aria-hidden="true">
     <div class="plan-pace-head">
@@ -59,7 +63,43 @@
         <p class="muted">Calculated from nearest marathon-goal lookup row.</p>
         <div id="planTrainingPacesList" class="plan-pace-grid"></div>
       </section>
+      <section class="plan-pace-section">
+        <h3>Plan Equivalencies</h3>
+        <p class="muted">Other plan labels are mapped onto the Hansons baseline so workout YAML can use familiar names without creating a second pace system.</p>
+        <div id="planPaceFamilyList" class="plan-pace-family-list"></div>
+      </section>
       <p id="planPaceStatus" class="plan-pace-status" aria-live="polite"></p>
+    </div>
+  </aside>
+  <aside id="planWorkoutDrawer" class="plan-pace-drawer" aria-hidden="true">
+    <div class="plan-pace-head">
+      <h2>Workout Workshop</h2>
+      <button id="planWorkoutDrawerClose" class="plan-pace-close" type="button">Close</button>
+    </div>
+    <div class="plan-pace-body">
+      <section id="planWorkoutWorkshopSection" class="plan-pace-section plan-workout-section">
+        <div class="plan-workout-head">
+          <div>
+            <h3>Workout Library</h3>
+            <p class="muted">Create file-backed workouts in YAML, organize them by plan family, and reuse them in SOS rows.</p>
+          </div>
+        </div>
+        <div id="planWorkoutWorkshopMeta" class="plan-pace-status">Loading workouts...</div>
+        <div class="plan-workout-picker-shell">
+          <label for="planWorkoutPickerToggle">Workout</label>
+          <button id="planWorkoutPickerToggle" class="plan-workout-picker-toggle" type="button" aria-haspopup="dialog" aria-expanded="false">Select workout</button>
+          <div id="planWorkoutPickerPanel" class="plan-workout-picker-panel" hidden></div>
+        </div>
+        <div id="planWorkoutDocumentMeta" class="muted">No workout selected.</div>
+        <div class="plan-pace-inline plan-workout-actions">
+          <button id="planWorkoutNewBtn" type="button">New</button>
+          <button id="planWorkoutSaveBtn" type="button">Save</button>
+          <button id="planWorkoutReloadBtn" type="button">Reload</button>
+        </div>
+        <label for="planWorkoutYamlEditor">Workout YAML</label>
+        <textarea id="planWorkoutYamlEditor" class="plan-workout-yaml-editor" spellcheck="false"></textarea>
+        <div id="planWorkoutStatus" class="plan-pace-status" aria-live="polite">Loading workout workshop...</div>
+      </section>
     </div>
   </aside>
   <div id="planPaceBackdrop" class="plan-pace-backdrop" aria-hidden="true"></div>
@@ -96,6 +136,7 @@
           <span class="legend-chip legend-hard">Risk</span>
         </div>
       </div>
+      <p id="planActionStatus" class="plan-action-status" aria-live="polite"></p>
       <div class="plan-table-wrap" role="region" aria-label="Plan table">
         <table class="plan-table">
           <thead>
@@ -124,5 +165,8 @@
   </div>
 
   <script src="/static/plan.js"></script>
+  {% if review_variant_js_url %}
+  <script src="{{ review_variant_js_url }}"></script>
+  {% endif %}
 </body>
 </html>

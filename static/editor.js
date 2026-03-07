@@ -169,6 +169,16 @@ const state = {
   templateMeta: null,
   profiles: [],
   workingProfileId: "default",
+  selectedProfileId: "default",
+  profileDraftMode: false,
+  profileDraftName: "",
+  profileYamlText: "",
+  profileYamlLoadedText: "",
+  profileYamlReadOnly: false,
+  profileYamlSourcePath: "",
+  profileYamlLoadError: "",
+  profileValidationActivityId: "",
+  profileValidationSummary: "",
   repositoryTemplates: [],
   repositorySelectedId: "",
   repositoryLoadedTemplateId: "",
@@ -210,7 +220,17 @@ const elements = {
   workspaceScopeSections: Array.from(document.querySelectorAll("[data-workspace-scope]")),
   profileWorkspaceSection: document.getElementById("profileWorkspaceSection"),
   profileWorkspaceMeta: document.getElementById("profileWorkspaceMeta"),
-  profileList: document.getElementById("profileList"),
+  profileSelect: document.getElementById("profileSelect"),
+  btnProfileNew: document.getElementById("btnProfileNew"),
+  btnProfileReload: document.getElementById("btnProfileReload"),
+  btnProfileToggleEnabled: document.getElementById("btnProfileToggleEnabled"),
+  btnProfileSave: document.getElementById("btnProfileSave"),
+  btnProfileSetWorking: document.getElementById("btnProfileSetWorking"),
+  profileYamlEditor: document.getElementById("profileYamlEditor"),
+  profileDocumentMeta: document.getElementById("profileDocumentMeta"),
+  profileValidationActivityId: document.getElementById("profileValidationActivityId"),
+  btnProfileValidateActivity: document.getElementById("btnProfileValidateActivity"),
+  profileValidationMeta: document.getElementById("profileValidationMeta"),
   drawerBackdrop: document.getElementById("drawerBackdrop"),
   btnDrawerToggle: document.getElementById("btnDrawerToggle"),
   btnProfileDrawerToggle: document.getElementById("btnProfileDrawerToggle"),
@@ -351,6 +371,24 @@ function currentProfileId() {
   return String(state.workingProfileId || "default").trim() || "default";
 }
 
+function profileDraftKey(profileId = currentProfileId()) {
+  const normalized = String(profileId || "default")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "default";
+  return `${DRAFT_KEY}:${normalized}`;
+}
+
+function persistProfileDraftSnapshot(profileId = currentProfileId(), templateText = getEditorText()) {
+  try {
+    localStorage.setItem(profileDraftKey(profileId), String(templateText || ""));
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
 function currentProfileLabel() {
   const profileId = currentProfileId();
   const found = Array.isArray(state.profiles)
@@ -365,7 +403,237 @@ function updateCurrentProfileDisplay() {
   elements.currentProfileDisplay.textContent = currentProfileLabel();
 }
 
-async function loadProfiles() {
+function normalizeProfileId(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function selectedProfileId() {
+  return normalizeProfileId(state.selectedProfileId || state.workingProfileId || "default") || "default";
+}
+
+function selectedProfileRecord() {
+  return Array.isArray(state.profiles)
+    ? state.profiles.find((item) => normalizeProfileId(item.profile_id) === selectedProfileId()) || null
+    : null;
+}
+
+function profileYamlDirty() {
+  return String(state.profileYamlText || "") !== String(state.profileYamlLoadedText || "");
+}
+
+function buildProfileYamlSkeleton(name) {
+  const normalizedName = String(name || "").trim() || "New Profile";
+  const profileId = normalizeProfileId(normalizedName) || "new-profile";
+  return [
+    `profile_id: ${profileId}`,
+    `label: ${normalizedName}`,
+    "priority: 0",
+    "criteria:",
+    "  kind: activity",
+    "  description: Describe when this profile should match.",
+    "  all_of: []",
+    "",
+  ].join("\n");
+}
+
+function applyProfileDocument(documentPayload) {
+  const profile = documentPayload?.profile || {};
+  state.selectedProfileId = String(profile.profile_id || state.selectedProfileId || "default");
+  state.profileYamlText = String(documentPayload?.yaml_text || "");
+  state.profileYamlLoadedText = String(documentPayload?.yaml_text || "");
+  state.profileYamlReadOnly = Boolean(documentPayload?.read_only);
+  state.profileYamlSourcePath = String(documentPayload?.source_path || "");
+  state.profileYamlLoadError = String(documentPayload?.load_error || "");
+  state.profileDraftMode = false;
+  state.profileDraftName = String(profile.label || state.profileDraftName || "");
+  state.profileValidationSummary = "";
+}
+
+async function loadSelectedProfileDocument({ force = false } = {}) {
+  const profileId = selectedProfileId();
+  if (!profileId || state.profileDraftMode) {
+    renderProfileWorkspace();
+    return true;
+  }
+  if (!force && profileYamlDirty()) {
+    const ok = window.confirm("Discard unsaved profile YAML changes?");
+    if (!ok) return false;
+  }
+  const res = await requestJSON(`/editor/profiles/${encodeURIComponent(profileId)}`);
+  if (!res.ok) {
+    setStatus(res.payload?.error || "Failed to load profile YAML", "error");
+    return false;
+  }
+  applyProfileDocument(res.payload);
+  renderProfileWorkspace();
+  return true;
+}
+
+async function createNewProfileDraft() {
+  if (profileYamlDirty()) {
+    const ok = window.confirm("Discard unsaved profile YAML changes and start a new profile?");
+    if (!ok) return;
+  }
+  const rawName = window.prompt("New profile name");
+  const name = String(rawName || "").trim();
+  if (!name) return;
+  state.profileDraftMode = true;
+  state.profileDraftName = name;
+  state.selectedProfileId = normalizeProfileId(name) || "new-profile";
+  state.profileYamlText = buildProfileYamlSkeleton(name);
+  state.profileYamlLoadedText = "";
+  state.profileYamlReadOnly = false;
+  state.profileYamlSourcePath = "Not saved yet";
+  state.profileYamlLoadError = "";
+  state.profileValidationSummary = "";
+  renderProfileWorkspace();
+  setStatus(`Drafting new profile: ${name}`, "ok");
+}
+
+async function saveCurrentProfileYaml() {
+  const yamlText = String(state.profileYamlText || "");
+  if (!yamlText.trim()) {
+    setStatus("Profile YAML is empty", "error");
+    return false;
+  }
+  const isNew = Boolean(state.profileDraftMode);
+  const targetProfileId = selectedProfileId();
+  const res = isNew
+    ? await requestJSON("/editor/profiles", {
+        method: "POST",
+        body: JSON.stringify({
+          profile_name: state.profileDraftName || targetProfileId,
+          yaml_text: yamlText,
+        }),
+      })
+    : await requestJSON(`/editor/profiles/${encodeURIComponent(targetProfileId)}`, {
+        method: "PUT",
+        body: JSON.stringify({ yaml_text: yamlText }),
+      });
+  if (!res.ok) {
+    setStatus(res.payload?.error || "Profile save failed", "error");
+    return false;
+  }
+  if (res.payload.profile?.profile_id) {
+    state.selectedProfileId = String(res.payload.profile.profile_id);
+  }
+  state.workingProfileId = String(res.payload.working_profile_id || state.workingProfileId || "default");
+  applyProfileDocument(res.payload);
+  await loadProfiles({ reloadDocument: false });
+  renderProfileWorkspace();
+  updateCurrentProfileDisplay();
+  setStatus(`Profile saved: ${state.profileDraftName || state.selectedProfileId}`, "ok");
+  return true;
+}
+
+async function toggleSelectedProfileEnabled() {
+  const profile = selectedProfileRecord();
+  const profileId = selectedProfileId();
+  if (!profile || !profileId || profileId === "default") return;
+  if (profile.invalid) {
+    setStatus(profile.load_error || "Fix the profile YAML before toggling status", "error");
+    return;
+  }
+  const nextEnabled = !Boolean(profile.enabled);
+  const res = await requestJSON(`/editor/profiles/${encodeURIComponent(profileId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled: nextEnabled }),
+  });
+  if (!res.ok) {
+    setStatus(res.payload?.error || "Failed to update profile status", "error");
+    return;
+  }
+  state.workingProfileId = String(res.payload?.working_profile_id || state.workingProfileId || "default");
+  state.profileValidationSummary = "";
+  await loadProfiles({ reloadDocument: false });
+  renderProfileWorkspace();
+  updateCurrentProfileDisplay();
+  setStatus(`${profile.label || profileId} ${nextEnabled ? "enabled" : "disabled"}`, "ok");
+}
+
+async function validateSelectedProfileActivity() {
+  const yamlText = String(state.profileYamlText || "");
+  if (!yamlText.trim()) {
+    setStatus("Profile YAML is empty", "error");
+    return;
+  }
+  const activityId = String(state.profileValidationActivityId || "").trim();
+  if (!/^[0-9]+$/.test(activityId)) {
+    state.profileValidationSummary = "Enter a valid numeric Strava activity ID.";
+    renderProfileWorkspace();
+    setStatus(state.profileValidationSummary, "error");
+    return;
+  }
+  const selectedProfile = selectedProfileRecord();
+  const res = await requestJSON("/editor/profiles/validate-activity", {
+    method: "POST",
+    body: JSON.stringify({
+      activity_id: Number(activityId),
+      enabled: state.profileDraftMode ? true : Boolean(selectedProfile?.enabled),
+      profile_id: selectedProfileId(),
+      profile_name: state.profileDraftName || selectedProfileId(),
+      yaml_text: yamlText,
+    }),
+  });
+  if (!res.ok) {
+    state.profileValidationSummary = res.payload?.error || "Activity validation failed";
+    renderProfileWorkspace();
+    setStatus(state.profileValidationSummary, "error");
+    return;
+  }
+  const match = res.payload?.profile_match || {};
+  const activity = res.payload?.activity || {};
+  const reasons = Array.isArray(match.reasons) ? match.reasons.filter(Boolean).join(" | ") : "";
+  const verdict = match.would_process ? "Would process" : "Would not process";
+  const detailBits = [
+    activity.id ? String(activity.id) : "",
+    activity.name ? String(activity.name) : "",
+    activity.sport_type ? String(activity.sport_type) : "",
+  ].filter(Boolean);
+  state.profileValidationSummary = `${verdict}${detailBits.length ? ` | ${detailBits.join(" | ")}` : ""}${reasons ? ` | ${reasons}` : ""}`;
+  renderProfileWorkspace();
+  setStatus("Activity validation updated", "ok");
+}
+
+async function setSelectedProfileWorking() {
+  const profile = selectedProfileRecord();
+  const profileId = selectedProfileId();
+  if (!profileId || !profile || !profile.enabled) return;
+  if (profileYamlDirty()) {
+    setStatus("Save or reload profile YAML before setting the working profile", "error");
+    return;
+  }
+  if (profile.invalid) {
+    setStatus(profile.load_error || "Fix the profile YAML before setting it as working", "error");
+    return;
+  }
+  if (state.editorTouched) {
+    const ok = window.confirm(
+      "Switch working profile and replace editor content with that profile template?"
+    );
+    if (!ok) return;
+    persistProfileDraftSnapshot(currentProfileId(), getEditorText());
+  }
+  const setRes = await requestJSON("/editor/profiles/working", {
+    method: "POST",
+    body: JSON.stringify({ profile_id: profileId }),
+  });
+  if (!setRes.ok) {
+    setStatus(setRes.payload?.error || "Failed to switch working profile", "error");
+    return;
+  }
+  state.workingProfileId = String(setRes.payload?.working_profile_id || profileId);
+  await loadEditorBootstrap();
+  await loadProfiles({ reloadDocument: false });
+  renderProfileWorkspace();
+  setStatus(`Working profile set: ${profile.label || profileId}`, "ok");
+}
+
+async function loadProfiles({ reloadDocument = true, forceDocument = false } = {}) {
   const res = await requestJSON("/editor/profiles");
   if (!res.ok) {
     setStatus("Failed to load profile workspace", "error");
@@ -373,108 +641,138 @@ async function loadProfiles() {
   }
   state.profiles = Array.isArray(res.payload.profiles) ? res.payload.profiles : [];
   state.workingProfileId = String(res.payload.working_profile_id || "default");
+  if (!state.profileDraftMode) {
+    const availableIds = new Set(state.profiles.map((item) => normalizeProfileId(item.profile_id)));
+    if (!availableIds.has(selectedProfileId())) {
+      state.selectedProfileId = state.workingProfileId;
+    }
+  }
   renderProfileWorkspace();
   updateCurrentProfileDisplay();
+  if (reloadDocument && !state.profileDraftMode) {
+    await loadSelectedProfileDocument({ force: forceDocument });
+  }
   return true;
 }
 
 function renderProfileWorkspace() {
-  if (!elements.profileList) return;
-  elements.profileList.innerHTML = "";
+  if (!elements.profileSelect || !elements.profileYamlEditor) return;
   const profiles = Array.isArray(state.profiles) ? [...state.profiles] : [];
-  profiles.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
+  profiles.sort(
+    (a, b) =>
+      Number(b.priority || 0) - Number(a.priority || 0)
+      || String(a.label || a.profile_id || "").localeCompare(String(b.label || b.profile_id || ""))
+  );
+  const themeStyles = window.getComputedStyle(document.body);
+  const enabledTextColor = themeStyles.getPropertyValue("--ink").trim() || "#f2f2f2";
+  const disabledTextColor = themeStyles.getPropertyValue("--muted").trim() || "#a8a8a8";
+  const invalidTextColor = themeStyles.getPropertyValue("--secondary").trim() || "#ff9b4a";
   if (elements.profileWorkspaceMeta) {
-    elements.profileWorkspaceMeta.textContent = `Working profile: ${currentProfileLabel()} (${currentProfileId()})`;
+    elements.profileWorkspaceMeta.textContent = `Working profile: ${currentProfileLabel()} (${currentProfileId()}) | order: highest priority first`;
   }
-  if (profiles.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "meta";
-    empty.textContent = "No profiles available.";
-    elements.profileList.appendChild(empty);
-    return;
+  const selectedId = selectedProfileId();
+  elements.profileSelect.innerHTML = "";
+  if (state.profileDraftMode) {
+    const draftOption = document.createElement("option");
+    draftOption.value = selectedId;
+    draftOption.textContent = `draft | ${state.profileDraftName || selectedId}`;
+    elements.profileSelect.appendChild(draftOption);
   }
-
   for (const profile of profiles) {
-    const profileId = String(profile.profile_id || "");
-    const row = document.createElement("div");
-    row.className = "field";
+    const option = document.createElement("option");
+    option.value = String(profile.profile_id || "");
+    const priorityLabel = String(Math.trunc(Number(profile.priority || 0))).padStart(3, "0");
+    option.textContent = `${priorityLabel} | ${profile.enabled ? "●" : "○"} ${profile.label || profile.profile_id}${profile.is_builtin ? " [builtin]" : ""}${profile.invalid ? " [invalid]" : ""}`;
+    if (profile.invalid) {
+      option.style.backgroundColor = "rgba(122, 36, 15, 0.24)";
+      option.style.color = invalidTextColor;
+    } else if (profile.enabled) {
+      option.style.backgroundColor = "rgba(252, 76, 2, 0.12)";
+      option.style.color = enabledTextColor;
+    } else {
+      option.style.backgroundColor = "rgba(255, 255, 255, 0.03)";
+      option.style.color = disabledTextColor;
+    }
+    if (normalizeProfileId(profile.profile_id) === selectedId) {
+      option.selected = true;
+    }
+    elements.profileSelect.appendChild(option);
+  }
 
-    const body = document.createElement("div");
-    const key = document.createElement("div");
-    key.className = "field-key";
-    key.textContent = `${profile.label || profileId} (${profileId})`;
-
-    const type = document.createElement("div");
-    type.className = "field-type";
-    type.textContent = `Priority ${profile.priority ?? 0} | ${profile.enabled ? "Enabled" : "Disabled"}${profile.locked ? " | Locked" : ""}`;
-
-    const source = document.createElement("div");
-    source.className = "field-source";
-    source.textContent = String(profile.criteria?.description || "");
-
-    body.appendChild(key);
-    body.appendChild(type);
-    body.appendChild(source);
-
-    const controls = document.createElement("div");
-    controls.className = "row-controls";
-
-    const enabledLabel = document.createElement("label");
-    enabledLabel.className = "toggle-inline";
-    const enabledInput = document.createElement("input");
-    enabledInput.type = "checkbox";
-    enabledInput.checked = Boolean(profile.enabled);
-    enabledInput.disabled = Boolean(profile.locked);
-    enabledInput.addEventListener("change", async () => {
-      const previousWorking = currentProfileId();
-      const res = await requestJSON(`/editor/profiles/${encodeURIComponent(profileId)}`, {
-        method: "PUT",
-        body: JSON.stringify({ enabled: Boolean(enabledInput.checked) }),
-      });
-      if (!res.ok) {
-        setStatus(res.payload?.error || "Profile update failed", "error");
-        await loadProfiles();
-        return;
-      }
-      setStatus(`Profile ${profile.label || profileId} updated`, "ok");
-      await loadProfiles();
-      if (currentProfileId() !== previousWorking) {
-        await loadEditorBootstrap();
-      }
-    });
-    enabledLabel.appendChild(enabledInput);
-    enabledLabel.append(" Enabled");
-
-    const workingBtn = document.createElement("button");
-    workingBtn.className = "field-insert";
-    workingBtn.textContent = profileId === currentProfileId() ? "Working" : "Set Working";
-    workingBtn.disabled = profileId === currentProfileId() || !Boolean(profile.enabled);
-    workingBtn.addEventListener("click", async () => {
-      if (state.editorTouched) {
-        const ok = window.confirm(
-          "Switch working profile and replace editor content with that profile template?"
-        );
-        if (!ok) return;
-      }
-      const setRes = await requestJSON("/editor/profiles/working", {
-        method: "POST",
-        body: JSON.stringify({ profile_id: profileId }),
-      });
-      if (!setRes.ok) {
-        setStatus(setRes.payload?.error || "Failed to switch working profile", "error");
-        return;
-      }
-      await loadProfiles();
-      await loadEditorBootstrap();
-      setStatus(`Working profile set: ${profile.label || profileId}`, "ok");
-    });
-
-    controls.appendChild(enabledLabel);
-    controls.appendChild(workingBtn);
-
-    row.appendChild(body);
-    row.appendChild(controls);
-    elements.profileList.appendChild(row);
+  const selectedProfile = selectedProfileRecord();
+  const readOnly = Boolean(state.profileYamlReadOnly);
+  const dirty = profileYamlDirty();
+  const nextYamlText = String(state.profileYamlText || "");
+  elements.profileSelect.classList.remove("profile-select-enabled", "profile-select-disabled", "profile-select-invalid");
+  if (selectedProfile?.invalid) {
+    elements.profileSelect.classList.add("profile-select-invalid");
+  } else if (selectedProfile?.enabled) {
+    elements.profileSelect.classList.add("profile-select-enabled");
+  } else if (selectedProfile) {
+    elements.profileSelect.classList.add("profile-select-disabled");
+  }
+  if (elements.profileYamlEditor.value !== nextYamlText) {
+    elements.profileYamlEditor.value = nextYamlText;
+  }
+  elements.profileYamlEditor.readOnly = readOnly;
+  if (elements.profileValidationActivityId && elements.profileValidationActivityId.value !== state.profileValidationActivityId) {
+    elements.profileValidationActivityId.value = state.profileValidationActivityId;
+  }
+  if (elements.profileDocumentMeta) {
+    const summaryBits = [];
+    if (selectedProfile) {
+      summaryBits.push(`Priority ${selectedProfile.priority ?? 0}`);
+      summaryBits.push(selectedProfile.enabled ? "Enabled" : "Disabled");
+      if (selectedProfile.is_builtin) summaryBits.push("Builtin");
+      if (selectedProfile.invalid) summaryBits.push("Invalid YAML");
+    }
+    if (state.profileYamlSourcePath) summaryBits.push(state.profileYamlSourcePath);
+    if (dirty) summaryBits.push("Unsaved changes");
+    elements.profileDocumentMeta.textContent = summaryBits.join(" | ") || "No profile selected.";
+  }
+  if (elements.profileValidationMeta) {
+    elements.profileValidationMeta.textContent = state.profileValidationSummary
+      || state.profileYamlLoadError
+      || (readOnly
+        ? "Builtin profile YAML is read-only. Duplicate it with New if you want to customize it."
+        : "Validate the current YAML against a real Strava activity before you save or set working.");
+  }
+  if (elements.btnProfileSave) {
+    elements.btnProfileSave.disabled = readOnly || !nextYamlText.trim();
+  }
+  if (elements.btnProfileToggleEnabled) {
+    elements.btnProfileToggleEnabled.classList.remove("btn-profile-enabled", "btn-profile-disabled", "btn-profile-locked");
+    if (state.profileDraftMode) {
+      elements.btnProfileToggleEnabled.textContent = "Save To Enable";
+      elements.btnProfileToggleEnabled.disabled = true;
+      elements.btnProfileToggleEnabled.classList.add("btn-profile-locked");
+    } else if (!selectedProfile) {
+      elements.btnProfileToggleEnabled.textContent = "Status";
+      elements.btnProfileToggleEnabled.disabled = true;
+      elements.btnProfileToggleEnabled.classList.add("btn-profile-locked");
+    } else if (selectedProfile.profile_id === "default") {
+      elements.btnProfileToggleEnabled.textContent = "Always Enabled";
+      elements.btnProfileToggleEnabled.disabled = true;
+      elements.btnProfileToggleEnabled.classList.add("btn-profile-locked");
+    } else if (selectedProfile.invalid) {
+      elements.btnProfileToggleEnabled.textContent = "Invalid YAML";
+      elements.btnProfileToggleEnabled.disabled = true;
+      elements.btnProfileToggleEnabled.classList.add("btn-profile-locked");
+    } else if (selectedProfile.enabled) {
+      elements.btnProfileToggleEnabled.textContent = "Disable Profile";
+      elements.btnProfileToggleEnabled.disabled = false;
+      elements.btnProfileToggleEnabled.classList.add("btn-profile-enabled");
+    } else {
+      elements.btnProfileToggleEnabled.textContent = "Enable Profile";
+      elements.btnProfileToggleEnabled.disabled = false;
+      elements.btnProfileToggleEnabled.classList.add("btn-profile-disabled");
+    }
+  }
+  if (elements.btnProfileSetWorking) {
+    elements.btnProfileSetWorking.disabled = state.profileDraftMode || !selectedProfile || !selectedProfile.enabled || Boolean(selectedProfile.invalid) || dirty || selectedId === currentProfileId();
+  }
+  if (elements.btnProfileValidateActivity) {
+    elements.btnProfileValidateActivity.disabled = !nextYamlText.trim() || !String(state.profileValidationActivityId || "").trim();
   }
 }
 
@@ -2090,19 +2388,28 @@ function renderRepositoryOptions() {
 }
 
 async function loadRepositoryTemplates(options = {}) {
-  const { preferTemplateId = "" } = options;
+  const {
+    preferTemplateId = "",
+    preserveExistingOnError = false,
+    statusOnError = "Failed to load template repository",
+  } = options;
   const res = await requestJSON("/editor/repository/templates");
   if (!res.ok || !Array.isArray(res.payload.templates)) {
-    state.repositoryTemplates = [];
-    renderRepositoryOptions();
-    setStatus("Failed to load template repository", "error");
-    return;
+    if (!preserveExistingOnError) {
+      state.repositoryTemplates = [];
+      renderRepositoryOptions();
+    }
+    if (statusOnError) {
+      setStatus(statusOnError, "error");
+    }
+    return false;
   }
   state.repositoryTemplates = res.payload.templates;
   if (preferTemplateId) {
     state.repositorySelectedId = String(preferTemplateId);
   }
   renderRepositoryOptions();
+  return true;
 }
 
 async function loadRepositoryTemplateIntoEditor(templateId, options = {}) {
@@ -2291,8 +2598,9 @@ async function rollbackTemplateVersion(versionId) {
 
 function saveDraft() {
   try {
+    persistProfileDraftSnapshot(currentProfileId(), getEditorText());
     localStorage.setItem(DRAFT_KEY, getEditorText());
-    setStatus("Draft saved locally", "ok");
+    setStatus(`Draft saved locally for ${currentProfileLabel()}`, "ok");
   } catch (_err) {
     setStatus("Draft save failed", "error");
   }
@@ -2300,14 +2608,14 @@ function saveDraft() {
 
 function loadDraft() {
   try {
-    const draft = localStorage.getItem(DRAFT_KEY);
+    const draft = localStorage.getItem(profileDraftKey(currentProfileId())) || localStorage.getItem(DRAFT_KEY);
     if (!draft) {
-      setStatus("No local draft found", "error");
+      setStatus(`No local draft found for ${currentProfileLabel()}`, "error");
       return;
     }
     setEditorText(draft);
     setEditorDirty(true);
-    setStatus("Loaded local draft", "ok");
+    setStatus(`Loaded local draft for ${currentProfileLabel()}`, "ok");
     queueAutoPreview();
   } catch (_err) {
     setStatus("Draft load failed", "error");
@@ -2623,13 +2931,23 @@ async function saveRepositoryTemplate() {
     setStatus("Repository save failed", "error");
     return;
   }
-  await loadRepositoryTemplates({ preferTemplateId: selectedId });
-  const loaded = await requestJSON(`/editor/repository/template/${encodeURIComponent(selectedId)}`);
-  if (loaded.ok) {
-    renderRepositoryMeta(loaded.payload.template_record || null);
+  const updatedRecord = res.payload.template_record || null;
+  const refreshed = await loadRepositoryTemplates({
+    preferTemplateId: selectedId,
+    preserveExistingOnError: true,
+    statusOnError: "",
+  });
+  if (updatedRecord) {
+    renderRepositoryMeta(updatedRecord);
+    setRepositoryFormValues({ name: updatedRecord.name, author: updatedRecord.author });
   }
   state.repositoryLoadedTemplateId = selectedId;
-  setStatus("Repository template saved", "ok");
+  setStatus(
+    refreshed
+      ? "Repository template saved"
+      : "Repository template saved, but repository list refresh failed. Use Refresh to sync the drawer.",
+    "ok",
+  );
 }
 
 async function saveRepositoryTemplateAs() {
@@ -2654,10 +2972,19 @@ async function saveRepositoryTemplateAs() {
   }
   const created = res.payload.template_record || {};
   const createdId = String(created.template_id || "");
-  await loadRepositoryTemplates({ preferTemplateId: createdId });
+  const refreshed = await loadRepositoryTemplates({
+    preferTemplateId: createdId,
+    preserveExistingOnError: true,
+    statusOnError: "",
+  });
   state.repositoryLoadedTemplateId = createdId;
   renderRepositoryMeta(created);
-  setStatus(`Repository template saved as: ${created.name || createdId}`, "ok");
+  setStatus(
+    refreshed
+      ? `Repository template saved as: ${created.name || createdId}`
+      : `Repository template saved as: ${created.name || createdId}. Repository list refresh failed; use Refresh to sync the drawer.`,
+    "ok",
+  );
 }
 
 async function duplicateRepositoryTemplate() {
@@ -2685,10 +3012,19 @@ async function duplicateRepositoryTemplate() {
   }
   const duplicated = res.payload.template_record || {};
   const duplicatedId = String(duplicated.template_id || "");
-  await loadRepositoryTemplates({ preferTemplateId: duplicatedId });
+  const refreshed = await loadRepositoryTemplates({
+    preferTemplateId: duplicatedId,
+    preserveExistingOnError: true,
+    statusOnError: "",
+  });
   state.repositoryLoadedTemplateId = duplicatedId;
   renderRepositoryMeta(duplicated);
-  setStatus(`Template duplicated: ${duplicated.name || duplicatedId}`, "ok");
+  setStatus(
+    refreshed
+      ? `Template duplicated: ${duplicated.name || duplicatedId}`
+      : `Template duplicated: ${duplicated.name || duplicatedId}. Repository list refresh failed; use Refresh to sync the drawer.`,
+    "ok",
+  );
 }
 
 async function importTemplateBundleFromFile(file) {
@@ -2727,14 +3063,23 @@ async function importTemplateBundleFromFile(file) {
 
   const record = res.payload.template_record || {};
   const importedId = String(record.template_id || "");
-  await loadRepositoryTemplates({ preferTemplateId: importedId });
+  const refreshed = await loadRepositoryTemplates({
+    preferTemplateId: importedId,
+    preserveExistingOnError: true,
+    statusOnError: "",
+  });
   state.repositoryLoadedTemplateId = importedId;
   if (typeof record.template === "string") {
     setEditorText(record.template);
   }
   setRepositoryFormValues({ name: record.name, author: record.author });
   renderRepositoryMeta(record);
-  setStatus("Template imported into repository", "ok");
+  setStatus(
+    refreshed
+      ? "Template imported into repository"
+      : "Template imported into repository, but repository list refresh failed. Use Refresh to sync the drawer.",
+    "ok",
+  );
   queueAutoPreview();
 }
 
@@ -2785,6 +3130,9 @@ async function loadEditorBootstrap() {
   if (profilesRes.ok) {
     state.profiles = Array.isArray(profilesRes.payload.profiles) ? profilesRes.payload.profiles : [];
     state.workingProfileId = String(profilesRes.payload.working_profile_id || "default");
+    if (!state.profileDraftMode) {
+      state.selectedProfileId = state.selectedProfileId || state.workingProfileId;
+    }
     renderProfileWorkspace();
   }
 
@@ -2792,6 +3140,9 @@ async function loadEditorBootstrap() {
   state.templateDefault = decodeEscapedNewlines(defaultRes.payload.template || "");
   state.templateMeta = activeRes.payload || null;
   state.workingProfileId = String(activeRes.payload.profile_id || state.workingProfileId || "default");
+  if (!state.profileDraftMode) {
+    state.selectedProfileId = state.selectedProfileId || state.workingProfileId;
+  }
   renderProfileWorkspace();
   state.templateName = String(activeRes.payload.name || "Chronicle Template");
   state.lastValidationOk = null;
@@ -3363,6 +3714,70 @@ function bindUI() {
         event.preventDefault();
         await executeCommandPaletteSelection();
       }
+    });
+  }
+  if (elements.profileSelect) {
+    elements.profileSelect.addEventListener("change", async (event) => {
+      const nextId = normalizeProfileId(event.target?.value || "");
+      if (!nextId) return;
+      if (profileYamlDirty()) {
+        const ok = window.confirm("Discard unsaved profile YAML changes?");
+        if (!ok) {
+          renderProfileWorkspace();
+          return;
+        }
+      }
+      state.profileDraftMode = false;
+      state.profileDraftName = "";
+      state.selectedProfileId = nextId;
+      await loadSelectedProfileDocument({ force: true });
+    });
+  }
+  if (elements.btnProfileNew) {
+    elements.btnProfileNew.addEventListener("click", createNewProfileDraft);
+  }
+  if (elements.btnProfileReload) {
+    elements.btnProfileReload.addEventListener("click", async () => {
+      await loadSelectedProfileDocument({ force: false });
+    });
+  }
+  if (elements.btnProfileSave) {
+    elements.btnProfileSave.addEventListener("click", saveCurrentProfileYaml);
+  }
+  if (elements.btnProfileToggleEnabled) {
+    elements.btnProfileToggleEnabled.addEventListener("click", toggleSelectedProfileEnabled);
+  }
+  if (elements.btnProfileSetWorking) {
+    elements.btnProfileSetWorking.addEventListener("click", setSelectedProfileWorking);
+  }
+  if (elements.profileYamlEditor) {
+    elements.profileYamlEditor.addEventListener("input", (event) => {
+      state.profileYamlText = String(event.target?.value || "");
+      state.profileYamlLoadError = "";
+      state.profileValidationSummary = "";
+      renderProfileWorkspace();
+    });
+  }
+  if (elements.profileValidationActivityId) {
+    elements.profileValidationActivityId.addEventListener("input", (event) => {
+      state.profileValidationActivityId = String(event.target?.value || "");
+      state.profileValidationSummary = "";
+      renderProfileWorkspace();
+    });
+    elements.profileValidationActivityId.addEventListener("keydown", async (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      await validateSelectedProfileActivity();
+    });
+  }
+  if (elements.btnProfileValidateActivity) {
+    elements.btnProfileValidateActivity.addEventListener("click", validateSelectedProfileActivity);
+  }
+  if (elements.profileYamlEditor) {
+    elements.profileYamlEditor.addEventListener("input", (event) => {
+      state.profileYamlText = String(event.target?.value || "");
+      state.profileYamlLoadError = "";
+      renderProfileWorkspace();
     });
   }
   document.addEventListener("keydown", (event) => {

@@ -8,10 +8,16 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
-from flask import Flask, abort, redirect, render_template, request, send_from_directory
+from flask import Flask, redirect, render_template, request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .activity_pipeline import preview_profile_match, run_once
+from .activity_pipeline import (
+    build_profile_preview_training,
+    preview_profile_match,
+    preview_specific_profile_against_activity,
+    preview_specific_profile_match,
+    run_once,
+)
 from .config import Settings
 from .dashboard_data import get_dashboard_payload
 from .garmin_sync_queue import (
@@ -58,13 +64,18 @@ from .storage import (
 )
 from .template_profiles import (
     create_template_profile,
+    create_template_profile_from_yaml,
     export_template_profiles_bundle,
     get_template_profile,
+    get_template_profile_document,
     get_working_template_profile,
     import_template_profiles_bundle,
     list_template_profiles,
+    parse_template_profile_yaml_document,
+    save_template_profile_yaml,
     set_working_template_profile,
     update_template_profile,
+    validate_template_profile_criteria,
 )
 from .template_repository import (
     create_template_repository_template,
@@ -87,7 +98,17 @@ from .template_repository import (
 )
 from .template_rendering import normalize_template_context, render_template_text, validate_template_text
 from .template_schema import build_context_schema
-from .workout_workshop import list_workout_definitions, upsert_workout_definition
+from .strava_client import StravaClient
+from .workout_workshop import (
+    collect_workout_target_references,
+    create_workout_definition_from_yaml,
+    get_workout_definition,
+    get_workout_definition_document,
+    list_workout_definitions,
+    resolve_session_workout,
+    save_workout_definition_yaml,
+    upsert_workout_definition,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -129,17 +150,26 @@ STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 METERS_PER_MILE = 1609.34
 PLAN_PACE_WORKSHOP_GOAL_KEY = "pace_workshop.marathon_goal"
-UI_ROLLOUT_RUNTIME_KEY = "ui.rollout.mode"
-UI_ROLLOUT_LAST_MODE_CHANGE_KEY = "ui.rollout.last_mode_change"
-UI_ROLLOUT_LAST_ROLLBACK_KEY = "ui.rollout.last_rollback"
-UI_ROLLOUT_ALLOWED_MODES = {"mpa", "spa"}
-UI_ROLLBACK_TARGET_MINUTES = 15
 CORE_UI_FLOW_LEGACY_PATHS = {
     "sources": "/setup",
     "build": "/editor",
     "plan": "/plan",
     "view": "/dashboard",
     "control": "/control",
+}
+CORE_UI_FLOW_LABELS = {
+    "sources": "Sources",
+    "build": "Build",
+    "plan": "Plan",
+    "view": "View",
+    "control": "Control",
+}
+CORE_UI_FLOW_DESCRIPTIONS = {
+    "sources": "Provider credentials and OAuth state.",
+    "build": "Template authoring with profile and template workshops.",
+    "plan": "Spreadsheet-style weekly planning with pace calculations.",
+    "view": "Training history heatmaps and long-range trend storytelling.",
+    "control": "One-click API operations and service command feedback.",
 }
 
 
@@ -150,87 +180,40 @@ def _normalize_ui_flow(value: object) -> str | None:
     return None
 
 
-def _normalize_ui_rollout_mode(value: object) -> str | None:
-    mode = str(value or "").strip().lower()
-    if mode in UI_ROLLOUT_ALLOWED_MODES:
-        return mode
-    return None
+def _normalize_review_variant_token(value: object) -> str:
+    token = "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum() or ch in {"-", "_"})
+    return token[:64]
 
 
-def _ui_rollout_default_mode() -> str:
-    configured = _normalize_ui_rollout_mode(os.getenv("UI_ROLLOUT_DEFAULT_MODE", "mpa"))
-    return configured or "mpa"
+def _design_review_preview_assets(flow_name: str, variant: str) -> dict[str, str | None]:
+    normalized_variant = _normalize_review_variant_token(variant)
+    if not normalized_variant:
+        return {"review_variant_css_url": None, "review_variant_js_url": None}
+
+    variant_root = PROJECT_ROOT / "static" / "review-variants" / flow_name
+    css_file = variant_root / f"{normalized_variant}.css"
+    js_file = variant_root / f"{normalized_variant}.js"
+    return {
+        "review_variant_css_url": f"/static/review-variants/{flow_name}/{normalized_variant}.css"
+        if css_file.is_file()
+        else None,
+        "review_variant_js_url": f"/static/review-variants/{flow_name}/{normalized_variant}.js"
+        if js_file.is_file()
+        else None,
+    }
 
 
-def _ui_rollout_spa_base_path() -> str:
-    configured = str(os.getenv("UI_SPA_BASE_PATH", "/app") or "").strip()
-    if not configured:
-        return "/app"
-    if not configured.startswith("/"):
-        configured = f"/{configured}"
-    return configured.rstrip("/") or "/app"
-
-
-def _legacy_flow_path(flow_name: str) -> str:
-    return f"/legacy/{flow_name}"
-
-
-def _spa_flow_path(flow_name: str) -> str:
-    return f"{_ui_rollout_spa_base_path()}/{flow_name}"
-
-
-def _ui_rollout_targets(mode: str) -> dict[str, str]:
-    normalized_mode = _normalize_ui_rollout_mode(mode) or "mpa"
-    if normalized_mode == "spa":
-        return {flow_name: _spa_flow_path(flow_name) for flow_name in CORE_UI_FLOW_LEGACY_PATHS}
-    return {flow_name: _legacy_flow_path(flow_name) for flow_name in CORE_UI_FLOW_LEGACY_PATHS}
-
-
-def _current_ui_rollout_mode(current: Settings | None = None) -> str:
-    effective = current or _effective_settings()
-    runtime_mode = _normalize_ui_rollout_mode(get_runtime_value(effective.processed_log_file, UI_ROLLOUT_RUNTIME_KEY))
-    if runtime_mode is not None:
-        return runtime_mode
-    return _ui_rollout_default_mode()
-
-
-def _set_ui_rollout_mode(
-    current: Settings,
-    mode: str,
-    *,
-    source: str,
-    reason: str | None = None,
-) -> str:
-    normalized_mode = _normalize_ui_rollout_mode(mode)
-    if normalized_mode is None:
-        raise ValueError("mode must be one of: mpa, spa.")
-
-    timestamp_utc = datetime.now(timezone.utc).isoformat()
-    set_runtime_value(current.processed_log_file, UI_ROLLOUT_RUNTIME_KEY, normalized_mode)
-    set_runtime_value(
-        current.processed_log_file,
-        UI_ROLLOUT_LAST_MODE_CHANGE_KEY,
-        {
-            "mode": normalized_mode,
-            "source": source,
-            "reason": reason or "",
-            "changed_at_utc": timestamp_utc,
-        },
-    )
-    return timestamp_utc
-
-
-def _render_legacy_core_flow(flow_name: str) -> str:
+def _render_legacy_core_flow(flow_name: str, **template_context: object) -> str:
     if flow_name == "sources":
-        return render_template("setup.html")
+        return render_template("setup.html", **template_context)
     if flow_name == "build":
-        return render_template("editor.html")
+        return render_template("editor.html", **template_context)
     if flow_name == "plan":
-        return render_template("plan.html")
+        return render_template("plan.html", **template_context)
     if flow_name == "view":
-        return render_template("dashboard.html")
+        return render_template("dashboard.html", **template_context)
     if flow_name == "control":
-        return render_template("control.html")
+        return render_template("control.html", **template_context)
     raise ValueError(f"Unsupported core flow '{flow_name}'.")
 
 
@@ -246,10 +229,6 @@ def _core_flow_entrypoint(flow_name: str):
             },
         }, 404
 
-    current = _effective_settings()
-    mode = _current_ui_rollout_mode(current)
-    if mode == "spa":
-        return redirect(_spa_flow_path(normalized_flow), code=302)
     return _render_legacy_core_flow(normalized_flow)
 
 
@@ -470,9 +449,7 @@ def _parse_profile_label(raw_value: object) -> str:
 
 
 def _parse_profile_criteria(raw_value: object) -> dict:
-    if not isinstance(raw_value, dict):
-        raise ValueError("criteria must be an object.")
-    return raw_value
+    return validate_template_profile_criteria(raw_value, require_executable=True, field="criteria")
 
 
 def _resolve_plan_date(raw_date: str) -> str:
@@ -503,6 +480,128 @@ def _plan_pace_workshop_payload(marathon_goal: str) -> dict[str, object]:
         "supported_distances": supported_race_distances(),
         "goal_training": training,
     }
+
+
+def _decorate_workout_with_target_resolution(workout: dict[str, object], marathon_goal: str) -> dict[str, object]:
+    if not isinstance(workout, dict):
+        return workout
+    decorated = dict(workout)
+    decorated["resolved_targets"] = collect_workout_target_references(decorated, marathon_goal)
+    decorated["pace_goal"] = normalize_marathon_goal_time(marathon_goal)
+    return decorated
+
+
+def _attached_workout_codes_for_day(path: Path, *, date_key: str) -> list[str]:
+    day_sessions_map = list_plan_sessions(
+        path,
+        start_date=date_key,
+        end_date=date_key,
+    )
+    raw_sessions = day_sessions_map.get(date_key, []) if isinstance(day_sessions_map, dict) else []
+    attached_workouts: list[str] = []
+    seen_codes: set[str] = set()
+    for session in raw_sessions:
+        if not isinstance(session, dict):
+            continue
+        workout_code = str(session.get("workout_code") or session.get("planned_workout") or "").strip()
+        if not workout_code:
+            continue
+        lowered = workout_code.lower()
+        if lowered in seen_codes:
+            continue
+        seen_codes.add(lowered)
+        attached_workouts.append(workout_code)
+    return attached_workouts
+
+
+def _run_garmin_sync_result_for_day(
+    path: Path,
+    *,
+    date_key: str,
+    requested_workout: str | None = None,
+) -> tuple[dict[str, object], int]:
+    workout_code = str(requested_workout or "").strip() or None
+    attempt_count = 0
+    max_attempts = 2
+    run_phase_completed = False
+    last_error: ValueError | RuntimeError | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_count = attempt
+        try:
+            run_garmin_sync_request(
+                path,
+                date_local=date_key,
+                workout_code=workout_code,
+            )
+            run_phase_completed = True
+            sync_record, garmin_workout, calendar_entry = schedule_garmin_sync_request(
+                path,
+                date_local=date_key,
+                workout_code=workout_code,
+            )
+            timestamp_utc = str(sync_record.get("updated_at_utc") or "").strip() or datetime.now(timezone.utc).replace(
+                microsecond=0
+            ).isoformat()
+            status_code = str(sync_record.get("status_code") or "").strip() or "calendar_scheduled"
+            return {
+                "status": "ok",
+                "date_local": date_key,
+                "sync": sync_record,
+                "garmin_workout": garmin_workout,
+                "calendar_entry": calendar_entry,
+                "result": {
+                    "outcome": "scheduled",
+                    "status_code": status_code,
+                    "timestamp_utc": timestamp_utc,
+                    "message": "Workout scheduled on Garmin calendar.",
+                    "attempt_count": attempt_count,
+                },
+            }, 200
+        except (ValueError, RuntimeError) as exc:
+            last_error = exc
+            if "Send to Garmin first" in str(exc):
+                return {"status": "error", "error": str(exc)}, 400
+            if attempt < max_attempts:
+                time.sleep(0.2 * attempt)
+
+    if last_error is None:
+        return {"status": "error", "error": "Garmin sync result could not be resolved."}, 500
+
+    failure_code = "schedule_failed" if run_phase_completed else "run_failed"
+    retry_guidance = (
+        "Retry Garmin sync from Plan. If this keeps failing, verify Garmin connection settings and that the workout is attached to the day."
+    )
+    try:
+        failed_sync = mark_garmin_sync_request_failed(
+            path,
+            date_local=date_key,
+            workout_code=workout_code,
+            status_code=failure_code,
+            error_message=str(last_error),
+            retry_guidance=retry_guidance,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    timestamp_utc = str(failed_sync.get("updated_at_utc") or "").strip() or datetime.now(timezone.utc).replace(
+        microsecond=0
+    ).isoformat()
+    return {
+        "status": "error",
+        "date_local": date_key,
+        "sync": failed_sync,
+        "result": {
+            "outcome": "failed",
+            "status_code": str(failed_sync.get("status_code") or failure_code),
+            "timestamp_utc": timestamp_utc,
+            "message": str(last_error),
+            "retry_guidance": retry_guidance,
+            "attempt_count": attempt_count,
+        },
+    }, 200
 
 
 def _format_plan_miles_value(value: float) -> str:
@@ -542,7 +641,7 @@ def _parse_plan_distance_input(raw_value: object) -> tuple[list[dict[str, object
     return sessions, total
 
 
-def _parse_plan_sessions_input(raw_value: object) -> tuple[list[dict[str, object]], float]:
+def _parse_plan_sessions_input(path: Path, raw_value: object) -> tuple[list[dict[str, object]], float]:
     if not isinstance(raw_value, list):
         raise ValueError("sessions must be an array of numeric values or objects with planned_miles.")
     sessions: list[dict[str, object]] = []
@@ -550,10 +649,14 @@ def _parse_plan_sessions_input(raw_value: object) -> tuple[list[dict[str, object
     for idx, item in enumerate(raw_value):
         run_type: str | None = None
         workout_code: str | None = None
+        planned_workout: str | None = None
         if isinstance(item, dict):
             planned_raw = item.get("planned_miles")
             run_type = _coerce_plan_run_type(item.get("run_type"))
-            workout_code = str(item.get("planned_workout") or item.get("workout_code") or "").strip() or None
+            workout_code = str(item.get("workout_code") or "").strip() or None
+            planned_workout = str(item.get("planned_workout") or "").strip() or None
+            if "planned_workout" in item and not planned_workout:
+                workout_code = None
         else:
             planned_raw = item
         try:
@@ -564,34 +667,50 @@ def _parse_plan_sessions_input(raw_value: object) -> tuple[list[dict[str, object
             raise ValueError("sessions planned_miles must be >= 0.")
         if planned == 0:
             continue
+        resolved_workout = resolve_session_workout(
+            path,
+            workout_code=workout_code,
+            planned_workout=planned_workout,
+            run_type=run_type,
+        )
         sessions.append(
             {
                 "ordinal": idx + 1,
                 "planned_miles": planned,
                 "run_type": run_type,
-                "workout_code": workout_code,
+                "workout_code": str(resolved_workout.get("workout_code") or "").strip() or None,
             }
         )
         total += planned
     return sessions, total
 
 
-def _normalize_plan_session_response(sessions: object) -> list[dict[str, object]]:
+def _normalize_plan_session_response(path: Path, sessions: object) -> list[dict[str, object]]:
     if not isinstance(sessions, list):
         return []
     payload: list[dict[str, object]] = []
+    workout_cache: dict[str, dict[str, Any] | None] = {}
     for item in sessions:
         if not isinstance(item, dict):
             continue
-        workout_text = str(item.get("planned_workout") or item.get("workout_code") or "").strip()
+        workout_code = str(item.get("workout_code") or "").strip()
+        workout_text = str(item.get("planned_workout") or "").strip()
+        if workout_code:
+            cached = workout_cache.get(workout_code)
+            if workout_code not in workout_cache:
+                cached = get_workout_definition(path, workout_code)
+                workout_cache[workout_code] = cached
+            if isinstance(cached, dict):
+                workout_text = str(cached.get("shorthand") or workout_text or workout_code).strip()
         normalized = dict(item)
         normalized["planned_workout"] = workout_text
-        normalized["workout_code"] = workout_text
+        normalized["workout_code"] = workout_code
         payload.append(normalized)
     return payload
 
 
 def _coerce_plan_day_payload(
+    path: Path,
     body: dict[str, object],
     *,
     existing_day: dict[str, object],
@@ -627,7 +746,7 @@ def _coerce_plan_day_payload(
     sessions: list[dict[str, object]] | None = None
     run_type_from_sessions: str | None = None
     if "sessions" in body:
-        sessions, planned_total_miles = _parse_plan_sessions_input(body.get("sessions"))
+        sessions, planned_total_miles = _parse_plan_sessions_input(path, body.get("sessions"))
         for item in sessions:
             if not isinstance(item, dict):
                 continue
@@ -657,6 +776,7 @@ def _save_plan_day_record(
     existing_day = get_plan_day(current.processed_log_file, date_local=date_key) or {}
     try:
         run_type, notes, is_complete, planned_total_miles, sessions = _coerce_plan_day_payload(
+            current.processed_log_file,
             body,
             existing_day=existing_day,
         )
@@ -693,6 +813,7 @@ def _save_plan_day_record(
         sessions = existing_sessions if isinstance(existing_sessions, list) else []
 
     return _plan_day_success_payload(
+        current.processed_log_file,
         date_key=date_key,
         planned_total_miles=planned_total_miles,
         sessions=sessions or [],
@@ -703,6 +824,7 @@ def _save_plan_day_record(
 
 
 def _plan_day_success_payload(
+    path: Path,
     *,
     date_key: str,
     planned_total_miles: float | int | str | None,
@@ -721,7 +843,7 @@ def _plan_day_success_payload(
     elif isinstance(planned_total_miles, (int, float)) and float(planned_total_miles) > 0:
         distance_saved = _format_plan_miles_value(float(planned_total_miles))
 
-    normalized_sessions = _normalize_plan_session_response(sessions or [])
+    normalized_sessions = _normalize_plan_session_response(path, sessions or [])
     return {
         "status": "ok",
         "date_local": date_key,
@@ -905,165 +1027,47 @@ def control_page():
     return _core_flow_entrypoint("control")
 
 
-@app.get("/legacy/<string:flow_name>")
-def legacy_core_flow_page(flow_name: str):
+@app.get("/design-review")
+def design_review_page() -> str:
+    review_pages = [
+        {
+            "key": flow_name,
+            "label": CORE_UI_FLOW_LABELS.get(flow_name, flow_name.title()),
+            "description": CORE_UI_FLOW_DESCRIPTIONS.get(flow_name, ""),
+            "live_path": f"/{flow_name}",
+            "preview_path": f"/design-review/preview/{flow_name}",
+        }
+        for flow_name in CORE_UI_FLOW_LEGACY_PATHS
+    ]
+    return render_template(
+        "design_review.html",
+        review_pages=review_pages,
+        review_page_default="view",
+        review_variant_default="a",
+    )
+
+
+@app.get("/design-review/preview/<string:flow_name>")
+def design_review_preview_page(flow_name: str):
     normalized_flow = _normalize_ui_flow(flow_name)
     if normalized_flow is None:
         return {
             "status": "error",
             "error": {
-                "code": "LEGACY_FLOW_NOT_FOUND",
-                "message": "Unknown legacy core flow.",
+                "code": "DESIGN_REVIEW_FLOW_NOT_FOUND",
+                "message": "Unknown design review flow.",
                 "details": {"flow": flow_name},
             },
         }, 404
-    return _render_legacy_core_flow(normalized_flow)
 
-
-@app.get("/app")
-@app.get("/app/")
-@app.get("/app/<path:spa_path>")
-def spa_app_entry(spa_path: str = ""):
-    dist_dir = PROJECT_ROOT / "chronicle-ui" / "dist"
-    index_file = dist_dir / "index.html"
-    requested_path = str(spa_path or "").strip("/")
-    if index_file.exists():
-        if requested_path:
-            requested_file = dist_dir / requested_path
-            if requested_file.is_file():
-                return send_from_directory(str(dist_dir), requested_path)
-            if "." in Path(requested_path).name:
-                # Missing concrete asset (JS/CSS/map/etc.) should not return HTML fallback.
-                return abort(404)
-        return send_from_directory(str(dist_dir), "index.html")
-
-    first_segment = requested_path.split("/", 1)[0]
-    normalized_flow = _normalize_ui_flow(first_segment)
-    if normalized_flow is None:
-        return redirect(_legacy_flow_path("view"), code=302)
-    return redirect(_legacy_flow_path(normalized_flow), code=302)
-
-
-@app.get("/ops/ui-rollout/status")
-def ui_rollout_status_get() -> tuple[dict, int]:
-    current = _effective_settings()
-    mode = _current_ui_rollout_mode(current)
-    targets = _ui_rollout_targets(mode)
-    last_mode_change = get_runtime_value(current.processed_log_file, UI_ROLLOUT_LAST_MODE_CHANGE_KEY)
-    last_rollback = get_runtime_value(current.processed_log_file, UI_ROLLOUT_LAST_ROLLBACK_KEY)
-
-    return {
-        "status": "ok",
-        "mode": mode,
-        "default_mode": _ui_rollout_default_mode(),
-        "spa_base_path": _ui_rollout_spa_base_path(),
-        "rollback_target_minutes": UI_ROLLBACK_TARGET_MINUTES,
-        "flows": [
-            {
-                "flow": flow_name,
-                "canonical_path": f"/{flow_name}",
-                "target_path": targets[flow_name],
-                "legacy_path": _legacy_flow_path(flow_name),
-            }
-            for flow_name in CORE_UI_FLOW_LEGACY_PATHS
-        ],
-        "last_mode_change": last_mode_change if isinstance(last_mode_change, dict) else None,
-        "last_rollback": last_rollback if isinstance(last_rollback, dict) else None,
-    }, 200
-
-
-@app.post("/ops/ui-rollout/mode")
-def ui_rollout_mode_post() -> tuple[dict, int]:
-    body = request.get_json(silent=True) or {}
-    requested_mode = _normalize_ui_rollout_mode(body.get("mode"))
-    if requested_mode is None:
-        return {
-            "status": "error",
-            "error": {
-                "code": "UI_ROLLOUT_MODE_INVALID",
-                "message": "mode must be one of: mpa, spa.",
-                "details": {
-                    "provided": body.get("mode"),
-                    "allowed_modes": sorted(UI_ROLLOUT_ALLOWED_MODES),
-                },
-            },
-        }, 400
-
-    source = str(body.get("source") or "ui-rollout-mode-api").strip() or "ui-rollout-mode-api"
-    reason = str(body.get("reason") or "").strip() or None
-    current = _effective_settings()
-    try:
-        changed_at_utc = _set_ui_rollout_mode(current, requested_mode, source=source, reason=reason)
-    except OSError as exc:
-        return {
-            "status": "error",
-            "error": {
-                "code": "UI_ROLLOUT_STATE_WRITE_FAILED",
-                "message": "Failed to persist rollout mode.",
-                "details": {"reason": str(exc)},
-            },
-        }, 500
-    targets = _ui_rollout_targets(requested_mode)
-
-    return {
-        "status": "ok",
-        "mode": requested_mode,
-        "changed_at_utc": changed_at_utc,
-        "source": source,
-        "reason": reason,
-        "targets": targets,
-    }, 200
-
-
-@app.post("/ops/ui-rollout/rollback")
-def ui_rollout_rollback_post() -> tuple[dict, int]:
-    body = request.get_json(silent=True) or {}
-    source = str(body.get("source") or "ui-rollout-rollback-api").strip() or "ui-rollout-rollback-api"
-    reason = str(body.get("reason") or "regression-detected").strip() or "regression-detected"
-    started = time.monotonic()
-    current = _effective_settings()
-    try:
-        rolled_back_at_utc = _set_ui_rollout_mode(current, "mpa", source=source, reason=reason)
-    except OSError as exc:
-        return {
-            "status": "error",
-            "error": {
-                "code": "UI_ROLLBACK_FAILED",
-                "message": "Failed to trigger UI rollback.",
-                "details": {"reason": str(exc)},
-            },
-        }, 500
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    rollback_deadline_utc = (datetime.now(timezone.utc) + timedelta(minutes=UI_ROLLBACK_TARGET_MINUTES)).isoformat()
-    targets = _ui_rollout_targets("mpa")
-    verification_checklist = [
-        {
-            "flow": flow_name,
-            "canonical_path": f"/{flow_name}",
-            "expected_target": targets[flow_name],
-            "fallback_path": _legacy_flow_path(flow_name),
-        }
-        for flow_name in CORE_UI_FLOW_LEGACY_PATHS
-    ]
-    rollback_record = {
-        "rolled_back_to_mode": "mpa",
-        "source": source,
-        "reason": reason,
-        "rolled_back_at_utc": rolled_back_at_utc,
-        "elapsed_ms": elapsed_ms,
-        "rollback_target_minutes": UI_ROLLBACK_TARGET_MINUTES,
-    }
-    set_runtime_value(current.processed_log_file, UI_ROLLOUT_LAST_ROLLBACK_KEY, rollback_record)
-
-    return {
-        "status": "ok",
-        "mode": "mpa",
-        "rolled_back_at_utc": rolled_back_at_utc,
-        "rollback_deadline_utc": rollback_deadline_utc,
-        "rollback_target_minutes": UI_ROLLBACK_TARGET_MINUTES,
-        "elapsed_ms": elapsed_ms,
-        "verification_checklist": verification_checklist,
-    }, 200
+    variant = _normalize_review_variant_token(request.args.get("variant"))
+    preview_assets = _design_review_preview_assets(normalized_flow, variant)
+    return _render_legacy_core_flow(
+        normalized_flow,
+        review_mode=True,
+        review_variant=variant or "",
+        **preview_assets,
+    )
 
 
 @app.get("/control/activity-detection")
@@ -1204,7 +1208,12 @@ def plan_today_get() -> tuple[dict, int]:
             run_type_key = str(session.get("run_type") or "").strip().lower()
             workout_candidate = str(session.get("workout_code") or "").strip()
             if run_type_key == "sos" and workout_candidate:
-                workout_shorthand = workout_candidate
+                workout_record = get_workout_definition(current.processed_log_file, workout_candidate)
+                workout_shorthand = (
+                    str(workout_record.get("shorthand") or "").strip()
+                    if isinstance(workout_record, dict)
+                    else workout_candidate
+                )
 
     if planned_total <= 0:
         try:
@@ -1219,7 +1228,12 @@ def plan_today_get() -> tuple[dict, int]:
                 continue
             workout_candidate = str(session.get("workout_code") or "").strip()
             if workout_candidate:
-                workout_shorthand = workout_candidate
+                workout_record = get_workout_definition(current.processed_log_file, workout_candidate)
+                workout_shorthand = (
+                    str(workout_record.get("shorthand") or "").strip()
+                    if isinstance(workout_record, dict)
+                    else workout_candidate
+                )
                 break
 
     payload: dict[str, object] = {
@@ -1282,8 +1296,81 @@ def plan_pace_workshop_calculate_post() -> tuple[dict, int]:
 @app.get("/plan/workouts")
 def plan_workouts_get() -> tuple[dict, int]:
     current = _effective_settings()
-    workouts = list_workout_definitions(current.processed_log_file)
+    marathon_goal = _load_plan_marathon_goal(current.processed_log_file)
+    workouts = [
+        _decorate_workout_with_target_resolution(workout, marathon_goal)
+        for workout in list_workout_definitions(current.processed_log_file)
+    ]
     return {"status": "ok", "workouts": workouts}, 200
+
+
+@app.get("/plan/workouts/<string:workout_id>")
+def plan_workout_get(workout_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    marathon_goal = _load_plan_marathon_goal(current.processed_log_file)
+    try:
+        document = get_workout_definition_document(current.processed_log_file, workout_id)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    return {
+        "status": "ok",
+        **document,
+        "workout": _decorate_workout_with_target_resolution(dict(document["workout"]), marathon_goal),
+        "pace_goal": normalize_marathon_goal_time(marathon_goal),
+    }, 200
+
+
+@app.post("/plan/workouts")
+def plan_workouts_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    yaml_text = body.get("yaml_text")
+    if yaml_text is not None:
+        current = _effective_settings()
+        marathon_goal = _load_plan_marathon_goal(current.processed_log_file)
+        try:
+            document = create_workout_definition_from_yaml(
+                current.processed_log_file,
+                yaml_text=str(yaml_text),
+                workout_name=body.get("workout_name") if isinstance(body.get("workout_name"), str) else None,
+            )
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+        return {
+            "status": "ok",
+            "workout": _decorate_workout_with_target_resolution(dict(document["workout"]), marathon_goal),
+            "yaml_text": document["yaml_text"],
+            "source_path": document["source_path"],
+            "read_only": document["read_only"],
+            "invalid": document.get("invalid", False),
+            "load_error": document.get("load_error", ""),
+            "workouts": [
+                _decorate_workout_with_target_resolution(workout, marathon_goal)
+                for workout in list_workout_definitions(current.processed_log_file)
+            ],
+            "pace_goal": normalize_marathon_goal_time(marathon_goal),
+        }, 200
+
+    try:
+        current = _effective_settings()
+        workout = upsert_workout_definition(current.processed_log_file, body)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 500
+
+    marathon_goal = _load_plan_marathon_goal(current.processed_log_file)
+    return {
+        "status": "ok",
+        "workout": _decorate_workout_with_target_resolution(workout, marathon_goal),
+        "workouts": [
+            _decorate_workout_with_target_resolution(workout_item, marathon_goal)
+            for workout_item in list_workout_definitions(current.processed_log_file)
+        ],
+        "pace_goal": normalize_marathon_goal_time(marathon_goal),
+    }, 200
 
 
 @app.put("/plan/workouts/<string:workout_code>")
@@ -1300,8 +1387,34 @@ def plan_workouts_put(workout_code: str) -> tuple[dict, int]:
         return {"status": "error", "error": "workout_code in body must match path."}, 400
 
     current = _effective_settings()
+    yaml_text = body.get("yaml_text")
+    if yaml_text is not None:
+        marathon_goal = _load_plan_marathon_goal(current.processed_log_file)
+        try:
+            document = save_workout_definition_yaml(
+                current.processed_log_file,
+                path_code,
+                yaml_text=str(yaml_text),
+            )
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+        return {
+            "status": "ok",
+            "workout": _decorate_workout_with_target_resolution(dict(document["workout"]), marathon_goal),
+            "yaml_text": document["yaml_text"],
+            "source_path": document["source_path"],
+            "read_only": document["read_only"],
+            "invalid": document.get("invalid", False),
+            "load_error": document.get("load_error", ""),
+            "workouts": [
+                _decorate_workout_with_target_resolution(workout, marathon_goal)
+                for workout in list_workout_definitions(current.processed_log_file)
+            ],
+            "pace_goal": normalize_marathon_goal_time(marathon_goal),
+        }, 200
+
     payload = dict(body)
-    payload["workout_code"] = path_code
+    payload["workout_id"] = path_code
     try:
         workout = upsert_workout_definition(current.processed_log_file, payload)
     except ValueError as exc:
@@ -1309,8 +1422,17 @@ def plan_workouts_put(workout_code: str) -> tuple[dict, int]:
     except RuntimeError as exc:
         return {"status": "error", "error": str(exc)}, 500
 
-    workouts = list_workout_definitions(current.processed_log_file)
-    return {"status": "ok", "workout": workout, "workouts": workouts}, 200
+    marathon_goal = _load_plan_marathon_goal(current.processed_log_file)
+    workouts = [
+        _decorate_workout_with_target_resolution(workout_item, marathon_goal)
+        for workout_item in list_workout_definitions(current.processed_log_file)
+    ]
+    return {
+        "status": "ok",
+        "workout": _decorate_workout_with_target_resolution(workout, marathon_goal),
+        "workouts": workouts,
+        "pace_goal": normalize_marathon_goal_time(marathon_goal),
+    }, 200
 
 
 @app.put("/plan/day/<string:date_local>")
@@ -1339,21 +1461,7 @@ def plan_day_garmin_sync_post(date_local: str) -> tuple[dict, int]:
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}, 400
 
-    day_sessions_map = list_plan_sessions(
-        current.processed_log_file,
-        start_date=date_key,
-        end_date=date_key,
-    )
-    raw_sessions = day_sessions_map.get(date_key, []) if isinstance(day_sessions_map, dict) else []
-
-    attached_workouts: list[str] = []
-    for session in raw_sessions:
-        if not isinstance(session, dict):
-            continue
-        workout_code = str(session.get("planned_workout") or session.get("workout_code") or "").strip()
-        if not workout_code:
-            continue
-        attached_workouts.append(workout_code)
+    attached_workouts = _attached_workout_codes_for_day(current.processed_log_file, date_key=date_key)
 
     if not attached_workouts:
         return {
@@ -1462,6 +1570,45 @@ def plan_day_garmin_sync_schedule_post(date_local: str) -> tuple[dict, int]:
     }, 200
 
 
+def _execute_garmin_sync_send_for_workout(
+    path: Path,
+    *,
+    date_key: str,
+    workout_code: str,
+) -> dict[str, object]:
+    sync_payload: dict[str, object] | None = None
+    try:
+        sync_payload = initiate_garmin_sync_request(
+            path,
+            date_local=date_key,
+            workout_code=workout_code,
+        )
+        result_payload, _http_code = _run_garmin_sync_result_for_day(
+            path,
+            date_key=date_key,
+            requested_workout=workout_code,
+        )
+        return {
+            "workout_code": workout_code,
+            "status": str(result_payload.get("status") or "error"),
+            "sync": result_payload.get("sync") or sync_payload,
+            "result": result_payload.get("result"),
+            "garmin_workout": result_payload.get("garmin_workout"),
+            "calendar_entry": result_payload.get("calendar_entry"),
+            **({"error": result_payload.get("error")} if result_payload.get("error") else {}),
+        }
+    except (ValueError, RuntimeError) as exc:
+        return {
+            "workout_code": workout_code,
+            "status": "error",
+            "sync": sync_payload,
+            "result": None,
+            "garmin_workout": None,
+            "calendar_entry": None,
+            "error": str(exc),
+        }
+
+
 @app.post("/plan/day/<string:date_local>/garmin-sync/result")
 def plan_day_garmin_sync_result_post(date_local: str) -> tuple[dict, int]:
     body = request.get_json(silent=True) or {}
@@ -1475,85 +1622,135 @@ def plan_day_garmin_sync_result_post(date_local: str) -> tuple[dict, int]:
         return {"status": "error", "error": str(exc)}, 400
 
     requested_workout = str(body.get("workout_code") or "").strip() or None
-    attempt_count = 0
-    max_attempts = 2
-    run_phase_completed = False
-    last_error: ValueError | RuntimeError | None = None
-
-    for attempt in range(1, max_attempts + 1):
-        attempt_count = attempt
-        try:
-            run_garmin_sync_request(
-                current.processed_log_file,
-                date_local=date_key,
-                workout_code=requested_workout,
-            )
-            run_phase_completed = True
-            sync_record, garmin_workout, calendar_entry = schedule_garmin_sync_request(
-                current.processed_log_file,
-                date_local=date_key,
-                workout_code=requested_workout,
-            )
-            timestamp_utc = str(sync_record.get("updated_at_utc") or "").strip() or datetime.now(timezone.utc).replace(
-                microsecond=0
-            ).isoformat()
-            status_code = str(sync_record.get("status_code") or "").strip() or "calendar_scheduled"
-            return {
-                "status": "ok",
-                "date_local": date_key,
-                "sync": sync_record,
-                "garmin_workout": garmin_workout,
-                "calendar_entry": calendar_entry,
-                "result": {
-                    "outcome": "scheduled",
-                    "status_code": status_code,
-                    "timestamp_utc": timestamp_utc,
-                    "message": "Workout scheduled on Garmin calendar.",
-                    "attempt_count": attempt_count,
-                },
-            }, 200
-        except (ValueError, RuntimeError) as exc:
-            last_error = exc
-            if "Send to Garmin first" in str(exc):
-                return {"status": "error", "error": str(exc)}, 400
-            if attempt < max_attempts:
-                time.sleep(0.2 * attempt)
-
-    if last_error is None:
-        return {"status": "error", "error": "Garmin sync result could not be resolved."}, 500
-
-    failure_code = "schedule_failed" if run_phase_completed else "run_failed"
-    retry_guidance = (
-        "Retry Garmin sync from Plan. If this keeps failing, verify Garmin connection settings and that the workout is attached to the day."
+    return _run_garmin_sync_result_for_day(
+        current.processed_log_file,
+        date_key=date_key,
+        requested_workout=requested_workout,
     )
+
+
+@app.post("/plan/day/<string:date_local>/garmin-sync/send")
+def plan_day_garmin_sync_send_post(date_local: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    current = _effective_settings()
     try:
-        failed_sync = mark_garmin_sync_request_failed(
-            current.processed_log_file,
-            date_local=date_key,
-            workout_code=requested_workout,
-            status_code=failure_code,
-            error_message=str(last_error),
-            retry_guidance=retry_guidance,
-        )
+        date_key = _resolve_plan_date(date_local)
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}, 400
-    except RuntimeError as exc:
-        return {"status": "error", "error": str(exc)}, 500
 
-    timestamp_utc = str(failed_sync.get("updated_at_utc") or "").strip() or datetime.now(timezone.utc).replace(
-        microsecond=0
-    ).isoformat()
+    attached_workouts = _attached_workout_codes_for_day(current.processed_log_file, date_key=date_key)
+    if not attached_workouts:
+        return {
+            "status": "error",
+            "error": "No workout is attached to this plan day. Attach a workout before sending to Garmin.",
+        }, 400
+
+    results: list[dict[str, object]] = []
+    for workout_code in attached_workouts:
+        result_payload = _execute_garmin_sync_send_for_workout(
+            current.processed_log_file,
+            date_key=date_key,
+            workout_code=workout_code,
+        )
+        results.append(result_payload)
+
+    succeeded = sum(1 for item in results if str(item.get("status") or "") == "ok")
+    failed = len(results) - succeeded
+    overall_status = "ok" if failed == 0 else ("partial" if succeeded > 0 else "error")
     return {
-        "status": "error",
+        "status": overall_status,
         "date_local": date_key,
-        "sync": failed_sync,
-        "result": {
-            "outcome": "failed",
-            "status_code": str(failed_sync.get("status_code") or failure_code),
-            "timestamp_utc": timestamp_utc,
-            "message": str(last_error),
-            "retry_guidance": retry_guidance,
-            "attempt_count": attempt_count,
+        "results": results,
+        "summary": {
+            "requested_count": len(attached_workouts),
+            "succeeded_count": succeeded,
+            "failed_count": failed,
+        },
+    }, 200
+
+
+@app.post("/plan/day/<string:date_local>/garmin-sync/send-window")
+def plan_day_garmin_sync_send_window_post(date_local: str) -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+
+    current = _effective_settings()
+    try:
+        start_date = date.fromisoformat(_resolve_plan_date(date_local))
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    try:
+        span_days = int(body.get("span_days") or 7)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "span_days must be an integer."}, 400
+    span_days = max(1, min(span_days, 14))
+
+    day_results: list[dict[str, object]] = []
+    total_requested = 0
+    total_succeeded = 0
+    total_failed = 0
+    total_skipped = 0
+
+    for offset in range(span_days):
+        day_key = (start_date + timedelta(days=offset)).isoformat()
+        attached_workouts = _attached_workout_codes_for_day(current.processed_log_file, date_key=day_key)
+        if not attached_workouts:
+            day_results.append(
+                {
+                    "date_local": day_key,
+                    "status": "skipped",
+                    "reason": "no_attached_workouts",
+                    "results": [],
+                }
+            )
+            total_skipped += 1
+            continue
+
+        workout_results: list[dict[str, object]] = []
+        for workout_code in attached_workouts:
+            total_requested += 1
+            result_payload = _execute_garmin_sync_send_for_workout(
+                current.processed_log_file,
+                date_key=day_key,
+                workout_code=workout_code,
+            )
+            item_status = str(result_payload.get("status") or "error")
+            if item_status == "ok":
+                total_succeeded += 1
+            else:
+                total_failed += 1
+            workout_results.append(result_payload)
+
+        if all(str(item.get("status") or "") == "ok" for item in workout_results):
+            day_status = "ok"
+        elif any(str(item.get("status") or "") == "ok" for item in workout_results):
+            day_status = "partial"
+        else:
+            day_status = "error"
+        day_results.append(
+            {
+                "date_local": day_key,
+                "status": day_status,
+                "results": workout_results,
+            }
+        )
+
+    overall_status = "ok" if total_failed == 0 else ("partial" if total_succeeded > 0 else "error")
+    return {
+        "status": overall_status,
+        "start_date_local": start_date.isoformat(),
+        "span_days": span_days,
+        "days": day_results,
+        "summary": {
+            "requested_count": total_requested,
+            "succeeded_count": total_succeeded,
+            "failed_count": total_failed,
+            "skipped_day_count": total_skipped,
         },
     }, 200
 
@@ -1581,6 +1778,7 @@ def plan_days_bulk_post() -> tuple[dict, int]:
         existing_day = get_plan_day(current.processed_log_file, date_local=date_key) or {}
         try:
             run_type, notes, is_complete, planned_total_miles, sessions = _coerce_plan_day_payload(
+                current.processed_log_file,
                 day_payload,
                 existing_day=existing_day,
             )
@@ -1611,6 +1809,7 @@ def plan_days_bulk_post() -> tuple[dict, int]:
             response_sessions = sessions
         result_seed.append(
             _plan_day_success_payload(
+                current.processed_log_file,
                 date_key=date_key,
                 planned_total_miles=planned_total_miles,
                 sessions=response_sessions,
@@ -1969,9 +2168,44 @@ def editor_profiles_get() -> tuple[dict, int]:
     }, 200
 
 
+@app.get("/editor/profiles/<string:profile_id>")
+def editor_profile_get(profile_id: str) -> tuple[dict, int]:
+    try:
+        document = get_template_profile_document(settings, profile_id)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    return {
+        "status": "ok",
+        "working_profile_id": get_working_template_profile(settings).get("profile_id"),
+        **document,
+    }, 200
+
+
 @app.post("/editor/profiles")
 def editor_profiles_post() -> tuple[dict, int]:
     body = request.get_json(silent=True) or {}
+    yaml_text = body.get("yaml_text")
+    if yaml_text is not None:
+        try:
+            document = create_template_profile_from_yaml(
+                settings,
+                yaml_text=str(yaml_text),
+                profile_name=body.get("profile_name") if isinstance(body.get("profile_name"), str) else None,
+            )
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+        return {
+            "status": "ok",
+            "profile": document["profile"],
+            "yaml_text": document["yaml_text"],
+            "source_path": document["source_path"],
+            "read_only": document["read_only"],
+            "invalid": document.get("invalid", False),
+            "load_error": document.get("load_error", ""),
+            "working_profile_id": get_working_template_profile(settings).get("profile_id"),
+            "profiles": list_template_profiles(settings),
+        }, 200
+
     profile_id = body.get("profile_id")
     if not isinstance(profile_id, str) or not profile_id.strip():
         return {"status": "error", "error": "profile_id is required."}, 400
@@ -2013,6 +2247,27 @@ def editor_profiles_post() -> tuple[dict, int]:
 @app.put("/editor/profiles/<string:profile_id>")
 def editor_profile_put(profile_id: str) -> tuple[dict, int]:
     body = request.get_json(silent=True) or {}
+    yaml_text = body.get("yaml_text")
+    if yaml_text is not None:
+        try:
+            document = save_template_profile_yaml(
+                settings,
+                profile_id,
+                yaml_text=str(yaml_text),
+            )
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+        return {
+            "status": "ok",
+            "profile": document["profile"],
+            "yaml_text": document["yaml_text"],
+            "source_path": document["source_path"],
+            "read_only": document["read_only"],
+            "invalid": document.get("invalid", False),
+            "load_error": document.get("load_error", ""),
+            "working_profile_id": get_working_template_profile(settings).get("profile_id"),
+        }, 200
+
     enabled = body.get("enabled")
     parsed_enabled: bool | None = None
     if enabled is not None:
@@ -2096,14 +2351,124 @@ def editor_profile_preview_post() -> tuple[dict, int]:
             "error": "No template context is available yet. Run one update cycle first.",
         }, 404
 
+    yaml_text = body.get("yaml_text")
+    if yaml_text is not None:
+        try:
+            profile = parse_template_profile_yaml_document(
+                str(yaml_text),
+                profile_id=body.get("profile_id") if isinstance(body.get("profile_id"), str) else None,
+                profile_name=body.get("profile_name") if isinstance(body.get("profile_name"), str) else None,
+            )
+            match = preview_specific_profile_match(settings, context, profile)
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}, 400
+        return {
+            "status": "ok",
+            "context_source": context_source,
+            "profile_match": match,
+        }, 200
+
     try:
-        match = preview_profile_match(settings, context)
+        if isinstance(body.get("profile_id"), str) and body.get("profile_id"):
+            profile = get_template_profile(settings, str(body.get("profile_id")))
+            if profile is None:
+                raise ValueError(f"Unknown profile_id: {body.get('profile_id')}")
+            match = preview_specific_profile_match(settings, context, profile)
+        else:
+            match = preview_profile_match(settings, context)
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}, 400
 
     return {
         "status": "ok",
         "context_source": context_source,
+        "profile_match": match,
+    }, 200
+
+
+@app.post("/editor/profiles/validate-activity")
+def editor_profile_validate_activity_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    raw_activity_id = body.get("activity_id")
+    try:
+        activity_id = int(raw_activity_id)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "activity_id must be an integer."}, 400
+    if activity_id <= 0:
+        return {"status": "error", "error": "activity_id must be a positive integer."}, 400
+
+    yaml_text = body.get("yaml_text")
+    if not isinstance(yaml_text, str) or not yaml_text.strip():
+        return {"status": "error", "error": "yaml_text is required."}, 400
+
+    enabled_override: bool | None = None
+    if "enabled" in body:
+        raw_enabled = body.get("enabled")
+        if not isinstance(raw_enabled, bool):
+            return {"status": "error", "error": "enabled must be boolean when provided."}, 400
+        enabled_override = raw_enabled
+
+    try:
+        profile = parse_template_profile_yaml_document(
+            yaml_text,
+            profile_id=body.get("profile_id") if isinstance(body.get("profile_id"), str) else None,
+            profile_name=body.get("profile_name") if isinstance(body.get("profile_name"), str) else None,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    current = _effective_settings()
+    try:
+        activity = StravaClient(current).get_activity_details(activity_id)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        if status_code == 404:
+            return {
+                "status": "error",
+                "error": f"Strava activity {activity_id} was not found or is not accessible.",
+            }, 404
+        return {
+            "status": "error",
+            "error": f"Failed to load Strava activity {activity_id}.",
+        }, 502
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"Failed to load Strava activity {activity_id}: {exc}",
+        }, 502
+
+    if not isinstance(activity, dict) or not activity:
+        return {
+            "status": "error",
+            "error": f"Strava activity {activity_id} did not return a valid payload.",
+        }, 502
+
+    try:
+        training = build_profile_preview_training(current, activity)
+        match = preview_specific_profile_against_activity(
+            current,
+            activity,
+            profile,
+            training=training,
+            enabled_override=enabled_override,
+        )
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    response_activity_id = activity_id
+    try:
+        response_activity_id = int(activity.get("id") or activity_id)
+    except (TypeError, ValueError):
+        response_activity_id = activity_id
+
+    return {
+        "status": "ok",
+        "activity": {
+            "id": response_activity_id,
+            "name": str(activity.get("name") or "").strip() or f"Activity {activity_id}",
+            "sport_type": str(activity.get("sport_type") or activity.get("type") or "").strip() or "Unknown",
+            "start_date_local": str(activity.get("start_date_local") or activity.get("start_date") or "").strip() or None,
+        },
         "profile_match": match,
     }, 200
 

@@ -1,6 +1,8 @@
 const state = {
   payload: null,
   stravaStatusEl: null,
+  configRequestVersion: 0,
+  envRequestVersion: 0,
 };
 
 const elements = {
@@ -38,6 +40,14 @@ async function requestJSON(url, options = {}) {
 
   const payload = await response.json().catch(() => ({}));
   return { ok: response.ok, status: response.status, payload };
+}
+
+function currentConfigRequestVersion() {
+  return ++state.configRequestVersion;
+}
+
+function currentEnvRequestVersion() {
+  return ++state.envRequestVersion;
 }
 
 function titleCase(text) {
@@ -265,27 +275,40 @@ function collectSaveValues() {
   return updates;
 }
 
-async function loadConfig() {
-  setStatus("Loading setup config...");
+async function loadConfig(options = {}) {
+  const requestVersion = currentConfigRequestVersion();
+  const suppressSuccessStatus = Boolean(options.suppressSuccessStatus);
+  if (!Boolean(options.suppressLoadingStatus)) {
+    setStatus("Loading setup config...");
+  }
   const res = await requestJSON("/setup/api/config");
+  if (requestVersion !== state.configRequestVersion) {
+    return { ok: false, stale: true };
+  }
   if (!res.ok) {
     setStatus(res.payload?.error || "Failed to load setup config.", "error");
-    return false;
+    return { ok: false };
   }
   state.payload = res.payload;
   renderProviders();
   renderStravaStatus();
-  setStatus("Setup config loaded.", "ok");
-  return true;
+  if (!suppressSuccessStatus) {
+    setStatus("Setup config loaded.", "ok");
+  }
+  return { ok: true, payload: res.payload };
 }
 
 async function saveConfig() {
+  const requestVersion = currentConfigRequestVersion();
   const values = collectSaveValues();
   setStatus("Saving setup values...");
   const res = await requestJSON("/setup/api/config", {
     method: "PUT",
     body: JSON.stringify({ values }),
   });
+  if (requestVersion !== state.configRequestVersion) {
+    return;
+  }
   if (!res.ok) {
     setStatus(res.payload?.error || "Save failed.", "error");
     return;
@@ -293,19 +316,33 @@ async function saveConfig() {
   state.payload = res.payload;
   renderProviders();
   renderStravaStatus();
-  setStatus("Setup values saved.", "ok");
-  await refreshEnvSnippet();
+  const envResult = await refreshEnvSnippet({ suppressStatus: true });
+  if (requestVersion !== state.configRequestVersion || envResult.stale) {
+    return;
+  }
+  if (envResult.ok) {
+    setStatus("Setup values saved.", "ok");
+    return;
+  }
+  setStatus("Setup values saved. Env snippet refresh failed; use Refresh.", "ok");
 }
 
-async function refreshEnvSnippet() {
+async function refreshEnvSnippet(options = {}) {
+  const requestVersion = currentEnvRequestVersion();
   const res = await requestJSON("/setup/api/env");
+  if (requestVersion !== state.envRequestVersion) {
+    return { ok: false, stale: true };
+  }
   if (!res.ok) {
-    setStatus(res.payload?.error || "Failed to build env snippet.", "error");
-    return;
+    if (!Boolean(options.suppressStatus)) {
+      setStatus(res.payload?.error || "Failed to build env snippet.", "error");
+    }
+    return { ok: false, error: String(res.payload?.error || "Failed to build env snippet.") };
   }
   if (elements.envSnippet) {
     elements.envSnippet.value = String(res.payload.env || "");
   }
+  return { ok: true };
 }
 
 async function startStravaOAuth() {
@@ -331,15 +368,33 @@ async function startStravaOAuth() {
 async function disconnectStrava() {
   const ok = window.confirm("Disconnect Strava tokens saved by setup wizard?");
   if (!ok) return;
+  const requestVersion = currentConfigRequestVersion();
   setStatus("Disconnecting Strava tokens...");
   const res = await requestJSON("/setup/api/strava/disconnect", { method: "POST" });
+  if (requestVersion !== state.configRequestVersion) {
+    return;
+  }
   if (!res.ok) {
     setStatus(res.payload?.error || "Failed to disconnect Strava tokens.", "error");
     return;
   }
-  await loadConfig();
-  await refreshEnvSnippet();
-  setStatus("Strava tokens disconnected.", "ok");
+  const configResult = await loadConfig({ suppressSuccessStatus: true, suppressLoadingStatus: true });
+  if (requestVersion !== state.configRequestVersion || configResult.stale) {
+    return;
+  }
+  const envResult = await refreshEnvSnippet({ suppressStatus: true });
+  if (requestVersion !== state.configRequestVersion || envResult.stale) {
+    return;
+  }
+  if (configResult.ok && envResult.ok) {
+    setStatus("Strava tokens disconnected.", "ok");
+    return;
+  }
+  if (configResult.ok) {
+    setStatus("Strava tokens disconnected. Env snippet refresh failed; use Refresh.", "ok");
+    return;
+  }
+  setStatus("Strava tokens disconnected, but setup reload failed. Use Reload.", "error");
 }
 
 async function copyEnvSnippet() {
@@ -379,8 +434,15 @@ function bindEvents() {
     window.location.assign("/editor");
   });
   elements.btnReload?.addEventListener("click", async () => {
-    await loadConfig();
-    await refreshEnvSnippet();
+    const configResult = await loadConfig({ suppressSuccessStatus: true });
+    const envResult = await refreshEnvSnippet({ suppressStatus: true });
+    if (configResult.ok && envResult.ok) {
+      setStatus("Setup config loaded.", "ok");
+      return;
+    }
+    if (configResult.ok) {
+      setStatus("Setup config loaded. Env snippet refresh failed; use Refresh.", "ok");
+    }
   });
   elements.btnSave?.addEventListener("click", saveConfig);
   elements.btnRefreshEnv?.addEventListener("click", refreshEnvSnippet);

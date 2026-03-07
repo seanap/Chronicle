@@ -5,6 +5,7 @@ from chronicle.pace_workshop import (
     calculate_race_equivalency,
     normalize_marathon_goal_time,
     parse_duration_to_seconds,
+    resolve_pace_reference,
     supported_race_distances,
     training_paces_for_goal,
 )
@@ -30,6 +31,13 @@ class TestPaceWorkshop(unittest.TestCase):
         paces = {item["key"]: item["pace"] for item in payload["paces"]}
         self.assertEqual(paces.get("recovery"), "10:19")
         self.assertEqual(paces.get("marathon_pace"), "8:01")
+        family_lookup = {item["label"]: item for item in payload["plan_families"]}
+        self.assertIn("Pfitz", family_lookup)
+        pfitz_items = {item["label"]: item["display"] for item in family_lookup["Pfitz"]["items"]}
+        self.assertEqual(pfitz_items.get("LT"), "7:51")
+        self.assertEqual(pfitz_items.get("General Aerobic"), "9:41 to 9:02")
+        pfitz_lt = next(item for item in family_lookup["Pfitz"]["items"] if item["label"] == "LT")
+        self.assertEqual(pfitz_lt["preferred_token"], "strength")
 
     def test_calculate_race_equivalency_from_10k_input(self) -> None:
         payload = calculate_race_equivalency("10k", "0:44:45")
@@ -41,6 +49,14 @@ class TestPaceWorkshop(unittest.TestCase):
 
     def test_default_marathon_goal_constant(self) -> None:
         self.assertEqual(DEFAULT_MARATHON_GOAL, "5:00:00")
+
+    def test_resolve_pace_reference_maps_aliases_to_hansons_defaults(self) -> None:
+        threshold = resolve_pace_reference("3:30:00", "$threshold")
+        self.assertEqual(threshold["canonical_key"], "strength")
+        self.assertEqual(threshold["display"], "7:51")
+        interval = resolve_pace_reference("3:30:00", "$i")
+        self.assertEqual(interval["canonical_key"], "interval")
+        self.assertEqual(interval["display"], "7:21 to 7:03")
 
 
 if __name__ == "__main__":

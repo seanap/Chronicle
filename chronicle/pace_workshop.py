@@ -117,6 +117,210 @@ _TRAINING_PACE_FIELDS = [
     ("5k", "5k"),
 ]
 
+_RACE_DISTANCE_MILES = {
+    "1mi": 1.0,
+    "2mi": 2.0,
+    "5k": 3.10686,
+    "10k": 6.21371,
+    "15k": 9.32057,
+    "10mi": 10.0,
+    "hm": 13.1094,
+    "marathon": 26.21875,
+}
+
+_CANONICAL_PACE_TARGETS = [
+    {
+        "key": "recovery",
+        "label": "Recovery",
+        "kind": "exact",
+        "source": "training",
+        "field": "recovery",
+        "aliases": ["recovery", "recover", "rec"],
+    },
+    {
+        "key": "easy_a",
+        "label": "Easy A",
+        "kind": "exact",
+        "source": "training",
+        "field": "easy_a",
+        "aliases": ["easy_a", "easya"],
+    },
+    {
+        "key": "easy_b",
+        "label": "Easy B",
+        "kind": "exact",
+        "source": "training",
+        "field": "easy_b",
+        "aliases": ["easy_b", "easyb", "steady"],
+    },
+    {
+        "key": "easy",
+        "label": "Easy",
+        "kind": "range",
+        "source": "training",
+        "fields": ["easy_a", "easy_b"],
+        "display_fields": ["easy_a", "easy_b"],
+        "default_field": "easy_a",
+        "aliases": ["easy", "e"],
+    },
+    {
+        "key": "long_run",
+        "label": "Long Run",
+        "kind": "exact",
+        "source": "training",
+        "field": "long_run",
+        "aliases": ["long_run", "longrun", "lr"],
+    },
+    {
+        "key": "moderate",
+        "label": "Moderate / Steady",
+        "kind": "range",
+        "source": "training",
+        "fields": ["easy_b", "long_run"],
+        "display_fields": ["easy_b", "long_run"],
+        "default_field": "long_run",
+        "aliases": ["moderate", "steady_plus", "ga", "general_aerobic", "aerobic", "lt1"],
+    },
+    {
+        "key": "marathon_pace",
+        "label": "Marathon Pace",
+        "kind": "exact",
+        "source": "training",
+        "field": "marathon_pace",
+        "aliases": ["marathon_pace", "marathon", "mp", "m", "goal_pace"],
+    },
+    {
+        "key": "half_marathon_pace",
+        "label": "Half Marathon Pace",
+        "kind": "exact",
+        "source": "race",
+        "field": "hm",
+        "aliases": ["half_marathon_pace", "half_marathon", "half", "hm", "hmp"],
+    },
+    {
+        "key": "strength",
+        "label": "Strength / LT",
+        "kind": "exact",
+        "source": "training",
+        "field": "strength",
+        "aliases": ["strength", "threshold", "tempo", "lt", "lt2", "t"],
+    },
+    {
+        "key": "10k",
+        "label": "10K Pace",
+        "kind": "exact",
+        "source": "training",
+        "field": "10k",
+        "aliases": ["10k", "10k_pace"],
+    },
+    {
+        "key": "5k",
+        "label": "5K Pace",
+        "kind": "exact",
+        "source": "training",
+        "field": "5k",
+        "aliases": ["5k", "5k_pace"],
+    },
+    {
+        "key": "interval",
+        "label": "Interval / VO2max",
+        "kind": "range",
+        "source": "training",
+        "fields": ["10k", "5k"],
+        "display_fields": ["10k", "5k"],
+        "default_field": "10k",
+        "aliases": ["interval", "vo2", "vo2max", "i"],
+    },
+    {
+        "key": "mile",
+        "label": "Mile / Repetition",
+        "kind": "exact",
+        "source": "race",
+        "field": "1mi",
+        "aliases": ["mile", "1mi", "repetition", "rep", "r"],
+    },
+]
+
+_PACE_PLAN_FAMILIES = [
+    {
+        "key": "hansons",
+        "label": "Hansons",
+        "items": [
+            {"label": "Recovery", "canonical_key": "recovery"},
+            {"label": "Easy A", "canonical_key": "easy_a"},
+            {"label": "Easy B", "canonical_key": "easy_b"},
+            {"label": "LR", "canonical_key": "long_run"},
+            {"label": "MP", "canonical_key": "marathon_pace"},
+            {"label": "Strength", "canonical_key": "strength"},
+            {"label": "HMP", "canonical_key": "half_marathon_pace"},
+            {"label": "10k", "canonical_key": "10k"},
+            {"label": "5k", "canonical_key": "5k"},
+        ],
+    },
+    {
+        "key": "pfitz",
+        "label": "Pfitz",
+        "items": [
+            {"label": "Recovery", "canonical_key": "recovery"},
+            {"label": "General Aerobic", "canonical_key": "easy"},
+            {"label": "Endurance / Med-Long", "canonical_key": "long_run"},
+            {"label": "Marathon Pace", "canonical_key": "marathon_pace"},
+            {"label": "LT", "canonical_key": "strength"},
+            {"label": "VO2max", "canonical_key": "interval"},
+        ],
+    },
+    {
+        "key": "jd",
+        "label": "JD",
+        "items": [
+            {"label": "E", "canonical_key": "easy"},
+            {"label": "M", "canonical_key": "marathon_pace"},
+            {"label": "T", "canonical_key": "strength"},
+            {"label": "I", "canonical_key": "interval"},
+            {"label": "R", "canonical_key": "mile"},
+        ],
+    },
+    {
+        "key": "higdon",
+        "label": "Higdon",
+        "items": [
+            {"label": "Easy / Conversation", "canonical_key": "easy"},
+            {"label": "Pace", "canonical_key": "marathon_pace"},
+            {
+                "label": "Tempo",
+                "canonical_key": "strength",
+                "note": "Higdon often describes tempo near 10K effort. Chronicle defaults it onto Hansons strength/LT for consistency.",
+            },
+            {"label": "Intervals", "canonical_key": "mile"},
+            {"label": "Long Run", "canonical_key": "long_run"},
+        ],
+    },
+    {
+        "key": "galloway",
+        "label": "Galloway",
+        "items": [
+            {"label": "Easy Run-Walk", "canonical_key": "easy"},
+            {"label": "Long Run", "canonical_key": "long_run"},
+            {"label": "Race Rehearsal / Goal Pace", "canonical_key": "marathon_pace"},
+            {"label": "Magic Mile 10K", "canonical_key": "10k"},
+            {"label": "Magic Mile HM", "canonical_key": "half_marathon_pace"},
+            {"label": "Magic Mile Marathon", "canonical_key": "marathon_pace"},
+        ],
+    },
+    {
+        "key": "run_type",
+        "label": "Run Type",
+        "items": [
+            {"label": "Easy", "canonical_key": "easy"},
+            {"label": "Tempo", "canonical_key": "strength"},
+            {"label": "Threshold", "canonical_key": "strength"},
+            {"label": "Speed", "canonical_key": "interval"},
+            {"label": "Race Pace", "canonical_key": "marathon_pace"},
+            {"label": "Long Run", "canonical_key": "long_run"},
+        ],
+    },
+]
+
 
 def _normalize_text(value: Any) -> str:
     return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
@@ -248,15 +452,213 @@ def _build_training_rows() -> list[dict[str, Any]]:
 
 _RACE_ROWS = _build_race_rows()
 _TRAINING_ROWS = _build_training_rows()
+_PACE_TARGET_SPECS_BY_KEY = {str(item["key"]): item for item in _CANONICAL_PACE_TARGETS}
+
+
+def _normalize_pace_alias(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("$"):
+        text = text[1:]
+    if text.startswith("p(") and text.endswith(")"):
+        text = text[2:-1].strip()
+        if text.startswith("$"):
+            text = text[1:]
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+_PACE_ALIAS_INDEX = {}
+for _spec in _CANONICAL_PACE_TARGETS:
+    for _alias in _spec.get("aliases") or []:
+        normalized_alias = _normalize_pace_alias(_alias)
+        if normalized_alias:
+            _PACE_ALIAS_INDEX[normalized_alias] = str(_spec["key"])
+    _PACE_ALIAS_INDEX[_normalize_pace_alias(_spec["key"])] = str(_spec["key"])
 
 
 def _nearest_row(rows: list[dict[str, Any]], *, field: str, target_seconds: int) -> dict[str, Any]:
     return min(rows, key=lambda item: abs(int(item["_seconds"][field]) - int(target_seconds)))
 
 
+def _format_pace_seconds(seconds: int) -> str:
+    return format_duration(int(round(seconds)))
+
+
+def _seconds_for_race_pace(row: dict[str, Any], field: str) -> int:
+    column = _DISTANCE_TO_COLUMN.get(field, field)
+    race_time = int(row["_seconds"][column])
+    miles = float(_RACE_DISTANCE_MILES[field])
+    return int(round(race_time / miles))
+
+
+def _race_row_for_goal(goal_seconds: int) -> dict[str, Any]:
+    return _nearest_row(_RACE_ROWS, field="marathon", target_seconds=goal_seconds)
+
+
+def _seconds_from_source(
+    *,
+    spec: dict[str, Any],
+    training_row: dict[str, Any],
+    race_row: dict[str, Any],
+    field: str,
+) -> int:
+    if spec.get("source") == "race":
+        return _seconds_for_race_pace(race_row, field)
+    return int(training_row["_seconds"][field])
+
+
+def _build_exact_resolution(
+    spec: dict[str, Any],
+    *,
+    training_row: dict[str, Any],
+    race_row: dict[str, Any],
+) -> dict[str, Any]:
+    field = str(spec["field"])
+    seconds = _seconds_from_source(spec=spec, training_row=training_row, race_row=race_row, field=field)
+    pace = _format_pace_seconds(seconds)
+    return {
+        "key": str(spec["key"]),
+        "label": str(spec["label"]),
+        "kind": "exact",
+        "source": str(spec.get("source") or "training"),
+        "pace": pace,
+        "pace_seconds": seconds,
+        "display": pace,
+        "fast_pace": pace,
+        "fast_pace_seconds": seconds,
+        "slow_pace": pace,
+        "slow_pace_seconds": seconds,
+        "default_pace": pace,
+        "default_pace_seconds": seconds,
+        "aliases": list(spec.get("aliases") or []),
+        "preferred_token": str((spec.get("aliases") or [spec["key"]])[0]),
+        "garmin_target": {
+            "target_type": "pace",
+            "pace_kind": "exact",
+            "fast_seconds_per_mile": seconds,
+            "slow_seconds_per_mile": seconds,
+            "fast_pace": pace,
+            "slow_pace": pace,
+        },
+    }
+
+
+def _build_range_resolution(
+    spec: dict[str, Any],
+    *,
+    training_row: dict[str, Any],
+    race_row: dict[str, Any],
+) -> dict[str, Any]:
+    fields = [str(item) for item in spec.get("fields") or [] if str(item or "").strip()]
+    if not fields:
+        raise ValueError(f"Range pace target missing fields: {spec.get('key')}")
+    values = [
+        _seconds_from_source(spec=spec, training_row=training_row, race_row=race_row, field=field)
+        for field in fields
+    ]
+    slow_seconds = max(values)
+    fast_seconds = min(values)
+    default_field = str(spec.get("default_field") or fields[0])
+    default_seconds = _seconds_from_source(spec=spec, training_row=training_row, race_row=race_row, field=default_field)
+    display_fields = [str(item) for item in spec.get("display_fields") or fields]
+    display_values = [
+        _seconds_from_source(spec=spec, training_row=training_row, race_row=race_row, field=field)
+        for field in display_fields
+    ]
+    display = " to ".join(_format_pace_seconds(value) for value in display_values)
+    return {
+        "key": str(spec["key"]),
+        "label": str(spec["label"]),
+        "kind": "range",
+        "source": str(spec.get("source") or "training"),
+        "pace": _format_pace_seconds(default_seconds),
+        "pace_seconds": default_seconds,
+        "display": display,
+        "fast_pace": _format_pace_seconds(fast_seconds),
+        "fast_pace_seconds": fast_seconds,
+        "slow_pace": _format_pace_seconds(slow_seconds),
+        "slow_pace_seconds": slow_seconds,
+        "default_pace": _format_pace_seconds(default_seconds),
+        "default_pace_seconds": default_seconds,
+        "aliases": list(spec.get("aliases") or []),
+        "preferred_token": str((spec.get("aliases") or [spec["key"]])[0]),
+        "garmin_target": {
+            "target_type": "pace",
+            "pace_kind": "range",
+            "fast_seconds_per_mile": fast_seconds,
+            "slow_seconds_per_mile": slow_seconds,
+            "fast_pace": _format_pace_seconds(fast_seconds),
+            "slow_pace": _format_pace_seconds(slow_seconds),
+        },
+    }
+
+
+def _build_canonical_pace_catalog(training_row: dict[str, Any], race_row: dict[str, Any]) -> list[dict[str, Any]]:
+    catalog: list[dict[str, Any]] = []
+    for spec in _CANONICAL_PACE_TARGETS:
+        if str(spec.get("kind") or "exact") == "range":
+            catalog.append(_build_range_resolution(spec, training_row=training_row, race_row=race_row))
+            continue
+        catalog.append(_build_exact_resolution(spec, training_row=training_row, race_row=race_row))
+    return catalog
+
+
+def _build_plan_family_equivalencies(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    families: list[dict[str, Any]] = []
+    for family in _PACE_PLAN_FAMILIES:
+        items: list[dict[str, Any]] = []
+        for item in family.get("items") or []:
+            canonical_key = str(item.get("canonical_key") or "")
+            resolved = catalog.get(canonical_key)
+            if not resolved:
+                continue
+            items.append(
+                {
+                    "label": str(item.get("label") or canonical_key),
+                    "canonical_key": canonical_key,
+                    "canonical_label": str(resolved.get("label") or canonical_key),
+                    "display": str(resolved.get("display") or resolved.get("pace") or "--"),
+                    "default_pace": str(resolved.get("default_pace") or resolved.get("pace") or "--"),
+                    "kind": str(resolved.get("kind") or "exact"),
+                    "preferred_token": str(resolved.get("preferred_token") or canonical_key),
+                    "note": str(item.get("note") or ""),
+                }
+            )
+        families.append(
+            {
+                "key": str(family.get("key") or ""),
+                "label": str(family.get("label") or ""),
+                "items": items,
+            }
+        )
+    return families
+
+
+def resolve_pace_reference(goal_time: Any, reference: Any) -> dict[str, Any]:
+    normalized_goal = normalize_marathon_goal_time(goal_time)
+    target_seconds = parse_duration_to_seconds(normalized_goal)
+    training_row = _nearest_row(_TRAINING_ROWS, field="marathon_goal", target_seconds=target_seconds)
+    matched_goal_seconds = int(training_row["_seconds"]["marathon_goal"])
+    race_row = _race_row_for_goal(matched_goal_seconds)
+    catalog = {item["key"]: item for item in _build_canonical_pace_catalog(training_row, race_row)}
+    alias = _normalize_pace_alias(reference)
+    canonical_key = _PACE_ALIAS_INDEX.get(alias)
+    if not canonical_key:
+        supported = ", ".join(sorted({alias for spec in _CANONICAL_PACE_TARGETS for alias in spec.get("aliases") or []}))
+        raise ValueError(f"Unsupported pace token: {reference}. Supported tokens include: {supported}.")
+    resolved = catalog[canonical_key]
+    return {
+        "input": str(reference or "").strip(),
+        "canonical_key": canonical_key,
+        "canonical_label": str(resolved.get("label") or canonical_key),
+        **resolved,
+        "matched_marathon_goal": str(training_row["marathon_goal"]),
+    }
+
+
 def training_paces_for_goal(goal_time: Any) -> dict[str, Any]:
     target = parse_duration_to_seconds(goal_time)
     row = _nearest_row(_TRAINING_ROWS, field="marathon_goal", target_seconds=target)
+    race_row = _race_row_for_goal(int(row["_seconds"]["marathon_goal"]))
     paces = [
         {
             "key": key,
@@ -265,11 +667,15 @@ def training_paces_for_goal(goal_time: Any) -> dict[str, Any]:
         }
         for key, label in _TRAINING_PACE_FIELDS
     ]
+    canonical_paces = _build_canonical_pace_catalog(row, race_row)
+    canonical_lookup = {item["key"]: item for item in canonical_paces}
     return {
         "input_marathon_goal": normalize_marathon_goal_time(goal_time),
         "matched_marathon_goal": str(row["marathon_goal"]),
         "matched_half_marathon_goal": str(row["half_marathon_goal"]),
         "paces": paces,
+        "canonical_paces": canonical_paces,
+        "plan_families": _build_plan_family_equivalencies(canonical_lookup),
     }
 
 

@@ -17,6 +17,9 @@
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='chronicle.png') }}">
   <link rel="stylesheet" href="/static/ui-theme.css">
   <link rel="stylesheet" href="/static/editor.css">
+  {% if review_variant_css_url %}
+  <link rel="stylesheet" href="{{ review_variant_css_url }}">
+  {% endif %}
 </head>
 <body>
   {% include "_app_shell_nav.html" %}
@@ -35,9 +38,40 @@
     <div class="drawer-workspace">
       <section id="profileWorkspaceSection" class="drawer-section" data-workspace-scope="profile">
         <h3>Profile Workspace</h3>
-        <p class="subtext">Enable profiles and choose which profile template you are editing.</p>
+        <p class="subtext">Select a profile, inspect its YAML rule file, create custom profiles, and set the working fallback.</p>
         <div id="profileWorkspaceMeta" class="meta">Loading profiles...</div>
-        <div id="profileList" class="catalog"></div>
+        <div class="profile-workshop-row profile-workshop-row-primary">
+          <div class="profile-select-shell">
+            <label for="profileSelect">Profile</label>
+            <select id="profileSelect">
+              <option value="">Loading profiles...</option>
+            </select>
+          </div>
+          <div class="inline-actions profile-workshop-top-actions">
+            <button id="btnProfileToggleEnabled" class="btn btn-ghost" type="button">Status</button>
+            <button id="btnProfileSetWorking" class="btn btn-ghost" type="button">Set Working</button>
+          </div>
+        </div>
+        <div id="profileDocumentMeta" class="meta">No profile selected.</div>
+        <div class="inline-actions profile-workshop-actions">
+          <button id="btnProfileNew" class="btn btn-ghost" type="button">New</button>
+          <button id="btnProfileSave" class="btn btn-secondary" type="button">Save</button>
+          <button id="btnProfileReload" class="btn btn-ghost" type="button">Reload</button>
+        </div>
+        <label for="profileYamlEditor">Profile YAML</label>
+        <textarea id="profileYamlEditor" class="profile-yaml-editor" spellcheck="false"></textarea>
+        <section class="profile-validation-shell" aria-labelledby="profileValidationHeading">
+          <div class="profile-validation-head">
+            <h4 id="profileValidationHeading">Activity Validator</h4>
+            <p class="subtext">Enter a Strava activity ID to check whether this selected YAML profile would process it.</p>
+          </div>
+          <div class="profile-validation-row">
+            <label for="profileValidationActivityId">Strava ID</label>
+            <input id="profileValidationActivityId" type="text" inputmode="numeric" placeholder="17618774880">
+            <button id="btnProfileValidateActivity" class="btn btn-ghost" type="button">Validate</button>
+          </div>
+          <div id="profileValidationMeta" class="meta">Validate the current YAML against a real Strava activity before you save or set working.</div>
+        </section>
       </section>
 
       <section class="drawer-section" data-workspace-scope="template">
@@ -394,5 +428,8 @@
   </div>
 
   <script src="/static/editor.js"></script>
+  {% if review_variant_js_url %}
+  <script src="{{ review_variant_js_url }}"></script>
+  {% endif %}
 </body>
 </html>

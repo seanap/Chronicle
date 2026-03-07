@@ -48,7 +48,7 @@ from .storage import (
     write_config_snapshot,
     write_json,
 )
-from .template_profiles import get_template_profile, list_template_profiles
+from .template_profiles import get_template_profile, get_working_template_profile, list_template_profiles
 from .template_rendering import render_with_active_template
 from .strava_client import StravaClient, get_gap_speed_mps, mps_to_pace
 
@@ -1466,6 +1466,109 @@ def _criteria_clauses(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _criteria_weekdays(value: Any) -> list[int]:
+    mapping = {
+        "mon": 0,
+        "monday": 0,
+        "tue": 1,
+        "tues": 1,
+        "tuesday": 1,
+        "wed": 2,
+        "wednesday": 2,
+        "thu": 3,
+        "thur": 3,
+        "thurs": 3,
+        "thursday": 3,
+        "fri": 4,
+        "friday": 4,
+        "sat": 5,
+        "saturday": 5,
+        "sun": 6,
+        "sunday": 6,
+    }
+    days: list[int] = []
+    for item in _criteria_string_list(value):
+        normalized = str(item or "").strip().lower()
+        if normalized in mapping and mapping[normalized] not in days:
+            days.append(mapping[normalized])
+    return days
+
+
+def _criteria_time_minutes(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _normalized_strava_tags(activity: dict[str, Any]) -> set[str]:
+    tags: set[str] = set()
+    sport_type = _normalize_activity_type_key(activity.get("sport_type") or activity.get("type"))
+    workout_type = _to_int(activity.get("workout_type"))
+    if sport_type:
+        tags.add(sport_type)
+    if bool(activity.get("commute")):
+        tags.add("commute")
+    if bool(activity.get("trainer")):
+        tags.add("trainer")
+    if _is_treadmill(activity):
+        tags.add("treadmill")
+    if workout_type == 1:
+        tags.add("race")
+    if workout_type == 2:
+        tags.add("long_run")
+    if sport_type == "trailrun":
+        tags.add("trail")
+    if sport_type == "walk":
+        tags.add("walk")
+    if sport_type in {"weighttraining", "weighttraining", "workout"}:
+        tags.add("strength")
+    return tags
+
+
+def _activity_match_datetime(activity: dict[str, Any], settings: Settings) -> datetime | None:
+    local_raw = activity.get("start_date_local")
+    if isinstance(local_raw, str) and local_raw.strip():
+        text = local_raw.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                try:
+                    return parsed.replace(tzinfo=ZoneInfo(settings.timezone))
+                except ZoneInfoNotFoundError:
+                    return parsed.replace(tzinfo=timezone.utc)
+            return parsed
+
+    utc_raw = activity.get("start_date")
+    if isinstance(utc_raw, str) and utc_raw.strip():
+        try:
+            parsed_utc = datetime.fromisoformat(utc_raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed_utc.tzinfo is None:
+            parsed_utc = parsed_utc.replace(tzinfo=timezone.utc)
+        try:
+            return parsed_utc.astimezone(ZoneInfo(settings.timezone))
+        except ZoneInfoNotFoundError:
+            return parsed_utc.astimezone(timezone.utc)
+    return None
+
+
 def _criteria_match_reasons(
     criteria: dict[str, Any],
     activity: dict[str, Any],
@@ -1531,6 +1634,10 @@ def _criteria_match_reasons(
     activity_name = str(activity.get("name") or "").strip().lower()
     external_id = str(activity.get("external_id") or "").strip().lower()
     device_name = str(activity.get("device_name") or "").strip().lower()
+    strava_tags = _normalized_strava_tags(activity)
+    match_dt = _activity_match_datetime(activity, settings)
+    match_minutes = (match_dt.hour * 60 + match_dt.minute) if isinstance(match_dt, datetime) else None
+    match_weekday = match_dt.weekday() if isinstance(match_dt, datetime) else None
 
     if "sport_type" in criteria:
         evaluated = True
@@ -1636,12 +1743,26 @@ def _criteria_match_reasons(
             return []
         reasons.append("text_contains matched")
 
+    if "text_contains_any" in criteria:
+        evaluated = True
+        tokens = [token.lower() for token in _criteria_string_list(criteria.get("text_contains_any"))]
+        if not tokens or not any(token in text for token in tokens):
+            return []
+        reasons.append("text_contains_any matched")
+
     if "name_contains" in criteria:
         evaluated = True
         tokens = [token.lower() for token in _criteria_string_list(criteria.get("name_contains"))]
         if not tokens or not all(token in activity_name for token in tokens):
             return []
         reasons.append("name_contains matched")
+
+    if "name_contains_any" in criteria:
+        evaluated = True
+        tokens = [token.lower() for token in _criteria_string_list(criteria.get("name_contains_any"))]
+        if not tokens or not any(token in activity_name for token in tokens):
+            return []
+        reasons.append("name_contains_any matched")
 
     if "text_not_contains" in criteria:
         evaluated = True
@@ -1670,6 +1791,80 @@ def _criteria_match_reasons(
         if not tokens or not all(token in device_name for token in tokens):
             return []
         reasons.append("device_name_contains matched")
+
+    if "strava_tags_any" in criteria:
+        evaluated = True
+        expected_tags = {_normalize_activity_type_key(item) for item in _criteria_string_list(criteria.get("strava_tags_any")) if item}
+        if not expected_tags or not (strava_tags & expected_tags):
+            return []
+        reasons.append("strava_tags_any matched")
+
+    if "strava_tags_all" in criteria:
+        evaluated = True
+        expected_tags = {_normalize_activity_type_key(item) for item in _criteria_string_list(criteria.get("strava_tags_all")) if item}
+        if not expected_tags or not expected_tags.issubset(strava_tags):
+            return []
+        reasons.append("strava_tags_all matched")
+
+    if "moving_time_minutes_min" in criteria:
+        evaluated = True
+        minimum = _as_float(criteria.get("moving_time_minutes_min"))
+        if minimum is None or moving_seconds < minimum * 60.0:
+            return []
+        reasons.append(f"moving_time={moving_seconds / 60.0:.0f}min >= {minimum:.0f}min")
+
+    if "moving_time_minutes_max" in criteria:
+        evaluated = True
+        maximum = _as_float(criteria.get("moving_time_minutes_max"))
+        if maximum is None or moving_seconds > maximum * 60.0:
+            return []
+        reasons.append(f"moving_time={moving_seconds / 60.0:.0f}min <= {maximum:.0f}min")
+
+    if "day_of_week_in" in criteria:
+        evaluated = True
+        expected_days = _criteria_weekdays(criteria.get("day_of_week_in"))
+        if match_weekday is None or not expected_days or match_weekday not in expected_days:
+            return []
+        reasons.append(f"day_of_week={match_weekday}")
+
+    if "time_of_day_after" in criteria:
+        evaluated = True
+        minimum_minutes = _criteria_time_minutes(criteria.get("time_of_day_after"))
+        if minimum_minutes is None or match_minutes is None or match_minutes < minimum_minutes:
+            return []
+        reasons.append(f"time_of_day={match_minutes} >= {minimum_minutes}")
+
+    if "time_of_day_before" in criteria:
+        evaluated = True
+        maximum_minutes = _criteria_time_minutes(criteria.get("time_of_day_before"))
+        if maximum_minutes is None or match_minutes is None or match_minutes > maximum_minutes:
+            return []
+        reasons.append(f"time_of_day={match_minutes} <= {maximum_minutes}")
+
+    if "start_geofence" in criteria:
+        evaluated = True
+        geofence = criteria.get("start_geofence")
+        if not isinstance(geofence, dict):
+            return []
+        if start is None:
+            return []
+        latitude = _as_float(geofence.get("latitude"))
+        longitude = _as_float(geofence.get("longitude"))
+        radius_miles = _as_float(geofence.get("radius_miles"))
+        mode = str(geofence.get("mode") or "within").strip().lower()
+        if latitude is None or longitude is None or radius_miles is None or radius_miles < 0:
+            return []
+        distance_to_center = _haversine_miles(start[0], start[1], latitude, longitude)
+        if mode == "within":
+            if distance_to_center > radius_miles:
+                return []
+            reasons.append(f"start_geofence within {radius_miles:.2f}mi")
+        elif mode == "outside":
+            if distance_to_center <= radius_miles:
+                return []
+            reasons.append(f"start_geofence outside {radius_miles:.2f}mi")
+        else:
+            return []
 
     if "home_distance_miles_max" in criteria or "home_distance_miles_min" in criteria:
         evaluated = True
@@ -1832,6 +2027,18 @@ def _select_activity_profile(
         ),
         None,
     )
+    working_profile: dict[str, Any] | None = None
+    try:
+        candidate = get_working_template_profile(settings)
+        if isinstance(candidate, dict):
+            working_profile = candidate
+    except Exception as exc:
+        logger.warning("Failed to resolve working template profile; default fallback will be used: %s", exc)
+    working_profile_id = (
+        str(working_profile.get("profile_id") or "").strip().lower()
+        if isinstance(working_profile, dict)
+        else ""
+    )
 
     for profile in profiles:
         profile_id = str(profile.get("profile_id") or "").strip().lower()
@@ -1850,16 +2057,34 @@ def _select_activity_profile(
                 "profile_id": profile_id,
                 "profile_label": str(profile.get("label") or profile_id.title()),
                 "reasons": reasons,
+                "working_profile_id": working_profile_id or "default",
+                "selection_mode": "criteria_match",
             }
+    if working_profile_id and working_profile_id != "default":
+        return {
+            "profile_id": working_profile_id,
+            "profile_label": str(working_profile.get("label") or working_profile_id.title()),
+            "reasons": ["working_profile_fallback"],
+            "working_profile_id": working_profile_id,
+            "selection_mode": "working_profile_fallback",
+        }
 
     if default_profile is not None:
         return {
             "profile_id": "default",
             "profile_label": str(default_profile.get("label") or "Default"),
             "reasons": ["fallback"],
+            "working_profile_id": working_profile_id or "default",
+            "selection_mode": "default_fallback",
         }
 
-    return {"profile_id": "default", "profile_label": "Default", "reasons": ["fallback"]}
+    return {
+        "profile_id": "default",
+        "profile_label": "Default",
+        "reasons": ["fallback"],
+        "working_profile_id": working_profile_id or "default",
+        "selection_mode": "default_fallback",
+    }
 
 
 def preview_profile_match(
@@ -1886,6 +2111,111 @@ def preview_profile_match(
         "criteria": dict(criteria) if isinstance(criteria, dict) else {},
         "enabled": bool(profile.get("enabled")) if isinstance(profile, dict) else profile_id == "default",
         "priority": int(profile.get("priority", 0)) if isinstance(profile, dict) else 0,
+        "working_profile_id": str(selected.get("working_profile_id") or "default"),
+        "selection_mode": str(selected.get("selection_mode") or ""),
+    }
+
+
+def preview_specific_profile_match(
+    settings: Settings,
+    context: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise ValueError("Template context is required.")
+    if not isinstance(profile, dict):
+        raise ValueError("Profile definition is required.")
+
+    activity, training = _activity_for_profile_preview(context)
+    if not isinstance(activity, dict) or not activity:
+        raise ValueError("Template context must include activity data for profile preview.")
+
+    profile_id = str(profile.get("profile_id") or "").strip().lower()
+    if not profile_id:
+        raise ValueError("profile_id is required.")
+    criteria = profile.get("criteria") if isinstance(profile.get("criteria"), dict) else {}
+    reasons = _profile_match_reasons(
+        profile_id,
+        activity,
+        settings,
+        training=training,
+        criteria=criteria,
+    )
+    return {
+        "profile_id": profile_id,
+        "profile_label": str(profile.get("label") or profile_id.title()),
+        "matched": bool(reasons),
+        "reasons": list(reasons) if isinstance(reasons, list) else [],
+        "criteria": dict(criteria) if isinstance(criteria, dict) else {},
+        "enabled": bool(profile.get("enabled")),
+        "priority": int(profile.get("priority", 0) or 0),
+    }
+
+
+def build_profile_preview_training(
+    settings: Settings,
+    activity: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(activity, dict) or not activity:
+        raise ValueError("Activity data is required.")
+
+    garmin_client = _get_garmin_client(settings)
+    training = _get_garmin_metrics(garmin_client)
+    training["_garmin_activity_aligned"] = False
+    if garmin_client is not None:
+        matched_garmin_context = get_activity_context_for_strava_activity(
+            garmin_client,
+            activity,
+        )
+        if isinstance(matched_garmin_context, dict) and matched_garmin_context:
+            training["garmin_last_activity"] = matched_garmin_context
+            training["_garmin_activity_aligned"] = True
+    return training
+
+
+def preview_specific_profile_against_activity(
+    settings: Settings,
+    activity: dict[str, Any],
+    profile: dict[str, Any],
+    *,
+    training: dict[str, Any] | None = None,
+    enabled_override: bool | None = None,
+) -> dict[str, Any]:
+    if not isinstance(activity, dict) or not activity:
+        raise ValueError("Activity data is required.")
+    if not isinstance(profile, dict):
+        raise ValueError("Profile definition is required.")
+
+    profile_id = str(profile.get("profile_id") or "").strip().lower()
+    if not profile_id:
+        raise ValueError("profile_id is required.")
+    criteria = profile.get("criteria") if isinstance(profile.get("criteria"), dict) else {}
+    effective_training = training if isinstance(training, dict) else None
+    reasons = _profile_match_reasons(
+        profile_id,
+        activity,
+        settings,
+        training=effective_training,
+        criteria=criteria,
+    )
+    enabled = bool(profile.get("enabled"))
+    if enabled_override is not None:
+        enabled = bool(enabled_override)
+    matched = bool(reasons)
+    would_process = enabled and matched
+    result_reasons = list(reasons) if isinstance(reasons, list) else []
+    if not enabled:
+        result_reasons = ["profile disabled", *result_reasons]
+    return {
+        "profile_id": profile_id,
+        "profile_label": str(profile.get("label") or profile_id.title()),
+        "matched": matched,
+        "would_process": would_process,
+        "reasons": result_reasons,
+        "criteria": dict(criteria) if isinstance(criteria, dict) else {},
+        "enabled": enabled,
+        "priority": int(profile.get("priority", 0) or 0),
+        "garmin_activity_aligned": bool(effective_training.get("_garmin_activity_aligned")) if isinstance(effective_training, dict) else False,
     }
 
 
@@ -3090,6 +3420,8 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             "id": profile_id,
             "label": str(selected_profile.get("profile_label") or profile_id.title()),
             "reasons": selected_profile.get("reasons") or [],
+            "working_id": str(selected_profile.get("working_profile_id") or "default"),
+            "selection_mode": str(selected_profile.get("selection_mode") or ""),
         }
 
         render_result = render_with_active_template(
@@ -3130,6 +3462,8 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
                 "profile_id": profile_id,
                 "profile_label": str(selected_profile.get("profile_label") or profile_id.title()),
                 "reasons": selected_profile.get("reasons") or [],
+                "working_profile_id": str(selected_profile.get("working_profile_id") or "default"),
+                "selection_mode": str(selected_profile.get("selection_mode") or ""),
                 "evaluated_at_utc": now_utc.isoformat(),
             },
             "template_render": {
@@ -3137,6 +3471,10 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
                 "is_custom_template": render_result.get("is_custom_template"),
                 "fallback_used": render_result.get("fallback_used"),
                 "template_path": render_result.get("template_path"),
+                "template_hash": render_result.get("template_hash"),
+                "template_version": render_result.get("template_version"),
+                "template_name": render_result.get("template_name"),
+                "template_updated_at_utc": render_result.get("template_updated_at_utc"),
                 "profile_id": render_result.get("profile_id", profile_id),
                 "profile_label": render_result.get("profile_label"),
                 "error": render_result.get("error"),
@@ -3147,7 +3485,26 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
         write_json(settings.latest_json_file, payload)
 
         logger.info("Activity %s updated successfully.", selected_activity_id)
-        result = {"status": "updated", "activity_id": selected_activity_id}
+        result = {
+            "status": "updated",
+            "activity_id": selected_activity_id,
+            "profile_id": profile_id,
+            "working_profile_id": str(selected_profile.get("working_profile_id") or "default"),
+            "selection_mode": str(selected_profile.get("selection_mode") or ""),
+            "template_path": str(render_result.get("template_path") or ""),
+            "template_hash": str(render_result.get("template_hash") or ""),
+            "template_version": (
+                str(render_result.get("template_version"))
+                if render_result.get("template_version") is not None
+                else None
+            ),
+            "template_name": (
+                str(render_result.get("template_name"))
+                if render_result.get("template_name") is not None
+                else None
+            ),
+            "is_custom_template": bool(render_result.get("is_custom_template")),
+        }
         if job_id and run_id:
             complete_activity_job_run(
                 settings.processed_log_file,
@@ -3168,6 +3525,21 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             job_id=job_id,
             run_id=run_id,
             error=None,
+            template_hash=str(render_result.get("template_hash") or "").strip() or None,
+            template_path=str(render_result.get("template_path") or "").strip() or None,
+            template_version=(
+                str(render_result.get("template_version"))
+                if render_result.get("template_version") is not None
+                else None
+            ),
+            template_name=(
+                str(render_result.get("template_name"))
+                if render_result.get("template_name") is not None
+                else None
+            ),
+            working_profile_id=str(selected_profile.get("working_profile_id") or "default"),
+            selection_mode=str(selected_profile.get("selection_mode") or ""),
+            is_custom_template=bool(render_result.get("is_custom_template")),
         )
         _record_cycle_status(
             settings,

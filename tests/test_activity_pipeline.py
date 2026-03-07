@@ -11,6 +11,7 @@ from chronicle.activity_pipeline import (
     _profile_activity_update_payload,
     _profile_match_reasons,
     _select_activity_profile,
+    preview_specific_profile_against_activity,
 )
 
 
@@ -238,6 +239,48 @@ class TestStrengthProfileBehavior(unittest.TestCase):
         }
         reasons = _profile_match_reasons("strength_training", activity, settings)
         self.assertIn("sport_type=Workout", reasons)
+
+
+class TestProfileActivityPreview(unittest.TestCase):
+    def test_preview_specific_profile_against_activity_respects_disabled_status(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+            timezone="America/New_York",
+        )
+        activity = {
+            "id": 17571492798,
+            "sport_type": "Walk",
+            "type": "Walk",
+            "name": "Neighborhood Walk",
+            "moving_time": 1800,
+            "start_date_local": "2026-03-06T18:10:00-05:00",
+            "start_latlng": [34.24, -83.96],
+        }
+        profile = {
+            "profile_id": "walk",
+            "label": "Walk",
+            "enabled": True,
+            "priority": 40,
+            "criteria": {
+                "sport_type": ["walk"],
+            },
+        }
+
+        preview = preview_specific_profile_against_activity(
+            settings,
+            activity,
+            profile,
+            training={"_garmin_activity_aligned": False},
+            enabled_override=False,
+        )
+
+        self.assertTrue(preview["matched"])
+        self.assertFalse(preview["would_process"])
+        self.assertEqual(preview["reasons"][0], "profile disabled")
 
     def test_strength_profile_matches_strength_like_walk_session(self) -> None:
         settings = SimpleNamespace(
@@ -626,6 +669,68 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
         self.assertEqual(selected.get("profile_id"), "default")
         self.assertEqual(selected.get("reasons"), ["fallback"])
 
+    def test_profile_selection_falls_back_to_working_profile_before_default(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        profiles = [
+            {"profile_id": "default", "label": "Default", "enabled": True, "priority": 0},
+            {"profile_id": "trail", "label": "Trail", "enabled": True, "priority": 70},
+        ]
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "name": "Neighborhood easy run",
+            "distance": 4000.0,
+            "elev_gain": 50.0,
+        }
+
+        with patch("chronicle.activity_pipeline.list_template_profiles", return_value=profiles), patch(
+            "chronicle.activity_pipeline.get_working_template_profile",
+            return_value={"profile_id": "trail", "label": "Trail", "enabled": True},
+        ):
+            selected = _select_activity_profile(settings, activity)
+
+        self.assertEqual(selected.get("profile_id"), "trail")
+        self.assertEqual(selected.get("reasons"), ["working_profile_fallback"])
+        self.assertEqual(selected.get("working_profile_id"), "trail")
+        self.assertEqual(selected.get("selection_mode"), "working_profile_fallback")
+
+    def test_profile_selection_prefers_explicit_match_over_working_profile_fallback(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        profiles = [
+            {"profile_id": "default", "label": "Default", "enabled": True, "priority": 0},
+            {"profile_id": "trail", "label": "Trail", "enabled": True, "priority": 70},
+            {"profile_id": "race", "label": "Race", "enabled": True, "priority": 100},
+        ]
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "name": "Neighborhood 10K race effort",
+            "distance": 10000.0,
+            "workout_type": 1,
+        }
+
+        with patch("chronicle.activity_pipeline.list_template_profiles", return_value=profiles), patch(
+            "chronicle.activity_pipeline.get_working_template_profile",
+            return_value={"profile_id": "trail", "label": "Trail", "enabled": True},
+        ):
+            selected = _select_activity_profile(settings, activity)
+
+        self.assertEqual(selected.get("profile_id"), "race")
+        self.assertEqual(selected.get("selection_mode"), "criteria_match")
+        self.assertEqual(selected.get("working_profile_id"), "trail")
+
     def test_profile_selection_uses_criteria_for_custom_profile(self) -> None:
         settings = SimpleNamespace(
             profile_trail_gain_per_mile_ft=220.0,
@@ -733,6 +838,105 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
 
         self.assertEqual(selected.get("profile_id"), "strength_training")
         self.assertIn("garmin activity indicates strength", selected.get("reasons", []))
+
+
+class TestExecutableProfileCriteria(unittest.TestCase):
+    def setUp(self) -> None:
+        self.settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=34.241946,
+            home_longitude=-83.964154,
+            home_radius_miles=10.0,
+            timezone="America/New_York",
+        )
+
+    def test_profile_match_reasons_supports_strava_tags_and_time_windows(self) -> None:
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "name": "Evening Commute Run",
+            "commute": True,
+            "moving_time": 2400,
+            "start_date_local": "2026-03-02T18:15:00-05:00",
+            "start_latlng": [34.241946, -83.964154],
+        }
+        criteria = {
+            "sport_type": ["run"],
+            "strava_tags_any": ["commute"],
+            "time_of_day_after": "17:00",
+            "time_of_day_before": "20:00",
+            "day_of_week_in": ["monday"],
+        }
+
+        reasons = _profile_match_reasons("evening_commute", activity, self.settings, criteria=criteria)
+        self.assertIn("sport_type=Run", reasons)
+        self.assertIn("strava_tags_any matched", reasons)
+        self.assertIn("day_of_week=0", reasons)
+        self.assertIn("time_of_day=1095 >= 1020", reasons)
+        self.assertIn("time_of_day=1095 <= 1200", reasons)
+
+    def test_profile_match_reasons_supports_geofence_within(self) -> None:
+        activity = {
+            "sport_type": "Walk",
+            "type": "Walk",
+            "name": "Lunch walk",
+            "start_latlng": [34.2420, -83.9640],
+        }
+        criteria = {
+            "sport_type": ["walk"],
+            "start_geofence": {
+                "latitude": 34.241946,
+                "longitude": -83.964154,
+                "radius_miles": 0.25,
+                "mode": "within",
+            },
+        }
+
+        reasons = _profile_match_reasons("home_walk", activity, self.settings, criteria=criteria)
+        self.assertIn("sport_type=Walk", reasons)
+        self.assertIn("start_geofence within 0.25mi", reasons)
+
+    def test_profile_match_reasons_supports_geofence_outside(self) -> None:
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "name": "Destination run",
+            "start_latlng": [35.241946, -84.964154],
+        }
+        criteria = {
+            "sport_type": ["run"],
+            "start_geofence": {
+                "latitude": 34.241946,
+                "longitude": -83.964154,
+                "radius_miles": 5.0,
+                "mode": "outside",
+            },
+        }
+
+        reasons = _profile_match_reasons("destination_run", activity, self.settings, criteria=criteria)
+        self.assertIn("start_geofence outside 5.00mi", reasons)
+
+    def test_profile_match_reasons_supports_name_and_text_contains_any(self) -> None:
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "name": "Sunrise Badge Chase",
+            "description": "Trying for a local legend badge before work",
+            "moving_time": 1800,
+        }
+        criteria = {
+            "name_contains_any": ["badge", "race"],
+            "text_contains_any": ["legend", "commute"],
+            "moving_time_minutes_min": 25,
+            "moving_time_minutes_max": 35,
+        }
+
+        reasons = _profile_match_reasons("badge_chase", activity, self.settings, criteria=criteria)
+        self.assertIn("name_contains_any matched", reasons)
+        self.assertIn("text_contains_any matched", reasons)
+        self.assertIn("moving_time=30min >= 25min", reasons)
+        self.assertIn("moving_time=30min <= 35min", reasons)
 
 
 if __name__ == "__main__":

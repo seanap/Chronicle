@@ -7,6 +7,12 @@
 
 Chronicle automatically builds rich Strava activity descriptions by combining data from Strava and your connected stat sources.
 
+## UI Direction
+- The MPA is the product and the active refinement target.
+- Future styling changes should be reviewed in-browser with `A` vs `B` comparisons at `/design-review`.
+- Product direction details: [`docs/UI_DIRECTION.md`](docs/UI_DIRECTION.md)
+- Refinement process and page order: [`docs/MPA_REFINEMENT_ROADMAP.md`](docs/MPA_REFINEMENT_ROADMAP.md)
+
 ## Key Features
 - Auto-processes new activities on a worker heartbeat.
 - Writes description templates back to Strava based on activity profile.
@@ -47,8 +53,10 @@ cp .env.example .env
 
 ### Step 3: Start Chronicle
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
+
+- Re-run the same command after pulling new code so the latest backend and frontend assets are rebuilt into the image.
 
 ### Step 4: Open the app
 ```bash
@@ -60,6 +68,7 @@ http://localhost:1609
 - Template Editor (`Build`): http://localhost:1609/editor
 - Source Setup (`Sources`): http://localhost:1609/setup
 - API Control (`Control`): http://localhost:1609/control
+- Design review: `http://localhost:1609/design-review`
 
 ### Step 5: Add your credentials in `Sources`
 - Go to `Sources` and fill in your source keys/tokens.
@@ -71,16 +80,13 @@ http://localhost:1609
 - Android widget APK downloads: [GitHub Releases](https://github.com/seanap/Chronicle/releases)
 - Misery Index report: [`docs/MISERY_INDEX_REPORT.md`](docs/MISERY_INDEX_REPORT.md)
 
-## SPA Scaffold (Story 1.1)
+## Updating a Docker Deploy
 
-A parallel SPA workspace now exists at `chronicle-ui/` (Vite + React + TypeScript + MUI).
+If you already have Chronicle running and want the current MPA product build to show up:
 
-### Run frontend locally
 ```bash
-cd chronicle-ui
-npm install
-npm run dev
+git pull
+docker compose up -d --build
 ```
 
-- Vite proxy defaults to `http://localhost:1609` and can be overridden with `VITE_API_PROXY_TARGET`.
-- Backend endpoints and response contracts remain source-of-truth and unchanged.
+Then hard refresh the browser on `/dashboard` or `/control`.

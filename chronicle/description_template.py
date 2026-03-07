@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+import yaml
 
 from jinja2 import StrictUndefined, TemplateError, meta, pass_context
 from jinja2.sandbox import SandboxedEnvironment
@@ -1363,6 +1364,21 @@ def _template_profiles_path(settings: Settings) -> Path:
     return _template_path(settings).parent / "template_profiles.json"
 
 
+def _profile_rules_dir(settings: Settings) -> Path:
+    return _template_path(settings).parent / "profile_rules"
+
+
+def _profile_rule_path(settings: Settings, profile_id: str) -> Path:
+    safe = _normalize_profile_id(profile_id)
+    if not safe:
+        raise ValueError("profile_id is required.")
+    return _profile_rules_dir(settings) / f"{safe}.yaml"
+
+
+def _profile_rules_state_path(settings: Settings) -> Path:
+    return _profile_rules_dir(settings) / "_workshop_state.yaml"
+
+
 def _template_profiles_templates_dir(settings: Settings) -> Path:
     return _template_path(settings).parent / "template_profiles"
 
@@ -1398,7 +1414,158 @@ def _profile_template_metadata_defaults(label: str) -> dict[str, Any]:
     }
 
 
-def _profile_builtin_map() -> dict[str, dict[str, Any]]:
+def _settings_profile_long_run_miles(settings: Settings | None) -> float:
+    value = _shared_as_float(getattr(settings, "profile_long_run_miles", None)) if settings is not None else None
+    return value if value is not None and value > 0 else 10.0
+
+
+def _settings_profile_trail_gain_per_mile_ft(settings: Settings | None) -> float:
+    value = _shared_as_float(getattr(settings, "profile_trail_gain_per_mile_ft", None)) if settings is not None else None
+    return value if value is not None and value > 0 else 220.0
+
+
+def _settings_home_geofence(settings: Settings | None, *, mode: str) -> dict[str, Any] | None:
+    if settings is None:
+        return None
+    latitude = _shared_as_float(getattr(settings, "home_latitude", None))
+    longitude = _shared_as_float(getattr(settings, "home_longitude", None))
+    radius_miles = _shared_as_float(getattr(settings, "home_radius_miles", None))
+    if latitude is None or longitude is None:
+        return None
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "radius_miles": radius_miles if radius_miles is not None and radius_miles > 0 else 10.0,
+        "mode": mode,
+    }
+
+
+def _profile_builtin_criteria(settings: Settings | None, profile_id: str) -> dict[str, Any]:
+    normalized = _normalize_profile_id(profile_id)
+    if normalized == DEFAULT_PROFILE_ID:
+        return {
+            "kind": "fallback",
+            "description": "Fallback profile when no enabled rule matches.",
+        }
+    if normalized == "incline_treadmill":
+        return {
+            "kind": "activity",
+            "description": "Incline treadmill sessions named in Strava or Garmin activity context.",
+            "all_of": [
+                {"none_of": [{"strength_like": True}]},
+                {
+                    "any_of": [
+                        {"name_contains_any": ["treadmill incline", "incline treadmill"]},
+                        {"garmin_activity_type_in": ["treadmillincline", "inclinetreadmill"]},
+                    ]
+                },
+            ],
+        }
+    if normalized == "treadmill":
+        return {
+            "kind": "activity",
+            "description": "Standard treadmill sessions (trainer/VirtualRun with missing GPS).",
+            "all_of": [
+                {"none_of": [{"strength_like": True}]},
+                {"treadmill": True},
+                {
+                    "any_of": [
+                        {"sport_type": ["virtualrun"]},
+                        {"strava_tags_any": ["treadmill"]},
+                        {"text_contains_any": ["treadmill"]},
+                        {"distance_miles_min": 0.25},
+                        {"moving_time_seconds_min": 600},
+                    ]
+                },
+            ],
+        }
+    if normalized == "race":
+        return {
+            "kind": "activity",
+            "description": "Strava race/workout tags or race keywords.",
+            "any_of": [
+                {"workout_type": 1},
+                {"strava_tags_any": ["race"]},
+                {"text_contains_any": [" race", "5k", "10k", "half", "marathon", "ultra"]},
+            ],
+        }
+    if normalized == "commute":
+        return {
+            "kind": "activity",
+            "description": "Strava commute-tagged activities.",
+            "any_of": [
+                {"commute": True},
+                {"strava_tags_any": ["commute"]},
+            ],
+        }
+    if normalized == "walk":
+        return {
+            "kind": "activity",
+            "description": "Outdoor Strava Walk activities with GPS and trainer disabled.",
+            "all_of": [
+                {"sport_type": ["walk"]},
+                {"has_gps": True},
+                {"trainer": False},
+                {"none_of": [{"strength_like": True}]},
+            ],
+        }
+    if normalized == "strength_training":
+        return {
+            "kind": "activity",
+            "description": "Strength workout activities from Strava or Garmin.",
+            "any_of": [
+                {"garmin_activity_type_in": ["strength", "strengthtraining", "weighttraining", "weightlifting", "strengthworkout"]},
+                {"sport_type": ["weighttraining", "weight training", "workout"]},
+                {"strength_like": True},
+            ],
+        }
+    if normalized == "trail":
+        return {
+            "kind": "activity",
+            "description": "Trail run tags or high elevation-density heuristics.",
+            "any_of": [
+                {"sport_type": ["trailrun"]},
+                {"gain_per_mile_ft_min": _settings_profile_trail_gain_per_mile_ft(settings)},
+            ],
+        }
+    if normalized == "long_run":
+        return {
+            "kind": "activity",
+            "description": "Long run workout tag or distance threshold.",
+            "any_of": [
+                {"workout_type": 2},
+                {"strava_tags_any": ["long_run"]},
+                {"distance_miles_min": _settings_profile_long_run_miles(settings)},
+            ],
+        }
+    if normalized == "pet":
+        return {
+            "kind": "activity",
+            "description": "Pet/dog keywords in activity title or notes.",
+            "text_contains_any": ["dog", "with dog", "canicross", "🐕"],
+        }
+    if normalized == "away":
+        criteria = {
+            "kind": "location",
+            "description": "Outside home geofence when GPS is available.",
+        }
+        geofence = _settings_home_geofence(settings, mode="outside")
+        if geofence is not None:
+            criteria["start_geofence"] = geofence
+        return criteria
+    if normalized == "home":
+        criteria = {
+            "kind": "location",
+            "description": "Inside home geofence when GPS is available.",
+        }
+        geofence = _settings_home_geofence(settings, mode="within")
+        if geofence is not None:
+            criteria["start_geofence"] = geofence
+        return criteria
+    return {"kind": "activity", "description": f"{normalized.title()} profile"}
+
+
+def _profile_builtin_map(settings: Settings | None = None) -> dict[str, dict[str, Any]]:
     builtins: dict[str, dict[str, Any]] = {}
     for profile in PROFILE_BUILTINS:
         profile_id = _normalize_profile_id(profile.get("profile_id"))
@@ -1406,7 +1573,7 @@ def _profile_builtin_map() -> dict[str, dict[str, Any]]:
             continue
         record = deepcopy(profile)
         record["profile_id"] = profile_id
-        record["criteria"] = deepcopy(profile.get("criteria") if isinstance(profile.get("criteria"), dict) else {})
+        record["criteria"] = deepcopy(_profile_builtin_criteria(settings, profile_id))
         record["label"] = str(profile.get("label") or profile_id.title())
         record["enabled"] = _coerce_bool(profile.get("enabled"), default=True)
         record["locked"] = _coerce_bool(profile.get("locked"), default=False)
@@ -1422,9 +1589,248 @@ def _profile_builtin_map() -> dict[str, dict[str, Any]]:
             "enabled": True,
             "locked": True,
             "priority": 0,
-            "criteria": {"kind": "fallback", "description": "Fallback profile when no enabled rule matches."},
+            "criteria": _profile_builtin_criteria(settings, DEFAULT_PROFILE_ID),
         }
     return builtins
+
+
+_PROFILE_RULE_META_KEYS = {
+    "kind",
+    "description",
+    "label",
+    "name",
+    "version",
+    "notes",
+}
+_PROFILE_RULE_STRING_LIST_KEYS = {
+    "sport_type",
+    "text_contains",
+    "text_contains_any",
+    "name_contains",
+    "name_contains_any",
+    "text_not_contains",
+    "name_not_contains",
+    "external_id_contains",
+    "device_name_contains",
+    "strava_tags_any",
+    "strava_tags_all",
+    "day_of_week_in",
+    "garmin_activity_type_in",
+}
+_PROFILE_RULE_BOOL_KEYS = {
+    "trainer",
+    "commute",
+    "has_gps",
+    "treadmill",
+    "strength_like",
+}
+_PROFILE_RULE_NUMERIC_KEYS = {
+    "distance_miles_min",
+    "distance_miles_max",
+    "moving_time_seconds_min",
+    "moving_time_seconds_max",
+    "moving_time_minutes_min",
+    "moving_time_minutes_max",
+    "gain_per_mile_ft_min",
+    "gain_per_mile_ft_max",
+    "home_distance_miles_min",
+    "home_distance_miles_max",
+}
+_PROFILE_RULE_TIME_KEYS = {
+    "time_of_day_after",
+    "time_of_day_before",
+}
+_PROFILE_RULE_COMPOUND_KEYS = {
+    "all_of",
+    "any_of",
+    "none_of",
+}
+_PROFILE_TOP_LEVEL_KEYS = {
+    "profile_id",
+    "label",
+    "priority",
+    "criteria",
+    "enabled",
+}
+
+
+def _criteria_time_value_is_valid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        return False
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return False
+    return 0 <= hour <= 23 and 0 <= minute <= 59
+
+
+def _normalize_profile_rule_string(value: Any, *, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} must be a non-empty string.")
+    return text
+
+
+def _normalize_profile_rule_string_list(value: Any, *, field: str) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ValueError(f"{field} must be a string or list of strings.")
+    normalized: list[str] = []
+    for item in items:
+        normalized.append(_normalize_profile_rule_string(item, field=field))
+    if not normalized:
+        raise ValueError(f"{field} must include at least one value.")
+    return normalized
+
+
+def _normalize_profile_rule_number(value: Any, *, field: str) -> float:
+    number = _shared_as_float(value)
+    if number is None:
+        raise ValueError(f"{field} must be numeric.")
+    return float(number)
+
+
+def _criteria_has_executable_rules(criteria: dict[str, Any] | None) -> bool:
+    if not isinstance(criteria, dict):
+        return False
+    for key, value in criteria.items():
+        if key in _PROFILE_RULE_META_KEYS:
+            continue
+        if key in _PROFILE_RULE_COMPOUND_KEYS:
+            if isinstance(value, dict):
+                if _criteria_has_executable_rules(value):
+                    return True
+                continue
+            if isinstance(value, (list, tuple)):
+                if any(_criteria_has_executable_rules(item) for item in value if isinstance(item, dict)):
+                    return True
+                continue
+        return True
+    return False
+
+
+def validate_template_profile_criteria(
+    raw_criteria: Any,
+    *,
+    require_executable: bool,
+    field: str = "criteria",
+) -> dict[str, Any]:
+    if raw_criteria is None:
+        criteria: dict[str, Any] = {}
+    elif isinstance(raw_criteria, dict):
+        criteria = raw_criteria
+    else:
+        raise ValueError(f"{field} must be an object.")
+
+    normalized: dict[str, Any] = {}
+    for key, value in criteria.items():
+        if key in _PROFILE_RULE_META_KEYS:
+            if value is None:
+                continue
+            normalized[key] = _normalize_profile_rule_string(value, field=f"{field}.{key}")
+            continue
+
+        child_field = f"{field}.{key}"
+        if key in _PROFILE_RULE_COMPOUND_KEYS:
+            if isinstance(value, dict):
+                normalized[key] = [validate_template_profile_criteria(value, require_executable=True, field=child_field)]
+                continue
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{child_field} must be a rule object or list of rule objects.")
+            clauses: list[dict[str, Any]] = []
+            for index, item in enumerate(value):
+                if not isinstance(item, dict):
+                    raise ValueError(f"{child_field}[{index}] must be an object.")
+                clauses.append(
+                    validate_template_profile_criteria(
+                        item,
+                        require_executable=True,
+                        field=f"{child_field}[{index}]",
+                    )
+                )
+            if not clauses:
+                raise ValueError(f"{child_field} must include at least one rule.")
+            normalized[key] = clauses
+            continue
+
+        if key in _PROFILE_RULE_STRING_LIST_KEYS:
+            normalized[key] = _normalize_profile_rule_string_list(value, field=child_field)
+            continue
+
+        if key in _PROFILE_RULE_BOOL_KEYS:
+            try:
+                normalized[key] = _parse_profile_import_bool(value)
+            except ValueError as exc:
+                raise ValueError(f"{child_field} must be a boolean.") from exc
+            continue
+
+        if key in _PROFILE_RULE_NUMERIC_KEYS:
+            normalized[key] = _normalize_profile_rule_number(value, field=child_field)
+            continue
+
+        if key == "workout_type":
+            try:
+                normalized[key] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{child_field} must be an integer.") from exc
+            continue
+
+        if key in _PROFILE_RULE_TIME_KEYS:
+            if not _criteria_time_value_is_valid(value):
+                raise ValueError(f"{child_field} must use HH:MM 24-hour time.")
+            normalized[key] = str(value).strip()
+            continue
+
+        if key == "start_geofence":
+            if not isinstance(value, dict):
+                raise ValueError(f"{child_field} must be an object.")
+            latitude = _shared_as_float(value.get("latitude"))
+            longitude = _shared_as_float(value.get("longitude"))
+            radius_miles = _shared_as_float(value.get("radius_miles"))
+            mode = str(value.get("mode") or "within").strip().lower()
+            if latitude is None or longitude is None:
+                raise ValueError(f"{child_field} requires latitude and longitude.")
+            if radius_miles is None or radius_miles < 0:
+                raise ValueError(f"{child_field}.radius_miles must be >= 0.")
+            if mode not in {"within", "outside"}:
+                raise ValueError(f"{child_field}.mode must be 'within' or 'outside'.")
+            normalized[key] = {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+                "radius_miles": float(radius_miles),
+                "mode": mode,
+            }
+            continue
+
+        raise ValueError(f"Unsupported criteria key: {child_field}")
+
+    if require_executable and not _criteria_has_executable_rules(normalized):
+        raise ValueError(f"{field} must include at least one executable rule.")
+    return normalized
+
+
+def _profile_invalid_record_shape(profile_id: str, *, source_path: str, load_error: str) -> dict[str, Any]:
+    normalized_id = _normalize_profile_id(profile_id) or "invalid-profile"
+    return {
+        "profile_id": normalized_id,
+        "label": normalized_id.replace("-", " ").title(),
+        "enabled": False,
+        "locked": False,
+        "priority": 0,
+        "criteria": {},
+        "invalid": True,
+        "load_error": load_error,
+        "source_path": source_path,
+        "storage_format": "yaml",
+    }
 
 
 def _profile_record_shape(record: dict[str, Any], builtin: dict[str, Any]) -> dict[str, Any]:
@@ -1461,14 +1867,23 @@ def _custom_profile_record_shape(record: dict[str, Any], profile_id: str) -> dic
     }
 
 
-def _load_template_profiles(settings: Settings) -> dict[str, Any] | None:
+def _profile_record_for_yaml(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "profile_id": str(record.get("profile_id") or DEFAULT_PROFILE_ID),
+        "label": str(record.get("label") or record.get("profile_id") or DEFAULT_PROFILE_ID.title()),
+        "priority": int(record.get("priority", 0)),
+        "criteria": deepcopy(record.get("criteria") if isinstance(record.get("criteria"), dict) else {}),
+    }
+
+
+def _load_template_profiles_from_json(settings: Settings) -> dict[str, Any] | None:
     payload = _read_json_file(_template_profiles_path(settings))
     if not isinstance(payload, dict):
         return None
     raw_profiles = payload.get("profiles")
     if not isinstance(raw_profiles, list):
         return None
-    builtins = _profile_builtin_map()
+    builtins = _profile_builtin_map(settings)
     shaped_profiles: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in raw_profiles:
@@ -1479,7 +1894,7 @@ def _load_template_profiles(settings: Settings) -> dict[str, Any] | None:
             continue
         seen.add(profile_id)
         if profile_id in builtins:
-            shaped_profiles.append(_profile_record_shape(item, builtins[profile_id]))
+            shaped_profiles.append(_profile_record_shape({"enabled": item.get("enabled")}, builtins[profile_id]))
         else:
             shaped_profiles.append(_custom_profile_record_shape(item, profile_id))
 
@@ -1500,13 +1915,151 @@ def _load_template_profiles(settings: Settings) -> dict[str, Any] | None:
     }
 
 
-def _save_template_profiles(settings: Settings, config: dict[str, Any]) -> None:
+def _load_template_profiles_from_yaml(settings: Settings) -> dict[str, Any] | None:
+    rules_dir = _profile_rules_dir(settings)
+    if not rules_dir.exists():
+        return None
+    raw_paths = sorted(
+        path
+        for path in rules_dir.glob("*.yaml")
+        if path.name != _profile_rules_state_path(settings).name
+    )
+    if not raw_paths:
+        return None
+
+    builtins = _profile_builtin_map(settings)
+    state_payload = _read_yaml_file(_profile_rules_state_path(settings)) or {}
+    state_enabled = state_payload.get("profile_enabled")
+    enabled_overrides = state_enabled if isinstance(state_enabled, dict) else {}
+    shaped_profiles: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for path in raw_paths:
+        profile_id = _normalize_profile_id(path.stem)
+        if not profile_id or profile_id in seen:
+            continue
+        seen.add(profile_id)
+        if profile_id in builtins:
+            shaped_profiles.append(
+                _profile_record_shape(
+                    {"enabled": enabled_overrides.get(profile_id, builtins[profile_id].get("enabled"))},
+                    builtins[profile_id],
+                )
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            payload = yaml.safe_load(text)
+        except (OSError, yaml.YAMLError) as exc:
+            shaped_profiles.append(
+                _profile_invalid_record_shape(
+                    profile_id,
+                    source_path=str(path),
+                    load_error=f"Invalid profile YAML: {exc}",
+                )
+            )
+            continue
+        if not isinstance(payload, dict):
+            shaped_profiles.append(
+                _profile_invalid_record_shape(
+                    profile_id,
+                    source_path=str(path),
+                    load_error="Profile YAML must be an object.",
+                )
+            )
+            continue
+        try:
+            normalized_payload = {
+                "profile_id": profile_id,
+                "label": str(payload.get("label") or profile_id.title()),
+                "enabled": _parse_profile_import_bool(enabled_overrides.get(profile_id, payload.get("enabled", True))),
+                "locked": False,
+                "priority": int(payload.get("priority", 0)),
+                "criteria": validate_template_profile_criteria(
+                    payload.get("criteria"),
+                    require_executable=profile_id != DEFAULT_PROFILE_ID,
+                    field=f"profile_rules.{profile_id}.criteria",
+                ),
+            }
+        except ValueError as exc:
+            shaped_profiles.append(
+                _profile_invalid_record_shape(
+                    profile_id,
+                    source_path=str(path),
+                    load_error=str(exc),
+                )
+            )
+            continue
+        shaped_profiles.append(_custom_profile_record_shape(normalized_payload, profile_id))
+
+    for profile_id, builtin in builtins.items():
+        if profile_id in seen:
+            continue
+        shaped_profiles.append(
+            _profile_record_shape(
+                {"enabled": enabled_overrides.get(profile_id, builtin.get("enabled"))},
+                builtin,
+            )
+        )
+
+    working = _normalize_profile_id(state_payload.get("working_profile_id"))
+    valid_ids = {profile["profile_id"] for profile in shaped_profiles if profile.get("enabled")}
+    if not working or working not in valid_ids:
+        working = DEFAULT_PROFILE_ID
+
+    return {
+        "version": PROFILE_CONFIG_VERSION,
+        "working_profile_id": working,
+        "profiles": shaped_profiles,
+    }
+
+
+def _load_template_profiles(settings: Settings) -> dict[str, Any] | None:
+    from_yaml = _load_template_profiles_from_yaml(settings)
+    if from_yaml is not None:
+        return from_yaml
+    return _load_template_profiles_from_json(settings)
+
+
+def _save_template_profiles_json_mirror(settings: Settings, config: dict[str, Any]) -> None:
     payload = {
         "version": PROFILE_CONFIG_VERSION,
         "working_profile_id": str(config.get("working_profile_id") or DEFAULT_PROFILE_ID),
         "profiles": deepcopy(config.get("profiles") if isinstance(config.get("profiles"), list) else []),
     }
     _write_json_file(_template_profiles_path(settings), payload)
+
+
+def _save_template_profiles(settings: Settings, config: dict[str, Any]) -> None:
+    profiles = deepcopy(config.get("profiles") if isinstance(config.get("profiles"), list) else [])
+    valid_ids: set[str] = set()
+    enabled_map: dict[str, bool] = {}
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = _normalize_profile_id(profile.get("profile_id"))
+        if not profile_id:
+            continue
+        valid_ids.add(profile_id)
+        enabled_map[profile_id] = _coerce_bool(profile.get("enabled"), default=True)
+        _write_yaml_file(_profile_rule_path(settings, profile_id), _profile_record_for_yaml(profile))
+
+    rules_dir = _profile_rules_dir(settings)
+    if rules_dir.exists():
+        for path in rules_dir.glob("*.yaml"):
+            if path.name == _profile_rules_state_path(settings).name:
+                continue
+            if path.stem not in valid_ids:
+                path.unlink(missing_ok=True)
+
+    _write_yaml_file(
+        _profile_rules_state_path(settings),
+        {
+            "version": PROFILE_CONFIG_VERSION,
+            "working_profile_id": str(config.get("working_profile_id") or DEFAULT_PROFILE_ID),
+            "profile_enabled": enabled_map,
+        },
+    )
+    _save_template_profiles_json_mirror(settings, config)
 
 
 def _profile_template_seed(profile_id: str) -> str:
@@ -1517,17 +2070,19 @@ def _profile_template_seed(profile_id: str) -> str:
 def _ensure_template_profiles(settings: Settings) -> dict[str, Any]:
     config = _load_template_profiles(settings)
     if config is None:
-        builtins = _profile_builtin_map()
+        builtins = _profile_builtin_map(settings)
         config = {
             "version": PROFILE_CONFIG_VERSION,
             "working_profile_id": DEFAULT_PROFILE_ID,
             "profiles": [_profile_record_shape({}, builtins[profile_id]) for profile_id in builtins],
         }
         _save_template_profiles(settings, config)
+    elif _load_template_profiles_from_yaml(settings) is None:
+        _save_template_profiles(settings, config)
 
     for profile in config["profiles"]:
         profile_id = str(profile["profile_id"])
-        if profile_id == DEFAULT_PROFILE_ID:
+        if profile_id == DEFAULT_PROFILE_ID or bool(profile.get("invalid")):
             continue
         template_path = _template_profile_template_path(settings, profile_id)
         if not template_path.exists():
@@ -1544,6 +2099,7 @@ def _ensure_template_profiles(settings: Settings) -> dict[str, Any]:
 
 def list_template_profiles(settings: Settings) -> list[dict[str, Any]]:
     config = _ensure_template_profiles(settings)
+    builtin_ids = set(_profile_builtin_map(settings).keys())
     rows: list[dict[str, Any]] = []
     for profile in config["profiles"]:
         profile_id = str(profile.get("profile_id") or DEFAULT_PROFILE_ID)
@@ -1561,6 +2117,11 @@ def list_template_profiles(settings: Settings) -> list[dict[str, Any]]:
                 "updated_at_utc": meta.get("updated_at_utc"),
                 "updated_by": meta.get("updated_by"),
                 "source": meta.get("source"),
+                "is_builtin": profile_id in builtin_ids,
+                "source_path": str(profile.get("source_path") or _profile_rule_path(settings, profile_id)),
+                "storage_format": "yaml",
+                "invalid": bool(profile.get("invalid")),
+                "load_error": str(profile.get("load_error") or ""),
             }
         )
     rows.sort(key=lambda item: (-int(item.get("priority", 0)), str(item.get("label") or "").lower()))
@@ -1627,12 +2188,11 @@ def create_template_profile(
         if not normalized_label:
             raise ValueError("label is required.")
 
-    if criteria is None:
-        normalized_criteria: dict[str, Any] = {}
-    elif isinstance(criteria, dict):
-        normalized_criteria = deepcopy(criteria)
-    else:
-        raise ValueError("criteria must be an object.")
+    normalized_criteria = validate_template_profile_criteria(
+        criteria,
+        require_executable=True,
+        field="criteria",
+    )
 
     config = _ensure_template_profiles(settings)
     config["profiles"].append(
@@ -1673,24 +2233,32 @@ def update_template_profile(
             break
     if found is None:
         raise ValueError(f"Unknown profile_id: {profile_id}")
+    is_builtin = target in _profile_builtin_map(settings)
 
     parsed_label: str | None = None
     if label is not None:
         parsed_label = str(label).strip()
         if not parsed_label:
             raise ValueError("label is required.")
-    if criteria is not None and not isinstance(criteria, dict):
-        raise ValueError("criteria must be an object.")
+    parsed_criteria: dict[str, Any] | None = None
+    if criteria is not None:
+        parsed_criteria = validate_template_profile_criteria(
+            criteria,
+            require_executable=True,
+            field="criteria",
+        )
 
     locked = bool(found.get("locked"))
+    if is_builtin and (parsed_label is not None or parsed_criteria is not None or priority is not None):
+        raise ValueError("Builtin profiles are immutable. Duplicate the profile to customize it.")
     if parsed_label is not None:
         if locked:
             raise ValueError("Default profile cannot be renamed.")
         found["label"] = parsed_label
-    if criteria is not None:
+    if parsed_criteria is not None:
         if locked:
             raise ValueError("Default profile criteria cannot be edited.")
-        found["criteria"] = deepcopy(criteria)
+        found["criteria"] = deepcopy(parsed_criteria)
     if enabled is not None:
         if locked and not bool(enabled):
             raise ValueError("Default profile cannot be disabled.")
@@ -1709,6 +2277,121 @@ def update_template_profile(
     if updated is None:
         raise ValueError(f"Unknown profile_id: {profile_id}")
     return updated
+
+
+def _parse_profile_yaml_text(yaml_text: str) -> dict[str, Any]:
+    text = str(yaml_text or "").strip()
+    if not text:
+        raise ValueError("yaml_text is required.")
+    try:
+        payload = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Profile YAML must be an object.")
+    return payload
+
+
+def parse_template_profile_yaml_document(
+    yaml_text: str,
+    *,
+    profile_id: str | None = None,
+    profile_name: str | None = None,
+) -> dict[str, Any]:
+    payload = _parse_profile_yaml_text(yaml_text)
+    extra_keys = sorted(key for key in payload.keys() if key not in _PROFILE_TOP_LEVEL_KEYS)
+    if extra_keys:
+        raise ValueError(f"Unsupported top-level profile keys: {', '.join(extra_keys)}")
+    target = _normalize_profile_id(payload.get("profile_id") or profile_id or profile_name)
+    if not target:
+        raise ValueError("profile_id is required in YAML or profile_name.")
+    label_raw = payload.get("label")
+    label = str(label_raw).strip() if isinstance(label_raw, str) and label_raw.strip() else target.title()
+    try:
+        priority = int(payload.get("priority", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("priority must be an integer.") from exc
+    if "enabled" in payload:
+        _parse_profile_import_bool(payload.get("enabled", True))
+    criteria = validate_template_profile_criteria(
+        payload.get("criteria"),
+        require_executable=target != DEFAULT_PROFILE_ID,
+        field="criteria",
+    )
+    return {
+        "profile_id": target,
+        "label": label,
+        "priority": priority,
+        "criteria": deepcopy(criteria),
+    }
+
+
+def get_template_profile_document(settings: Settings, profile_id: str) -> dict[str, Any]:
+    profile = get_template_profile(settings, profile_id)
+    if profile is None:
+        raise ValueError(f"Unknown profile_id: {profile_id}")
+    target = str(profile.get("profile_id") or DEFAULT_PROFILE_ID)
+    path = _profile_rule_path(settings, target)
+    if bool(profile.get("is_builtin")):
+        yaml_text = yaml.safe_dump(_profile_record_for_yaml(profile), sort_keys=False, allow_unicode=True)
+    elif bool(profile.get("invalid")):
+        yaml_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    else:
+        normalized_payload = _profile_record_for_yaml(profile)
+        yaml_text = yaml.safe_dump(normalized_payload, sort_keys=False, allow_unicode=True)
+        if not path.exists() or path.read_text(encoding="utf-8") != yaml_text:
+            _write_yaml_file(path, normalized_payload)
+    return {
+        "profile": profile,
+        "yaml_text": yaml_text,
+        "source_path": str(path),
+        "read_only": bool(profile.get("is_builtin")),
+        "storage_format": "yaml",
+        "invalid": bool(profile.get("invalid")),
+        "load_error": str(profile.get("load_error") or ""),
+    }
+
+
+def create_template_profile_from_yaml(
+    settings: Settings,
+    *,
+    yaml_text: str,
+    profile_name: str | None = None,
+) -> dict[str, Any]:
+    payload = parse_template_profile_yaml_document(yaml_text, profile_name=profile_name)
+    requested_id = str(payload.get("profile_id") or "")
+    created = create_template_profile(
+        settings,
+        requested_id,
+        label=str(payload.get("label") or requested_id.title()),
+        criteria=payload.get("criteria") if isinstance(payload.get("criteria"), dict) else {},
+    )
+    priority = int(payload.get("priority", 0) or 0)
+    if priority != 0:
+        created = update_template_profile(settings, requested_id, priority=priority)
+    return get_template_profile_document(settings, requested_id)
+
+
+def save_template_profile_yaml(settings: Settings, profile_id: str, *, yaml_text: str) -> dict[str, Any]:
+    existing = get_template_profile(settings, profile_id)
+    if existing is None:
+        raise ValueError(f"Unknown profile_id: {profile_id}")
+    if bool(existing.get("is_builtin")):
+        raise ValueError("Builtin profiles are read-only in the YAML workshop. Duplicate the profile to customize it.")
+
+    payload = parse_template_profile_yaml_document(yaml_text, profile_id=profile_id)
+    target = _normalize_profile_id(payload.get("profile_id") or profile_id)
+    if target != _normalize_profile_id(profile_id):
+        raise ValueError("profile_id in YAML must match the selected profile.")
+
+    update_template_profile(
+        settings,
+        target,
+        priority=int(payload.get("priority", 0) or 0),
+        label=str(payload.get("label") or target.title()),
+        criteria=payload.get("criteria") if isinstance(payload.get("criteria"), dict) else {},
+    )
+    return get_template_profile_document(settings, target)
 
 
 def export_template_profiles_bundle(
@@ -1784,6 +2467,7 @@ def import_template_profiles_bundle(
 
     imported_profile_ids: list[str] = []
     errors: list[str] = []
+    builtin_ids = set(_profile_builtin_map(settings).keys())
 
     for idx, entry in enumerate(raw_profiles):
         if not isinstance(entry, dict):
@@ -1794,8 +2478,8 @@ def import_template_profiles_bundle(
         if not profile_id:
             errors.append(f"profiles[{idx}].profile_id is required.")
             continue
-        if profile_id == DEFAULT_PROFILE_ID:
-            errors.append("default profile cannot be imported.")
+        if profile_id in builtin_ids:
+            errors.append(f"{profile_id} is builtin and cannot be imported.")
             continue
 
         label_raw = entry.get("label")
@@ -1805,12 +2489,14 @@ def import_template_profiles_bundle(
             continue
 
         criteria_raw = entry.get("criteria")
-        if criteria_raw is None:
-            criteria: dict[str, Any] = {}
-        elif isinstance(criteria_raw, dict):
-            criteria = deepcopy(criteria_raw)
-        else:
-            errors.append(f"{profile_id}.criteria must be an object.")
+        try:
+            criteria = validate_template_profile_criteria(
+                criteria_raw,
+                require_executable=True,
+                field=f"{profile_id}.criteria",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
             continue
 
         try:
@@ -1827,7 +2513,7 @@ def import_template_profiles_bundle(
 
         existing = index.get(profile_id)
         if existing is not None:
-            if bool(existing.get("locked")):
+            if bool(existing.get("locked")) or profile_id in builtin_ids:
                 errors.append(f"{profile_id} is locked and cannot be imported.")
                 continue
             existing["label"] = label
@@ -1882,6 +2568,11 @@ def _template_path_for_profile(settings: Settings, profile_id: str) -> Path:
     return _template_profile_template_path(settings, normalized)
 
 
+def _template_hash(template_text: str) -> str:
+    normalized = _normalize_template_text(template_text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _template_meta_path_for_profile(settings: Settings, profile_id: str) -> Path:
     normalized = _normalize_profile_id(profile_id) or DEFAULT_PROFILE_ID
     if normalized == DEFAULT_PROFILE_ID:
@@ -1896,7 +2587,7 @@ def _template_versions_dir_for_profile(settings: Settings, profile_id: str) -> P
     return _template_profile_versions_dir(settings, normalized)
 
 
-def _template_repository_builtin_records() -> list[dict[str, Any]]:
+def _template_repository_builtin_records(settings: Settings | None = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = [
         {
             "template_id": "builtin-default",
@@ -1930,7 +2621,7 @@ def _template_repository_builtin_records() -> list[dict[str, Any]]:
             }
         )
     profile_builtins = sorted(
-        _profile_builtin_map().values(),
+        _profile_builtin_map(settings).values(),
         key=lambda item: (
             -int(item.get("priority", 0)),
             str(item.get("label") or item.get("profile_id") or "").lower(),
@@ -2034,7 +2725,7 @@ def _new_template_repository_id(name: str, template_text: str) -> str:
 
 def list_template_repository_templates(settings: Settings) -> list[dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
-    for builtin in _template_repository_builtin_records():
+    for builtin in _template_repository_builtin_records(settings):
         records[builtin["template_id"]] = builtin
 
     repo_dir = _template_repository_dir(settings)
@@ -2061,7 +2752,7 @@ def get_template_repository_template(settings: Settings, template_id: str) -> di
     if not normalized_id:
         return None
 
-    for builtin in _template_repository_builtin_records():
+    for builtin in _template_repository_builtin_records(settings):
         if builtin["template_id"] == normalized_id:
             return deepcopy(builtin)
 
@@ -2280,6 +2971,26 @@ def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+def _read_yaml_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError):
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _write_yaml_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    text = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def _new_version_id(template_text: str) -> str:
     now = datetime.now(timezone.utc)
     digest = hashlib.sha256(template_text.encode("utf-8")).hexdigest()[:10]
@@ -2301,7 +3012,7 @@ def _load_template_metadata(settings: Settings, *, profile_id: str = DEFAULT_PRO
     data = _read_json_file(_template_meta_path_for_profile(settings, normalized_profile_id))
     if data is None:
         label = str(
-            _profile_builtin_map().get(normalized_profile_id, {}).get("label")
+            _profile_builtin_map(settings).get(normalized_profile_id, {}).get("label")
             or normalized_profile_id.title()
         )
         return _profile_template_metadata_defaults(label)
@@ -2453,12 +3164,14 @@ def get_active_template(settings: Settings, profile_id: str = DEFAULT_PROFILE_ID
     if path.exists():
         text = path.read_text(encoding="utf-8").strip()
         if text:
+            normalized_text = _normalize_template_text(text)
             return {
-                "template": _normalize_template_text(text),
+                "template": normalized_text,
                 "is_custom": True,
                 "path": str(path),
                 "profile_id": normalized_profile_id,
                 "profile_label": str(profile.get("label") or normalized_profile_id.title()) if profile else normalized_profile_id.title(),
+                "template_hash": _template_hash(normalized_text),
                 "name": metadata.get("name"),
                 "current_version": metadata.get("current_version"),
                 "updated_at_utc": metadata.get("updated_at_utc"),
@@ -2467,12 +3180,14 @@ def get_active_template(settings: Settings, profile_id: str = DEFAULT_PROFILE_ID
                 "metadata": metadata,
             }
     default_meta = _template_metadata_defaults()
+    seeded_template = _profile_template_seed(normalized_profile_id)
     return {
-        "template": _profile_template_seed(normalized_profile_id),
+        "template": seeded_template,
         "is_custom": False,
         "path": str(path),
         "profile_id": normalized_profile_id,
         "profile_label": str(profile.get("label") or normalized_profile_id.title()) if profile else normalized_profile_id.title(),
+        "template_hash": _template_hash(seeded_template),
         "name": default_meta["name"],
         "current_version": None,
         "updated_at_utc": None,
@@ -2654,6 +3369,10 @@ def render_with_active_template(
     render_result["template_path"] = active["path"]
     render_result["profile_id"] = active_profile_id
     render_result["profile_label"] = active.get("profile_label")
+    render_result["template_hash"] = active.get("template_hash")
+    render_result["template_version"] = active.get("current_version")
+    render_result["template_name"] = active.get("name")
+    render_result["template_updated_at_utc"] = active.get("updated_at_utc")
 
     if render_result["ok"]:
         render_result["fallback_used"] = False
@@ -2665,6 +3384,10 @@ def render_with_active_template(
         fallback_result["template_path"] = active["path"]
         fallback_result["profile_id"] = active_profile_id
         fallback_result["profile_label"] = active.get("profile_label")
+        fallback_result["template_hash"] = active.get("template_hash")
+        fallback_result["template_version"] = active.get("current_version")
+        fallback_result["template_name"] = active.get("name")
+        fallback_result["template_updated_at_utc"] = active.get("updated_at_utc")
         fallback_result["fallback_used"] = fallback_result["ok"]
         fallback_result["fallback_reason"] = render_result["error"]
         return fallback_result

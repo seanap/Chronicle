@@ -62,9 +62,11 @@ body.plan-page {
   width: 44px;
   z-index: 121;
   transition: left 0.22s ease;
+  display: grid;
+  gap: 8px;
 }
 
-body.plan-page.plan-pace-open .plan-pace-handles {
+body.plan-page.plan-drawer-open .plan-pace-handles {
   left: calc(var(--plan-pace-drawer-width) - 1px);
 }
 
@@ -140,6 +142,151 @@ body.plan-page.plan-pace-open .plan-pace-handles {
   font-size: 0.9rem;
 }
 
+.plan-workout-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.plan-workout-picker-shell {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+  position: relative;
+}
+
+.plan-workout-picker-toggle,
+.plan-workout-actions button,
+.plan-workout-yaml-editor,
+.plan-workout-picker-item {
+  font: inherit;
+}
+
+.plan-workout-picker-toggle {
+  border: 1px solid rgba(99, 216, 255, 0.28);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(8, 8, 8, 0.94), rgba(13, 13, 13, 0.96));
+  color: var(--dg-text);
+  min-height: 40px;
+  padding: 9px 12px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 10px 24px -18px rgba(99, 216, 255, 0.45);
+}
+
+.plan-workout-picker-toggle:focus-visible {
+  outline: none;
+  border-color: rgba(99, 216, 255, 0.72);
+  box-shadow: 0 0 0 2px rgba(99, 216, 255, 0.16);
+}
+
+.plan-workout-picker-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 60;
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid rgba(99, 216, 255, 0.32);
+  border-radius: 12px;
+  background: rgba(7, 7, 7, 0.98);
+  box-shadow: 0 16px 42px -28px #000, 0 0 20px -18px var(--plan-neon-blue);
+}
+
+.plan-workout-picker-group {
+  margin-bottom: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(10, 10, 10, 0.9);
+}
+
+.plan-workout-picker-group summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 8px 10px;
+  color: #d8f3ff;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.plan-workout-picker-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.plan-workout-picker-items {
+  display: grid;
+  gap: 4px;
+  padding: 0 6px 6px;
+}
+
+.plan-workout-picker-empty {
+  color: var(--dg-muted);
+  font-size: 0.76rem;
+  padding: 0 10px 8px;
+}
+
+.plan-workout-picker-item {
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--dg-text);
+  cursor: pointer;
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.plan-workout-picker-item strong,
+.plan-workout-picker-item span {
+  display: block;
+}
+
+.plan-workout-picker-item strong {
+  font-size: 0.8rem;
+}
+
+.plan-workout-picker-item span {
+  color: var(--dg-muted);
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  margin-top: 2px;
+}
+
+.plan-workout-picker-item:hover {
+  background: color-mix(in srgb, var(--plan-neon-blue) 16%, transparent);
+}
+
+.plan-workout-actions {
+  margin-top: 10px;
+}
+
+.plan-workout-yaml-editor {
+  width: 100%;
+  min-height: 280px;
+  resize: vertical;
+  border: 1px solid rgba(99, 216, 255, 0.18);
+  border-radius: 12px;
+  background: rgba(8, 16, 32, 0.8);
+  color: var(--dg-text);
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  margin-top: 6px;
+  padding: 10px 12px;
+}
+
+.plan-workout-yaml-editor:focus {
+  outline: none;
+  border-color: rgba(99, 216, 255, 0.68);
+  box-shadow: 0 0 0 2px rgba(99, 216, 255, 0.14);
+}
+
 .plan-pace-inline {
   display: grid;
   gap: 6px;
@@ -204,6 +351,62 @@ body.plan-page.plan-pace-open .plan-pace-handles {
   margin-top: 8px;
   display: grid;
   gap: 6px;
+}
+
+.plan-pace-family-list {
+  margin-top: 8px;
+  display: grid;
+  gap: 10px;
+}
+
+.plan-pace-family {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(11, 11, 11, 0.82);
+  padding: 8px 9px;
+}
+
+.plan-pace-family-title {
+  margin: 0 0 7px;
+  color: #ffe6c7;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.plan-pace-family-item {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(110px, 1fr) auto;
+  padding: 3px 0;
+}
+
+.plan-pace-family-item-label {
+  color: var(--dg-muted);
+  font-size: 0.77rem;
+  font-weight: 600;
+}
+
+.plan-pace-family-item-value {
+  color: #f8fbff;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.plan-pace-family-meta {
+  margin: 0 0 3px;
+  color: color-mix(in srgb, var(--dg-muted) 84%, #ffd6a5 16%);
+  font-size: 0.71rem;
+  line-height: 1.35;
+}
+
+.plan-pace-family-note {
+  margin: 2px 0 0;
+  color: color-mix(in srgb, var(--dg-muted) 88%, #f4d7ac 12%);
+  font-size: 0.72rem;
+  line-height: 1.4;
 }
 
 .plan-pace-item {
@@ -694,6 +897,134 @@ body.plan-page.plan-pace-open .plan-pace-handles {
   text-align: center;
 }
 
+.plan-action-status {
+  margin: 8px 2px 0;
+  min-height: 1.25em;
+  color: var(--dg-muted);
+  font-size: 0.8rem;
+}
+
+.plan-action-status[data-tone="ok"] {
+  color: #c8ffe3;
+}
+
+.plan-action-status[data-tone="error"] {
+  color: #ffd2e7;
+}
+
+.plan-action-status[data-tone="neutral"] {
+  color: var(--dg-muted);
+}
+
+.plan-date-cell-wrap {
+  display: inline-flex;
+  justify-content: center;
+  position: relative;
+}
+
+.plan-row-actions {
+  display: inline-flex;
+  position: relative;
+}
+
+.plan-row-actions-trigger {
+  align-items: center;
+  background: rgba(10, 10, 10, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: #f4fbff;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 0.86rem;
+  height: 18px;
+  justify-content: center;
+  line-height: 1;
+  opacity: 0;
+  padding: 0;
+  transform: translateY(1px);
+  transition: opacity 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+  visibility: hidden;
+  width: 18px;
+}
+
+.plan-row-actions-trigger:focus-visible {
+  opacity: 1;
+  visibility: visible;
+  border-color: color-mix(in srgb, var(--plan-neon-blue) 60%, transparent);
+  box-shadow: 0 0 14px -12px var(--plan-neon-blue);
+  outline: none;
+}
+
+.plan-table tbody tr:hover .plan-row-actions-trigger,
+.plan-table tbody tr:focus-within .plan-row-actions-trigger,
+.plan-row-actions[data-open="1"] .plan-row-actions-trigger {
+  opacity: 1;
+  visibility: visible;
+}
+
+.plan-row-actions[data-open="1"] .plan-row-actions-trigger {
+  border-color: color-mix(in srgb, var(--plan-neon-blue) 60%, transparent);
+  box-shadow: 0 0 14px -12px var(--plan-neon-blue);
+}
+
+.plan-row-actions-menu {
+  background: rgba(8, 8, 8, 0.98);
+  border: 1px solid color-mix(in srgb, var(--plan-neon-blue) 42%, transparent);
+  border-radius: 10px;
+  box-shadow: 0 12px 30px -24px #000, 0 0 20px -16px var(--plan-neon-blue);
+  left: calc(100% + 6px);
+  min-width: 190px;
+  padding: 4px;
+  position: absolute;
+  right: auto;
+  top: -4px;
+  z-index: 60;
+}
+
+.plan-row-actions-menu[hidden] {
+  display: none;
+}
+
+.plan-row-actions-item {
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: #dcecff;
+  cursor: pointer;
+  display: block;
+  font-size: 0.76rem;
+  line-height: 1.35;
+  padding: 7px 9px;
+  text-align: left;
+  width: 100%;
+}
+
+.plan-row-actions-item:hover,
+.plan-row-actions-item:focus-visible {
+  background: color-mix(in srgb, var(--plan-neon-blue) 18%, transparent);
+  color: #f4fbff;
+  outline: none;
+}
+
+.plan-row-actions-item[disabled] {
+  color: rgba(220, 236, 255, 0.42);
+  cursor: not-allowed;
+}
+
+.plan-row-actions-item[disabled]:hover,
+.plan-row-actions-item[disabled]:focus-visible {
+  background: transparent;
+  color: rgba(220, 236, 255, 0.42);
+}
+
+.plan-row-actions-note {
+  margin: 2px 8px 5px;
+  color: var(--dg-muted);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  text-align: left;
+}
+
 .plan-table tbody td[class^="metric-"],
 .plan-table tbody td[class*=" metric-"] {
   font-variant-numeric: tabular-nums;
@@ -702,9 +1033,10 @@ body.plan-page.plan-pace-open .plan-pace-handles {
 }
 
 .done-cell {
-  min-width: var(--plan-col-done);
-  padding: 0 6px 0 2px;
+  min-width: 42px;
+  padding: 0 6px 0 4px;
   position: relative;
+  white-space: nowrap;
   vertical-align: middle !important;
 }
 
@@ -712,12 +1044,12 @@ body.plan-page.plan-pace-open .plan-pace-handles {
   aspect-ratio: 1 / 1;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  display: block;
+  display: inline-block;
   height: 11px;
-  position: absolute;
-  right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
+  margin-left: 6px;
+  position: static;
+  transform: none;
+  vertical-align: middle;
   width: 11px;
 }
 
@@ -941,6 +1273,21 @@ body.plan-page.plan-pace-open .plan-pace-handles {
   display: none;
 }
 
+.plan-workout-menu-group + .plan-workout-menu-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.plan-workout-menu-heading {
+  color: var(--plan-neon-blue);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 4px 7px;
+  text-transform: uppercase;
+}
+
 .plan-workout-menu-item {
   background: transparent;
   border: 0;
@@ -952,7 +1299,7 @@ body.plan-page.plan-pace-open .plan-pace-handles {
   line-height: 1.3;
   padding: 5px 7px;
   text-align: left;
-  white-space: nowrap;
+  white-space: normal;
   width: 100%;
 }
 

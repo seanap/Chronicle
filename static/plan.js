@@ -2,6 +2,7 @@
   const bodyEl = document.getElementById("planTableBody");
   const metaEl = document.getElementById("planTopMeta");
   const summaryEl = document.getElementById("planSummary");
+  const planActionStatusEl = document.getElementById("planActionStatus");
   const tableWrapEl = document.querySelector(".plan-table-wrap");
   const centerDateEl = document.getElementById("planCenterDate");
   const centerBtn = document.getElementById("planCenterBtn");
@@ -11,8 +12,11 @@
   const seedBtn = document.getElementById("planSeedBtn");
   const settingsStatusEl = document.getElementById("planSettingsStatus");
   const paceDrawer = document.getElementById("planPaceDrawer");
+  const workoutDrawer = document.getElementById("planWorkoutDrawer");
   const paceDrawerTab = document.getElementById("planPaceDrawerTab");
+  const workoutDrawerTab = document.getElementById("planWorkoutDrawerTab");
   const paceDrawerClose = document.getElementById("planPaceDrawerClose");
+  const workoutDrawerClose = document.getElementById("planWorkoutDrawerClose");
   const paceBackdrop = document.getElementById("planPaceBackdrop");
   const paceStatusEl = document.getElementById("planPaceStatus");
   const marathonGoalInputEl = document.getElementById("planMarathonGoalInput");
@@ -24,14 +28,40 @@
   const paceSetDerivedBtn = document.getElementById("planPaceSetDerivedBtn");
   const raceEquivalencyListEl = document.getElementById("planRaceEquivalencyList");
   const trainingPacesListEl = document.getElementById("planTrainingPacesList");
+  const paceFamilyListEl = document.getElementById("planPaceFamilyList");
+  const workoutWorkshopSection = document.getElementById("planWorkoutWorkshopSection");
+  const workoutWorkshopMetaEl = document.getElementById("planWorkoutWorkshopMeta");
+  const workoutDocumentMetaEl = document.getElementById("planWorkoutDocumentMeta");
+  const workoutPickerToggleEl = document.getElementById("planWorkoutPickerToggle");
+  const workoutPickerPanelEl = document.getElementById("planWorkoutPickerPanel");
+  const workoutNewBtn = document.getElementById("planWorkoutNewBtn");
+  const workoutSaveBtn = document.getElementById("planWorkoutSaveBtn");
+  const workoutReloadBtn = document.getElementById("planWorkoutReloadBtn");
+  const workoutYamlEditorEl = document.getElementById("planWorkoutYamlEditor");
+  const workoutStatusEl = document.getElementById("planWorkoutStatus");
 
   let runTypeOptions = [""];
+  let workoutCatalog = [];
+  let workoutCatalogById = new Map();
+  let selectedWorkoutId = "";
+  let workoutDraftMode = false;
+  let workoutDraftName = "";
+  let workoutYamlText = "";
+  let workoutYamlLoadedText = "";
+  let workoutYamlSourcePath = "";
+  let workoutYamlLoadError = "";
+  let workoutPickerOpen = false;
+  let activeDrawer = "";
   let pendingFocus = { date: "", field: "distance" };
   let rowsByDate = new Map();
   let renderedRows = [];
   let loadedStartDate = "";
   let loadedEndDate = "";
   let loadedTimezone = "";
+  let metricContextByDate = new Map();
+  let metricContextStartDate = "";
+  let metricContextEndDate = "";
+  let metricContextToday = "";
   let refreshFromDate = "";
   let refreshTimer = null;
   let refreshInFlight = false;
@@ -61,23 +91,20 @@
     "1": "LT1",
     "2": "LT2",
   };
-
-  const workoutPresetOptions = [
-    "2E + 3x2T w/2:00 jog + 2E (Hansons strength)",
-    "2E + 6x800m @5k w/400m jog + 2E (Hansons speed)",
-    "1.5E + 10x400m @5k w/400m jog + 1.5E (Hansons speed)",
-    "2E + 20T + 2E (Jack Daniels tempo)",
-    "2E + 5x1k @I w/3:00 jog + 2E (Jack Daniels interval)",
-    "2E + 6x200m @R w/200m jog + 2E (Jack Daniels repetition)",
-    "15WU + 4x4min @LT2 w/3min easy + 10CD (Norwegian 4x4)",
-    "15WU + 5x4min @LT2 w/2min easy + 10CD (Norwegian variant)",
-    "15WU + 3x8min @LT1 w/2min easy + 10CD (Norwegian threshold)",
+  const longRunTypeKeys = new Set(["longroad", "longmoderate", "longtrail", "race"]);
+  const workoutLibraryOrder = [
+    "Hansons",
+    "Pfitz",
+    "Higdon",
+    "JD",
+    "Galloway",
+    "Strength",
+    "Stretching",
+    "Run Type",
+    "Other",
   ];
-  const workoutPresetMenuWidthCh = Math.max(
-    44,
-    workoutPresetOptions.reduce((max, item) => Math.max(max, String(item || "").length), 0) + 3,
-  );
   let workoutMenuHandlersBound = false;
+  let rowActionMenuHandlersBound = false;
 
   function normalizeRunType(value) {
     return String(value || "").trim().toLowerCase();
@@ -92,6 +119,10 @@
     workoutMenuHandlersBound = true;
     document.addEventListener("click", (event) => {
       const target = event.target;
+      if (target instanceof Element && target.closest(".plan-workout-picker-shell")) {
+        return;
+      }
+      closeWorkoutPickerPanel();
       if (target instanceof Element && target.closest(".plan-workout-field")) return;
       for (const field of document.querySelectorAll(".plan-workout-field")) {
         field.dataset.open = "0";
@@ -109,8 +140,389 @@
     menu.hidden = !nextOpen;
   }
 
+  function setPlanActionStatus(message, tone) {
+    if (!(planActionStatusEl instanceof HTMLElement)) return;
+    planActionStatusEl.textContent = String(message || "");
+    if (tone === "ok" || tone === "error") {
+      planActionStatusEl.dataset.tone = tone;
+      return;
+    }
+    planActionStatusEl.dataset.tone = "neutral";
+  }
+
+  function closeRowActionMenus(exceptEl) {
+    for (const shell of document.querySelectorAll(".plan-row-actions")) {
+      if (!(shell instanceof HTMLElement)) continue;
+      if (exceptEl instanceof HTMLElement && shell === exceptEl) continue;
+      shell.dataset.open = "0";
+      const trigger = shell.querySelector(".plan-row-actions-trigger");
+      if (trigger instanceof HTMLElement) {
+        trigger.setAttribute("aria-expanded", "false");
+      }
+      const menu = shell.querySelector(".plan-row-actions-menu");
+      if (menu instanceof HTMLElement) {
+        menu.hidden = true;
+      }
+    }
+  }
+
+  function bindRowActionMenuHandlers() {
+    if (rowActionMenuHandlersBound) return;
+    rowActionMenuHandlersBound = true;
+    document.addEventListener("click", (event) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".plan-row-actions")) {
+        return;
+      }
+      closeRowActionMenus();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      const openMenu = document.querySelector('.plan-row-actions[data-open="1"]');
+      if (!(openMenu instanceof HTMLElement)) return;
+      const trigger = openMenu.querySelector(".plan-row-actions-trigger");
+      closeRowActionMenus();
+      if (trigger instanceof HTMLElement) {
+        trigger.focus();
+      }
+    });
+  }
+
+  function normalizeWorkoutId(value) {
+    return String(value || "").trim().toLowerCase();
+  }
+
+  function rowAttachedWorkoutCodes(row) {
+    const codes = [];
+    const seen = new Set();
+    for (const session of Array.isArray(row && row.planned_sessions_detail) ? row.planned_sessions_detail : []) {
+      if (!session || typeof session !== "object") continue;
+      const sessionRunType = String(session.run_type || (row && row.run_type) || "").trim();
+      if (!isSosRunType(sessionRunType)) continue;
+      const workoutCode = String(session.workout_code || session.planned_workout || "").trim();
+      if (!workoutCode) continue;
+      const normalized = workoutCode.toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      codes.push(workoutCode);
+    }
+    return codes;
+  }
+
+  function attachedWorkoutWindowSummary(startDate, spanDays) {
+    const summary = {
+      dayCount: 0,
+      workoutCount: 0,
+    };
+    if (!isIsoDateString(startDate)) return summary;
+    for (let offset = 0; offset < Math.max(1, Number(spanDays) || 1); offset += 1) {
+      const dateKey = addDaysIso(startDate, offset);
+      const row = rowsByDate.get(dateKey);
+      const codes = rowAttachedWorkoutCodes(row);
+      if (codes.length <= 0) continue;
+      summary.dayCount += 1;
+      summary.workoutCount += codes.length;
+    }
+    return summary;
+  }
+
+  function workoutYamlDirty() {
+    return String(workoutYamlText || "") !== String(workoutYamlLoadedText || "");
+  }
+
+  function currentWorkoutRecord() {
+    if (workoutDraftMode) return null;
+    return workoutCatalogById.get(normalizeWorkoutId(selectedWorkoutId)) || null;
+  }
+
+  function setWorkoutStatus(message, tone) {
+    if (!workoutStatusEl) return;
+    workoutStatusEl.textContent = String(message || "");
+    if (tone === "ok" || tone === "error") {
+      workoutStatusEl.dataset.tone = tone;
+      return;
+    }
+    workoutStatusEl.dataset.tone = "neutral";
+  }
+
+  function workoutDisplayLabel(workout) {
+    if (!workout || typeof workout !== "object") return "Select workout";
+    return String(workout.label || workout.title || workout.workout_id || "Select workout");
+  }
+
+  function workoutGroupRank(library) {
+    const key = String(library || "");
+    const index = workoutLibraryOrder.findIndex((item) => item.toLowerCase() === key.toLowerCase());
+    return index >= 0 ? index : workoutLibraryOrder.length;
+  }
+
+  function workoutsGroupedByLibrary(options) {
+    const includeInvalid = Boolean(options && options.includeInvalid);
+    const groups = new Map();
+    for (const workout of Array.isArray(workoutCatalog) ? workoutCatalog : []) {
+      if (!includeInvalid && workout && workout.invalid) continue;
+      const library = String(workout && workout.library ? workout.library : "Other");
+      if (!groups.has(library)) groups.set(library, []);
+      groups.get(library).push(workout);
+    }
+    return Array.from(groups.entries()).sort((a, b) => {
+      const rankDiff = workoutGroupRank(a[0]) - workoutGroupRank(b[0]);
+      if (rankDiff !== 0) return rankDiff;
+      return String(a[0]).localeCompare(String(b[0]));
+    });
+  }
+
+  function renderWorkoutPickerPanel() {
+    if (!(workoutPickerPanelEl instanceof HTMLElement)) return;
+    workoutPickerPanelEl.textContent = "";
+    const groups = workoutsGroupedByLibrary({ includeInvalid: true });
+    if (groups.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "plan-workout-picker-empty";
+      empty.textContent = "No workouts yet. Create one with New.";
+      workoutPickerPanelEl.appendChild(empty);
+      return;
+    }
+    for (const [library, workouts] of groups) {
+      const details = document.createElement("details");
+      details.className = "plan-workout-picker-group";
+      details.open = true;
+      const summary = document.createElement("summary");
+      summary.textContent = `${library} (${workouts.length})`;
+      details.appendChild(summary);
+      if (!Array.isArray(workouts) || workouts.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "plan-workout-picker-empty";
+        empty.textContent = "No workouts yet.";
+        details.appendChild(empty);
+      } else {
+        const items = document.createElement("div");
+        items.className = "plan-workout-picker-items";
+        workouts.forEach((workout) => {
+          const item = document.createElement("button");
+          item.type = "button";
+          item.className = "plan-workout-picker-item";
+          item.dataset.workoutId = String(workout.workout_id || "");
+          const shorthandText = workout && workout.invalid
+            ? `Invalid YAML | ${String(workout.load_error || "repair required")}`
+            : String(workout.shorthand || "");
+          item.innerHTML = `<strong>${workoutDisplayLabel(workout)}</strong><span>${shorthandText}</span>`;
+          item.addEventListener("click", async () => {
+            if (workoutYamlDirty()) {
+              const ok = window.confirm("Discard unsaved workout YAML changes?");
+              if (!ok) return;
+            }
+            workoutDraftMode = false;
+            workoutDraftName = "";
+            selectedWorkoutId = String(workout.workout_id || "");
+            closeWorkoutPickerPanel();
+            await loadSelectedWorkoutDocument({ force: true });
+          });
+          items.appendChild(item);
+        });
+        details.appendChild(items);
+      }
+      workoutPickerPanelEl.appendChild(details);
+    }
+  }
+
+  function closeWorkoutPickerPanel() {
+    workoutPickerOpen = false;
+    if (workoutPickerToggleEl instanceof HTMLElement) {
+      workoutPickerToggleEl.setAttribute("aria-expanded", "false");
+    }
+    if (workoutPickerPanelEl instanceof HTMLElement) {
+      workoutPickerPanelEl.hidden = true;
+    }
+  }
+
+  function openWorkoutPickerPanel() {
+    workoutPickerOpen = true;
+    renderWorkoutPickerPanel();
+    if (workoutPickerToggleEl instanceof HTMLElement) {
+      workoutPickerToggleEl.setAttribute("aria-expanded", "true");
+    }
+    if (workoutPickerPanelEl instanceof HTMLElement) {
+      workoutPickerPanelEl.hidden = false;
+    }
+  }
+
+  function buildWorkoutYamlSkeleton(name) {
+    const workoutId = String(name || "")
+      .trim()
+      .replace(/"/g, '\\"') || "New Workout";
+    return [
+      "library: Run Type",
+      "run_type_default: SOS",
+      "workout:",
+      "  type: Run",
+      `  "${workoutId}":`,
+      "    - warmup: lap @H(z2)",
+      "    - repeat(4):",
+      "        - run: 4min @P($strength)",
+      "        - recovery: 4min",
+      "    - cooldown: 2mi @H(z2)",
+      "tags:",
+      "  - workout",
+      "notes: ''",
+      "",
+    ].join("\n");
+  }
+
+  function applyWorkoutDocument(documentPayload) {
+    const workout = documentPayload && typeof documentPayload === "object" ? (documentPayload.workout || {}) : {};
+    selectedWorkoutId = String(workout.workout_id || selectedWorkoutId || "");
+    workoutYamlText = String(documentPayload && documentPayload.yaml_text ? documentPayload.yaml_text : "");
+    workoutYamlLoadedText = String(documentPayload && documentPayload.yaml_text ? documentPayload.yaml_text : "");
+    workoutYamlSourcePath = String(documentPayload && documentPayload.source_path ? documentPayload.source_path : "");
+    workoutYamlLoadError = String(documentPayload && documentPayload.load_error ? documentPayload.load_error : "");
+    workoutDraftMode = false;
+    workoutDraftName = String(workout.label || workoutDraftName || "");
+  }
+
+  async function loadSelectedWorkoutDocument({ force = false } = {}) {
+    const workoutId = normalizeWorkoutId(selectedWorkoutId);
+    if (!workoutId || workoutDraftMode) {
+      renderWorkoutWorkshop();
+      return true;
+    }
+    if (!force && workoutYamlDirty()) {
+      const ok = window.confirm("Discard unsaved workout YAML changes?");
+      if (!ok) return false;
+    }
+    const response = await fetch(`/plan/workouts/${encodeURIComponent(workoutId)}`, { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || payload.status !== "ok") {
+      setWorkoutStatus(String((payload && payload.error) || "Failed to load workout YAML"), "error");
+      return false;
+    }
+    applyWorkoutDocument(payload);
+    renderWorkoutWorkshop();
+    return true;
+  }
+
+  async function loadWorkoutCatalog({ reloadDocument = true } = {}) {
+    if (workoutWorkshopMetaEl) {
+      workoutWorkshopMetaEl.textContent = "Loading workouts...";
+    }
+    const response = await fetch("/plan/workouts", { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || payload.status !== "ok") {
+      setWorkoutStatus(String((payload && payload.error) || "Failed to load workouts"), "error");
+      return false;
+    }
+    workoutCatalog = Array.isArray(payload.workouts) ? payload.workouts : [];
+    workoutCatalogById = new Map(
+      workoutCatalog.map((item) => [normalizeWorkoutId(item && item.workout_id), item]),
+    );
+    if (!workoutDraftMode) {
+      const selectedExists = workoutCatalogById.has(normalizeWorkoutId(selectedWorkoutId));
+      if (!selectedExists) {
+        selectedWorkoutId = workoutCatalog.length > 0 ? String(workoutCatalog[0].workout_id || "") : "";
+      }
+    }
+    renderWorkoutWorkshop();
+    if (reloadDocument && !workoutDraftMode && selectedWorkoutId) {
+      await loadSelectedWorkoutDocument({ force: true });
+    }
+    return true;
+  }
+
+  function renderWorkoutWorkshop() {
+    const selectedWorkout = currentWorkoutRecord();
+    if (workoutWorkshopMetaEl) {
+      workoutWorkshopMetaEl.textContent = `Workouts: ${workoutCatalog.length} | grouped by library`;
+    }
+    if (workoutPickerToggleEl) {
+      workoutPickerToggleEl.textContent = workoutDraftMode
+        ? `Draft | ${workoutDraftName || selectedWorkoutId || "New Workout"}`
+        : workoutDisplayLabel(selectedWorkout);
+    }
+    if (workoutYamlEditorEl && workoutYamlEditorEl.value !== workoutYamlText) {
+      workoutYamlEditorEl.value = workoutYamlText;
+    }
+    if (workoutDocumentMetaEl) {
+      const bits = [];
+      if (selectedWorkout) {
+        bits.push(String(selectedWorkout.library || "Other"));
+        bits.push(String(selectedWorkout.run_type_default || "SOS"));
+      }
+      if (workoutYamlSourcePath) bits.push(workoutYamlSourcePath);
+      if (workoutYamlDirty()) bits.push("Unsaved changes");
+      workoutDocumentMetaEl.textContent = bits.join(" | ") || "No workout selected.";
+    }
+    if (workoutStatusEl) {
+      workoutStatusEl.textContent = workoutYamlLoadError || workoutStatusEl.textContent || "Create a workout, save it as YAML, then reuse it from SOS rows.";
+    }
+    if (workoutSaveBtn) {
+      workoutSaveBtn.disabled = !String(workoutYamlText || "").trim();
+    }
+    renderWorkoutPickerPanel();
+  }
+
+  async function createNewWorkoutDraft() {
+    if (workoutYamlDirty()) {
+      const ok = window.confirm("Discard unsaved workout YAML changes and start a new workout?");
+      if (!ok) return;
+    }
+    const rawName = window.prompt("New workout name");
+    const name = String(rawName || "").trim();
+    if (!name) return;
+    workoutDraftMode = true;
+    workoutDraftName = name;
+    selectedWorkoutId = name
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "new-workout";
+    workoutYamlText = buildWorkoutYamlSkeleton(name);
+    workoutYamlLoadedText = "";
+    workoutYamlSourcePath = "Not saved yet";
+    workoutYamlLoadError = "";
+    renderWorkoutWorkshop();
+    setWorkoutStatus(`Drafting workout: ${name}`, "ok");
+  }
+
+  async function saveCurrentWorkoutYaml() {
+    const yamlText = String(workoutYamlText || "");
+    if (!yamlText.trim()) {
+      setWorkoutStatus("Workout YAML is empty", "error");
+      return false;
+    }
+    const isNew = Boolean(workoutDraftMode);
+    const endpoint = isNew ? "/plan/workouts" : `/plan/workouts/${encodeURIComponent(selectedWorkoutId)}`;
+    const method = isNew ? "POST" : "PUT";
+    const response = await fetch(endpoint, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workout_name: workoutDraftName || selectedWorkoutId,
+        yaml_text: yamlText,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.status !== "ok") {
+      setWorkoutStatus(String((payload && payload.error) || "Failed to save workout"), "error");
+      return false;
+    }
+    applyWorkoutDocument(payload);
+    await loadWorkoutCatalog({ reloadDocument: false });
+    renderWorkoutWorkshop();
+    setWorkoutStatus(`Workout saved: ${workoutDraftName || selectedWorkoutId}`, "ok");
+    return true;
+  }
+
   function asNumber(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
+  }
+
+  function numberOrZero(value) {
+    const direct = asNumber(value);
+    if (direct !== null) return direct;
+    if (typeof value === "string") {
+      const parsed = Number.parseFloat(value.trim());
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
   }
 
   function formatMiles(value, decimals) {
@@ -173,6 +585,32 @@
     if (rounded <= 1.4) return "metric-good";
     if (rounded <= 1.8) return "metric-caution";
     return "metric-hard";
+  }
+
+  function ratioOrNull(numerator, denominator) {
+    const parsedNumerator = asNumber(numerator);
+    const parsedDenominator = asNumber(denominator);
+    if (parsedNumerator === null || parsedDenominator === null || parsedDenominator <= 0) {
+      return null;
+    }
+    return parsedNumerator / parsedDenominator;
+  }
+
+  function t7BandFromValue(value) {
+    const parsed = asNumber(value);
+    if (parsed === null) return "neutral";
+    if (parsed < 0.90) return "easy";
+    if (parsed <= 1.20) return "good";
+    if (parsed <= 1.35) return "caution";
+    return "hard";
+  }
+
+  function sessionSpikeBandFromValue(value) {
+    const parsed = asNumber(value);
+    if (parsed === null) return "neutral";
+    if (parsed <= 1.10) return "good";
+    if (parsed <= 1.30) return "caution";
+    return "hard";
   }
 
   const DISTANCE_COLOR_STOPS = [
@@ -296,15 +734,42 @@
     paceStatusEl.dataset.tone = "neutral";
   }
 
-  function setPaceDrawerOpen(nextOpen) {
-    if (!(paceDrawer instanceof HTMLElement)) return;
-    paceDrawer.classList.toggle("open", !!nextOpen);
-    paceDrawer.setAttribute("aria-hidden", nextOpen ? "false" : "true");
-    document.body.classList.toggle("plan-pace-open", !!nextOpen);
-    if (paceBackdrop instanceof HTMLElement) {
-      paceBackdrop.classList.toggle("open", !!nextOpen);
-      paceBackdrop.setAttribute("aria-hidden", nextOpen ? "false" : "true");
+  function setActiveDrawer(nextDrawer) {
+    activeDrawer = nextDrawer === "pace" || nextDrawer === "workout" ? nextDrawer : "";
+    const paceOpen = activeDrawer === "pace";
+    const workoutOpen = activeDrawer === "workout";
+    if (paceDrawer instanceof HTMLElement) {
+      paceDrawer.classList.toggle("open", paceOpen);
+      paceDrawer.setAttribute("aria-hidden", paceOpen ? "false" : "true");
     }
+    if (workoutDrawer instanceof HTMLElement) {
+      workoutDrawer.classList.toggle("open", workoutOpen);
+      workoutDrawer.setAttribute("aria-hidden", workoutOpen ? "false" : "true");
+    }
+    document.body.classList.toggle("plan-drawer-open", Boolean(activeDrawer));
+    if (paceBackdrop instanceof HTMLElement) {
+      paceBackdrop.classList.toggle("open", Boolean(activeDrawer));
+      paceBackdrop.setAttribute("aria-hidden", activeDrawer ? "false" : "true");
+    }
+    if (activeDrawer !== "workout") {
+      closeWorkoutPickerPanel();
+    }
+  }
+
+  function scrollDrawerSectionIntoView(sectionEl) {
+    if (!(sectionEl instanceof HTMLElement)) return;
+    sectionEl.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  async function openPlanDrawer(section) {
+    if (section === "workout") {
+      setActiveDrawer("workout");
+      await loadWorkoutCatalog();
+      scrollDrawerSectionIntoView(workoutWorkshopSection);
+      return;
+    }
+    setActiveDrawer("pace");
+    scrollDrawerSectionIntoView(raceEquivalencyListEl);
   }
 
   function paceSetButtonBusy(buttonEl, isBusy, busyLabel) {
@@ -340,6 +805,64 @@
     for (const row of Array.isArray(rows) ? rows : []) {
       if (!row || typeof row !== "object") continue;
       targetEl.appendChild(makePaceItem(row.label, row.time || row.pace));
+    }
+  }
+
+  function renderPaceFamilies(targetEl, families) {
+    if (!(targetEl instanceof HTMLElement)) return;
+    targetEl.textContent = "";
+    for (const family of Array.isArray(families) ? families : []) {
+      if (!family || typeof family !== "object") continue;
+      const section = document.createElement("section");
+      section.className = "plan-pace-family";
+
+      const heading = document.createElement("h4");
+      heading.className = "plan-pace-family-title";
+      heading.textContent = String(family.label || "--");
+      section.appendChild(heading);
+
+      const items = Array.isArray(family.items) ? family.items : [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const row = document.createElement("div");
+        row.className = "plan-pace-family-item";
+
+        const label = document.createElement("span");
+        label.className = "plan-pace-family-item-label";
+        label.textContent = String(item.label || "--");
+
+        const value = document.createElement("span");
+        value.className = "plan-pace-family-item-value";
+        value.textContent = String(item.display || item.default_pace || "--");
+
+        row.appendChild(label);
+        row.appendChild(value);
+        section.appendChild(row);
+
+        const metaBits = [];
+        if (item.canonical_label) {
+          metaBits.push(String(item.canonical_label));
+        }
+        if (item.preferred_token) {
+          metaBits.push(`use $${String(item.preferred_token || "").replace(/^\$/, "")}`);
+        }
+        if (metaBits.length > 0) {
+          const meta = document.createElement("p");
+          meta.className = "plan-pace-family-meta";
+          meta.textContent = metaBits.join(" | ");
+          section.appendChild(meta);
+        }
+
+        const noteText = String(item.note || "").trim();
+        if (noteText) {
+          const note = document.createElement("p");
+          note.className = "plan-pace-family-note";
+          note.textContent = noteText;
+          section.appendChild(note);
+        }
+      }
+
+      targetEl.appendChild(section);
     }
   }
 
@@ -397,6 +920,7 @@
       ? payload.goal_training
       : {};
     renderPaceGrid(trainingPacesListEl, goalTraining.paces);
+    renderPaceFamilies(paceFamilyListEl, goalTraining.plan_families);
   }
 
   async function loadPaceWorkshop() {
@@ -413,6 +937,7 @@
       setPaceStatus("", "neutral");
     } catch (err) {
       setDistanceOptions([]);
+      renderPaceFamilies(paceFamilyListEl, []);
       setPaceStatus(String(err && err.message ? err.message : "Failed to load pace workshop"), "error");
     }
   }
@@ -468,6 +993,7 @@
       renderPaceGrid(raceEquivalencyListEl, payload.race_equivalency);
       const trainingBlock = payload.training && typeof payload.training === "object" ? payload.training : {};
       renderPaceGrid(trainingPacesListEl, trainingBlock.paces);
+      renderPaceFamilies(paceFamilyListEl, trainingBlock.plan_families);
       if (paceSetDerivedBtn instanceof HTMLButtonElement) {
         paceSetDerivedBtn.disabled = !paceDerivedGoal;
       }
@@ -534,6 +1060,350 @@
     const monthStart = new Date(parsed.getTime());
     monthStart.setUTCDate(1);
     return formatIsoDate(monthStart);
+  }
+
+  function prevMonthKeyForDate(value) {
+    const parsed = parseIsoDate(value);
+    if (!parsed) return "";
+    const year = parsed.getUTCFullYear();
+    const month = parsed.getUTCMonth();
+    const prevYear = month === 0 ? year - 1 : year;
+    const prevMonth = month === 0 ? 11 : month - 1;
+    return `${prevYear}-${String(prevMonth + 1).padStart(2, "0")}`;
+  }
+
+  function sumDays(dayValues, endingDate, days) {
+    const parsed = parseIsoDate(endingDate);
+    if (!parsed) return 0;
+    let total = 0;
+    for (let offset = 0; offset < Number(days || 0); offset += 1) {
+      const dayKey = formatIsoDate(new Date(parsed.getTime() - (offset * 86400000)));
+      total += Number(dayValues.get(dayKey) || 0);
+    }
+    return total;
+  }
+
+  function maxDays(dayValues, endingDate, days) {
+    const parsed = parseIsoDate(endingDate);
+    if (!parsed) return 0;
+    let maxValue = 0;
+    for (let offset = 0; offset < Number(days || 0); offset += 1) {
+      const dayKey = formatIsoDate(new Date(parsed.getTime() - (offset * 86400000)));
+      const value = Number(dayValues.get(dayKey) || 0);
+      if (value > maxValue) {
+        maxValue = value;
+      }
+    }
+    return maxValue;
+  }
+
+  function normalizedRunTypeKey(value) {
+    return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  function normalizeMetricContextDay(day) {
+    if (!day || typeof day !== "object") return null;
+    const dateKey = String(day.date || "").trim();
+    if (!isIsoDateString(dateKey)) return null;
+    return {
+      date: dateKey,
+      planned_miles: numberOrZero(day.planned_miles),
+      actual_miles: numberOrZero(day.actual_miles),
+      run_type: String(day.run_type || "").trim(),
+    };
+  }
+
+  function applyMetricContextPayload(payload, options = {}) {
+    const { append = false } = options;
+    const rawContext = payload && typeof payload === "object" ? payload.metric_context : null;
+    if (!rawContext || !Array.isArray(rawContext.days)) {
+      if (!append) {
+        metricContextByDate = new Map();
+        metricContextStartDate = "";
+        metricContextEndDate = "";
+        metricContextToday = String((payload && payload.today) || "");
+      }
+      return false;
+    }
+
+    const next = append ? new Map(metricContextByDate) : new Map();
+    for (const rawDay of rawContext.days) {
+      const normalized = normalizeMetricContextDay(rawDay);
+      if (!normalized) continue;
+      next.set(normalized.date, normalized);
+    }
+    metricContextByDate = next;
+    metricContextStartDate = String(rawContext.start_date || metricContextStartDate || "");
+    metricContextEndDate = String(rawContext.end_date || metricContextEndDate || "");
+    metricContextToday = String((payload && payload.today) || metricContextToday || "");
+    return metricContextByDate.size > 0;
+  }
+
+  function updateMetricContextDay(dateLocal, plannedMiles, actualMiles, runType) {
+    const dateKey = String(dateLocal || "").trim();
+    if (!isIsoDateString(dateKey)) return null;
+    const next = {
+      date: dateKey,
+      planned_miles: numberOrZero(plannedMiles),
+      actual_miles: numberOrZero(actualMiles),
+      run_type: String(runType || "").trim(),
+    };
+    metricContextByDate.set(dateKey, next);
+    if (!isIsoDateString(metricContextStartDate) || dateKey < metricContextStartDate) {
+      metricContextStartDate = dateKey;
+    }
+    if (!isIsoDateString(metricContextEndDate) || dateKey > metricContextEndDate) {
+      metricContextEndDate = dateKey;
+    }
+    return next;
+  }
+
+  function metricContextEffectiveMiles(dayKey, plannedMiles, actualMiles) {
+    const planned = numberOrZero(plannedMiles);
+    const actual = numberOrZero(actualMiles);
+    if (isIsoDateString(metricContextToday) && isIsoDateString(dayKey) && dayKey <= metricContextToday) {
+      return actual > 0 ? actual : planned;
+    }
+    return planned;
+  }
+
+  function recomputeDerivedPlanMetrics() {
+    if (!(metricContextByDate instanceof Map) || metricContextByDate.size === 0 || !Array.isArray(renderedRows) || renderedRows.length === 0) {
+      return false;
+    }
+
+    const sortedDateKeys = Array.from(metricContextByDate.keys())
+      .filter((item) => isIsoDateString(item))
+      .sort((a, b) => a.localeCompare(b));
+    if (sortedDateKeys.length === 0) {
+      return false;
+    }
+
+    const effectiveMiles = new Map();
+    const plannedMiles = new Map();
+    const actualMiles = new Map();
+    const runTypeByDate = new Map();
+    const weekTotals = new Map();
+    const weekPlannedTotals = new Map();
+    const weekActualTotals = new Map();
+    const weekLongMiles = new Map();
+    const monthTotals = new Map();
+    const monthPlannedTotals = new Map();
+    const monthActualTotals = new Map();
+
+    for (const dateKey of sortedDateKeys) {
+      const day = metricContextByDate.get(dateKey);
+      if (!day) continue;
+      const planned = numberOrZero(day.planned_miles);
+      const actual = numberOrZero(day.actual_miles);
+      const effective = metricContextEffectiveMiles(dateKey, planned, actual);
+      plannedMiles.set(dateKey, planned);
+      actualMiles.set(dateKey, actual);
+      effectiveMiles.set(dateKey, effective);
+      runTypeByDate.set(dateKey, String(day.run_type || ""));
+    }
+
+    for (const dateKey of sortedDateKeys) {
+      const weekKey = weekStartIso(dateKey);
+      if (weekKey && !weekTotals.has(weekKey)) {
+        let weekTotal = 0;
+        let weekPlanned = 0;
+        let weekActual = 0;
+        let weekLong = 0;
+        for (let idx = 0; idx < 7; idx += 1) {
+          const cursor = addDaysIso(weekKey, idx);
+          const effective = Number(effectiveMiles.get(cursor) || 0);
+          const planned = Number(plannedMiles.get(cursor) || 0);
+          const actual = Number(actualMiles.get(cursor) || 0);
+          weekTotal += effective;
+          weekPlanned += planned;
+          weekActual += actual;
+          if (longRunTypeKeys.has(normalizedRunTypeKey(runTypeByDate.get(cursor)))) {
+            weekLong = Math.max(weekLong, effective);
+          }
+        }
+        if (weekLong <= 0) {
+          for (let idx = 0; idx < 7; idx += 1) {
+            const cursor = addDaysIso(weekKey, idx);
+            weekLong = Math.max(weekLong, Number(effectiveMiles.get(cursor) || 0));
+          }
+        }
+        weekTotals.set(weekKey, weekTotal);
+        weekPlannedTotals.set(weekKey, weekPlanned);
+        weekActualTotals.set(weekKey, weekActual);
+        weekLongMiles.set(weekKey, weekLong);
+      }
+
+      const monthKey = dateKey.slice(0, 7);
+      if (!monthTotals.has(monthKey)) {
+        let monthTotal = 0;
+        let monthPlanned = 0;
+        let monthActual = 0;
+        let cursor = monthStartIso(dateKey);
+        while (cursor && cursor.slice(0, 7) === monthKey) {
+          monthTotal += Number(effectiveMiles.get(cursor) || 0);
+          monthPlanned += Number(plannedMiles.get(cursor) || 0);
+          monthActual += Number(actualMiles.get(cursor) || 0);
+          cursor = addDaysIso(cursor, 1);
+        }
+        monthTotals.set(monthKey, monthTotal);
+        monthPlannedTotals.set(monthKey, monthPlanned);
+        monthActualTotals.set(monthKey, monthActual);
+      }
+    }
+
+    for (const row of renderedRows) {
+      if (!row || !isIsoDateString(row.date)) continue;
+      const dateKey = row.date;
+      const weekKey = weekStartIso(dateKey);
+      const prevWeekKey = addDaysIso(weekKey, -7);
+      const monthKey = dateKey.slice(0, 7);
+      const prevMonthKey = prevMonthKeyForDate(dateKey);
+      const effective = Number(effectiveMiles.get(dateKey) || 0);
+      const planned = Number(plannedMiles.get(dateKey) || 0);
+      const actual = Number(actualMiles.get(dateKey) || 0);
+      const weekTotal = Number(weekTotals.get(weekKey) || 0);
+      const weekPlanned = Number(weekPlannedTotals.get(weekKey) || 0);
+      const weekActual = Number(weekActualTotals.get(weekKey) || 0);
+      const prevWeekTotal = Number(weekTotals.get(prevWeekKey) || 0);
+      const monthTotal = Number(monthTotals.get(monthKey) || 0);
+      const monthPlanned = Number(monthPlannedTotals.get(monthKey) || 0);
+      const monthActual = Number(monthActualTotals.get(monthKey) || 0);
+      const prevMonthTotal = Number(monthTotals.get(prevMonthKey) || 0);
+      const wowChange = prevWeekTotal > 0 ? ((weekTotal - prevWeekTotal) / prevWeekTotal) : null;
+      const momChange = prevMonthTotal > 0 ? ((monthTotal - prevMonthTotal) / prevMonthTotal) : null;
+      const longPct = weekTotal > 0 ? (Number(weekLongMiles.get(weekKey) || 0) / weekTotal) : null;
+      const t7 = sumDays(effectiveMiles, dateKey, 7);
+      const t7Planned = sumDays(plannedMiles, dateKey, 7);
+      const t7Actual = sumDays(actualMiles, dateKey, 7);
+      const t30 = sumDays(effectiveMiles, dateKey, 30);
+      const t30Planned = sumDays(plannedMiles, dateKey, 30);
+      const t30Actual = sumDays(actualMiles, dateKey, 30);
+      const avg30 = t30 / 30;
+      const miT30Ratio = avg30 > 0 ? (effective / avg30) : null;
+      const prevT7 = sumDays(effectiveMiles, addDaysIso(dateKey, -7), 7);
+      const prevT30 = sumDays(effectiveMiles, addDaysIso(dateKey, -30), 30);
+      const t7P7Ratio = prevT7 > 0 ? (t7 / prevT7) : null;
+      const t30P30Ratio = prevT30 > 0 ? (t30 / prevT30) : null;
+      const longest30dBefore = maxDays(effectiveMiles, addDaysIso(dateKey, -1), 30);
+      const sessionSpikeRatio = longest30dBefore > 0 ? (effective / longest30dBefore) : null;
+
+      row.run_type = String(runTypeByDate.get(dateKey) || row.run_type || "");
+      row.actual_miles = actual;
+      row.effective_miles = effective;
+      row.day_delta = actual - planned;
+      row.weekly_total = weekTotal;
+      row.weekly_planned_total = weekPlanned;
+      row.weekly_actual_total = weekActual;
+      row.weekly_adherence_ratio = ratioOrNull(weekActual, weekPlanned);
+      row.wow_change = wowChange;
+      row.long_pct = longPct;
+      row.monthly_total = monthTotal;
+      row.monthly_planned_total = monthPlanned;
+      row.monthly_actual_total = monthActual;
+      row.monthly_adherence_ratio = ratioOrNull(monthActual, monthPlanned);
+      row.mom_change = momChange;
+      row.t7_miles = t7;
+      row.t7_planned_miles = t7Planned;
+      row.t7_actual_miles = t7Actual;
+      row.t7_adherence_ratio = ratioOrNull(t7Actual, t7Planned);
+      row.t30_miles = t30;
+      row.t30_planned_miles = t30Planned;
+      row.t30_actual_miles = t30Actual;
+      row.t30_adherence_ratio = ratioOrNull(t30Actual, t30Planned);
+      row.avg30_miles_per_day = avg30;
+      row.mi_t30_ratio = miT30Ratio;
+      row.t7_p7_ratio = t7P7Ratio;
+      row.t30_p30_ratio = t30P30Ratio;
+      row.session_spike_ratio = sessionSpikeRatio;
+      row.bands = {
+        ...(row.bands && typeof row.bands === "object" ? row.bands : {}),
+        wow_change: wowBandFromValue(wowChange).replace("metric-", ""),
+        long_pct: metricBandClass(longPct === null ? "neutral" : (
+          longPct < 0.20 ? "easy" : longPct <= 0.30 ? "good" : longPct <= 0.35 ? "caution" : "hard"
+        )).replace("metric-", ""),
+        mi_t30_ratio: miT30BandFromValue(miT30Ratio).replace("metric-", ""),
+        t7_p7_ratio: t7BandFromValue(t7P7Ratio),
+        t30_p30_ratio: t7BandFromValue(t30P30Ratio),
+        session_spike_ratio: sessionSpikeBandFromValue(sessionSpikeRatio),
+      };
+    }
+    return true;
+  }
+
+  function updateMetricCell(cell, text, className) {
+    if (!(cell instanceof HTMLElement)) return;
+    cell.textContent = text;
+    if (className) {
+      cell.className = className;
+    }
+  }
+
+  function syncRenderedMetricCells() {
+    for (const row of renderedRows) {
+      if (!row || !isIsoDateString(row.date)) continue;
+      const tr = bodyEl.querySelector(`tr[data-date="${row.date}"]`);
+      if (!(tr instanceof HTMLTableRowElement)) continue;
+      updateMetricCell(
+        tr.querySelector(".metric-t7"),
+        formatMiles(row && row.t7_miles, 1),
+        "metric-neutral metric-t7",
+      );
+      updateMetricCell(
+        tr.querySelector(".metric-t7-ratio"),
+        formatRatio(row && row.t7_p7_ratio, 1),
+        `${metricBandClass(row && row.bands && row.bands.t7_p7_ratio)} metric-t7-ratio`,
+      );
+      updateMetricCell(
+        tr.querySelector(".metric-t30"),
+        formatMiles(row && row.t30_miles, 1),
+        "metric-neutral metric-t30",
+      );
+      updateMetricCell(
+        tr.querySelector(".metric-t30-ratio"),
+        formatRatio(row && row.t30_p30_ratio, 1),
+        `${metricBandClass(row && row.bands && row.bands.t30_p30_ratio)} metric-t30-ratio`,
+      );
+      updateMetricCell(
+        tr.querySelector(".metric-avg30"),
+        formatRatio(row && row.avg30_miles_per_day, 2),
+        "metric-neutral metric-avg30",
+      );
+      updateMetricCell(
+        tr.querySelector(".metric-mi-t30"),
+        formatRatio(row && row.mi_t30_ratio, 1),
+        `${miT30BandFromValue(row && row.mi_t30_ratio)} metric-mi-t30`,
+      );
+      if (row && row.show_week_metrics) {
+        updateMetricCell(
+          tr.querySelector(".metric-week"),
+          formatMiles(row && row.weekly_total, 1),
+          "metric-week metric-week-block metric-block-center metric-week-joined",
+        );
+        updateMetricCell(
+          tr.querySelector(".metric-wow-block"),
+          formatPct(row && row.wow_change),
+          `${wowBandFromValue(row && row.wow_change)} metric-wow-block metric-block-center metric-week-joined`,
+        );
+        updateMetricCell(
+          tr.querySelector(".metric-long-block"),
+          formatPct(row && row.long_pct),
+          `${metricBandClass(row && row.bands && row.bands.long_pct)} metric-long-block metric-block-center metric-week-joined`,
+        );
+      }
+      if (row && row.show_month_metrics) {
+        updateMetricCell(
+          tr.querySelector(".metric-month"),
+          formatMiles(row && row.monthly_total, 1),
+          "metric-month metric-month-block metric-block-bottom",
+        );
+        updateMetricCell(
+          tr.querySelector(".metric-mom-block"),
+          formatPct(row && row.mom_change),
+          `${wowBandFromValue(row && row.mom_change)} metric-mom-block metric-block-bottom`,
+        );
+      }
+    }
   }
 
   function overlapStartForDate(anchorDate, floorDate = "") {
@@ -728,6 +1598,10 @@
       if (runType) {
         item.run_type = runType;
       }
+      const workoutCode = String(session.workout_code || "").trim();
+      if (workoutCode) {
+        item.workout_code = workoutCode;
+      }
       if (plannedWorkout) {
         item.planned_workout = plannedWorkout;
       }
@@ -745,6 +1619,7 @@
       normalized.push({
         planned_miles: Number(planned.toFixed(3)),
         run_type: String(session.run_type || "").trim(),
+        workout_code: String(session.workout_code || "").trim(),
         planned_workout: String(session.planned_workout || session.workout_code || "").trim(),
       });
     }
@@ -765,7 +1640,7 @@
       planned_miles: item.planned_miles,
       run_type: item.run_type,
       planned_workout: item.planned_workout,
-      workout_code: item.planned_workout,
+      workout_code: item.workout_code,
     }));
     const plannedTotal = normalizedSessions.reduce((sum, item) => sum + Number(item.planned_miles || 0), 0);
     row.run_type = String(runType || row.run_type || "");
@@ -776,6 +1651,16 @@
     const actualMiles = asNumber(row.actual_miles) || 0;
     row.day_delta = actualMiles - Number(row.planned_miles || 0);
     rowsByDate.set(dateLocal, row);
+    updateMetricContextDay(dateLocal, row.planned_miles, actualMiles, row.run_type);
+    const centerDate = isIsoDateString(centerDateEl && centerDateEl.value) ? centerDateEl.value : "";
+    if (recomputeDerivedPlanMetrics()) {
+      syncRenderedMetricCells();
+      if (centerDate) {
+        setSummaryForDate(centerDate);
+      }
+    } else if (centerDate && centerDate === dateLocal) {
+      updateLocalDaySummaryCard(row);
+    }
   }
 
   function queuePlanBackgroundRefresh(anchorDate) {
@@ -824,13 +1709,16 @@
     refreshFromDate = "";
     refreshInFlight = true;
     try {
-      await loadPlanRange({
+      const refreshed = await loadPlanRange({
         startDate: loadedStartDate,
         endDate: loadedEndDate,
         centerDateOverride: centerDateEl.value,
         append: false,
         suppressPendingFocus: true,
       });
+      if (!refreshed) {
+        return;
+      }
       if (tableWrapEl) {
         tableWrapEl.scrollTop = prevScrollTop;
         tableWrapEl.scrollLeft = prevScrollLeft;
@@ -869,6 +1757,9 @@
       const fallbackWorkout = runTypeSelect.dataset
         ? String(runTypeSelect.dataset.plannedWorkout || fallbackSession.planned_workout || "")
         : String(fallbackSession.planned_workout || "");
+      const fallbackWorkoutCode = runTypeSelect.dataset
+        ? String(runTypeSelect.dataset.workoutCode || fallbackSession.workout_code || "")
+        : String(fallbackSession.workout_code || "");
       const workoutValue = workoutInput && typeof workoutInput.value === "string"
         ? workoutInput.value
         : fallbackWorkout;
@@ -881,6 +1772,7 @@
           ? runTypeSelect.value
           : String(fallbackSession.run_type || ""),
         planned_workout: workoutValue,
+        workout_code: fallbackWorkoutCode,
       };
     });
     return serializeSessionsForApi(raw);
@@ -903,6 +1795,7 @@
         `.plan-session-workout[data-date="${dateLocal}"][data-session-index="${sessionIndex}"]`,
       );
       const fallbackWorkout = runTypeSelect && runTypeSelect.dataset ? String(runTypeSelect.dataset.plannedWorkout || "") : "";
+      const fallbackWorkoutCode = runTypeSelect && runTypeSelect.dataset ? String(runTypeSelect.dataset.workoutCode || "") : "";
       const workoutValue = workoutInput && typeof workoutInput.value === "string"
         ? workoutInput.value
         : fallbackWorkout;
@@ -913,6 +1806,7 @@
         planned_miles: distanceInput && typeof distanceInput.value === "string" ? distanceInput.value : "",
         run_type: runTypeSelect && typeof runTypeSelect.value === "string" ? runTypeSelect.value : "",
         planned_workout: workoutValue,
+        workout_code: fallbackWorkoutCode,
       };
     });
     return serializeSessionsForApi(raw);
@@ -1217,6 +2111,7 @@
     select.dataset.date = row.date;
     select.dataset.sessionIndex = String(sessionIndex);
     select.dataset.plannedWorkout = String(session && (session.planned_workout || session.workout_code) ? (session.planned_workout || session.workout_code) : "");
+    select.dataset.workoutCode = String(session && session.workout_code ? session.workout_code : "");
     for (const optionValue of runTypeOptions) {
       const option = document.createElement("option");
       option.value = optionValue;
@@ -1242,33 +2137,44 @@
     input.placeholder = "Workout shorthand";
     input.title = "Workout shorthand for SOS session. Press Enter to save.";
     input.value = String((session && (session.planned_workout || session.workout_code)) || runTypeSelect.dataset.plannedWorkout || "");
+    if (session && session.workout_code) {
+      runTypeSelect.dataset.workoutCode = String(session.workout_code || "");
+    }
     runTypeSelect.dataset.plannedWorkout = input.value;
 
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "plan-workout-toggle";
-    toggle.setAttribute("aria-label", "Show workout presets");
-    toggle.title = "Show workout presets";
+    toggle.setAttribute("aria-label", "Show workout library");
+    toggle.title = "Show workout library";
     toggle.textContent = "▾";
 
     const menu = document.createElement("div");
     menu.className = "plan-workout-menu";
     menu.hidden = true;
-    menu.style.setProperty("--plan-workout-menu-width-ch", String(workoutPresetMenuWidthCh));
-
-    for (const optionValue of workoutPresetOptions) {
-      const option = document.createElement("button");
-      option.type = "button";
-      option.className = "plan-workout-menu-item";
-      option.textContent = optionValue;
-      option.title = optionValue;
-      option.addEventListener("click", () => {
-        input.value = optionValue;
-        runTypeSelect.dataset.plannedWorkout = String(optionValue || "");
-        setWorkoutMenuOpen(field, menu, false);
-        saveSessionPayload(row, index, rows, row.date, undefined, { preserveFocus: true });
-      });
-      menu.appendChild(option);
+    for (const [library, workouts] of workoutsGroupedByLibrary()) {
+      const group = document.createElement("div");
+      group.className = "plan-workout-menu-group";
+      const heading = document.createElement("div");
+      heading.className = "plan-workout-menu-heading";
+      heading.textContent = library;
+      group.appendChild(heading);
+      for (const workout of workouts) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "plan-workout-menu-item";
+        option.textContent = `${workoutDisplayLabel(workout)} | ${String(workout.shorthand || "")}`;
+        option.title = `${workoutDisplayLabel(workout)} | ${String(workout.shorthand || "")}`;
+        option.addEventListener("click", () => {
+          input.value = String(workout.shorthand || "");
+          runTypeSelect.dataset.plannedWorkout = String(workout.shorthand || "");
+          runTypeSelect.dataset.workoutCode = String(workout.workout_id || "");
+          setWorkoutMenuOpen(field, menu, false);
+          saveSessionPayload(row, index, rows, row.date, undefined, { preserveFocus: true });
+        });
+        group.appendChild(option);
+      }
+      menu.appendChild(group);
     }
 
     toggle.addEventListener("click", (event) => {
@@ -1289,6 +2195,12 @@
 
     input.addEventListener("input", () => {
       runTypeSelect.dataset.plannedWorkout = String(input.value || "");
+      if (!String(input.value || "").trim()) {
+        runTypeSelect.dataset.workoutCode = "";
+      }
+      if (String(input.value || "").trim() !== String(session && session.planned_workout ? session.planned_workout : "").trim()) {
+        // Keep the original workout id until the server derives or resolves the edited shorthand.
+      }
     });
     input.addEventListener("change", () => {
       runTypeSelect.dataset.plannedWorkout = String(input.value || "");
@@ -1410,6 +2322,137 @@
     return editor;
   }
 
+  async function sendRowToGarmin(dateLocal) {
+    const dateKey = String(dateLocal || "").trim();
+    if (!isIsoDateString(dateKey)) return;
+    setPlanActionStatus(`Sending ${dateKey} to Garmin...`, "neutral");
+    try {
+      const response = await fetch(`/plan/day/${encodeURIComponent(dateKey)}/garmin-sync/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload || !payload.status || payload.status === "error") {
+        throw new Error(String((payload && payload.error) || "Failed to send workout to Garmin"));
+      }
+      const summary = payload.summary && typeof payload.summary === "object" ? payload.summary : {};
+      const succeeded = Number(summary.succeeded_count || 0);
+      const failed = Number(summary.failed_count || 0);
+      const requested = Number(summary.requested_count || 0);
+      const message = failed > 0
+        ? `Garmin send partial for ${dateKey}: ${succeeded}/${requested} succeeded, ${failed} failed.`
+        : `Garmin send complete for ${dateKey}: ${succeeded} workout${succeeded === 1 ? "" : "s"} scheduled.`;
+      setPlanActionStatus(message, failed > 0 ? "error" : "ok");
+    } catch (err) {
+      setPlanActionStatus(String(err && err.message ? err.message : "Failed to send workout to Garmin"), "error");
+    }
+  }
+
+  async function sendWeekToGarmin(dateLocal) {
+    const dateKey = String(dateLocal || "").trim();
+    if (!isIsoDateString(dateKey)) return;
+    setPlanActionStatus(`Sending ${dateKey} + next 6 days to Garmin...`, "neutral");
+    try {
+      const response = await fetch(`/plan/day/${encodeURIComponent(dateKey)}/garmin-sync/send-window`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ span_days: 7 }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload || !payload.status || payload.status === "error") {
+        throw new Error(String((payload && payload.error) || "Failed to send 7-day Garmin window"));
+      }
+      const summary = payload.summary && typeof payload.summary === "object" ? payload.summary : {};
+      const succeeded = Number(summary.succeeded_count || 0);
+      const failed = Number(summary.failed_count || 0);
+      const skipped = Number(summary.skipped_day_count || 0);
+      const requested = Number(summary.requested_count || 0);
+      const message = failed > 0
+        ? `Garmin 7-day send partial: ${succeeded}/${requested} workouts scheduled, ${failed} failed, ${skipped} day${skipped === 1 ? "" : "s"} skipped.`
+        : `Garmin 7-day send complete: ${succeeded} workout${succeeded === 1 ? "" : "s"} scheduled across ${Math.max(0, 7 - skipped)} day${Math.max(0, 7 - skipped) === 1 ? "" : "s"}.`;
+      setPlanActionStatus(message, failed > 0 ? "error" : "ok");
+    } catch (err) {
+      setPlanActionStatus(String(err && err.message ? err.message : "Failed to send 7-day Garmin window"), "error");
+    }
+  }
+
+  function buildRowActions(row) {
+    const dateKey = String(row && row.date ? row.date : "");
+    const workoutCodes = rowAttachedWorkoutCodes(row);
+    const sevenDaySummary = attachedWorkoutWindowSummary(dateKey, 7);
+    const shell = document.createElement("div");
+    shell.className = "plan-row-actions";
+    shell.dataset.open = "0";
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "plan-row-actions-trigger";
+    trigger.setAttribute("aria-label", `Open row actions for ${dateKey}`);
+    trigger.setAttribute("aria-haspopup", "menu");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.textContent = "⋮";
+
+    const menu = document.createElement("div");
+    menu.className = "plan-row-actions-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", `Plan row actions for ${dateKey}`);
+    menu.hidden = true;
+
+    const sendDay = document.createElement("button");
+    sendDay.type = "button";
+    sendDay.className = "plan-row-actions-item";
+    sendDay.setAttribute("role", "menuitem");
+    sendDay.textContent = workoutCodes.length > 1
+      ? `Send to Garmin (${workoutCodes.length} workouts)`
+      : "Send to Garmin";
+    sendDay.disabled = workoutCodes.length <= 0;
+    sendDay.addEventListener("click", async () => {
+      closeRowActionMenus();
+      await sendRowToGarmin(dateKey);
+    });
+    menu.appendChild(sendDay);
+
+    const sendWeek = document.createElement("button");
+    sendWeek.type = "button";
+    sendWeek.className = "plan-row-actions-item";
+    sendWeek.setAttribute("role", "menuitem");
+    sendWeek.textContent = `Send 7 days to Garmin (${sevenDaySummary.workoutCount})`;
+    sendWeek.disabled = sevenDaySummary.workoutCount <= 0;
+    sendWeek.addEventListener("click", async () => {
+      closeRowActionMenus();
+      await sendWeekToGarmin(dateKey);
+    });
+    menu.appendChild(sendWeek);
+
+    const note = document.createElement("p");
+    note.className = "plan-row-actions-note";
+    note.textContent = workoutCodes.length > 0
+      ? `${workoutCodes.length} attached workout${workoutCodes.length === 1 ? "" : "s"} on this day.`
+      : "No attached SOS workouts on this day.";
+    menu.appendChild(note);
+
+    trigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const nextOpen = shell.dataset.open !== "1";
+      closeRowActionMenus(shell);
+      shell.dataset.open = nextOpen ? "1" : "0";
+      menu.hidden = !nextOpen;
+      trigger.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+      if (nextOpen) {
+        const firstEnabledAction = menu.querySelector(".plan-row-actions-item:not([disabled])");
+        if (firstEnabledAction instanceof HTMLElement) {
+          firstEnabledAction.focus();
+        }
+      }
+    });
+
+    shell.appendChild(trigger);
+    shell.appendChild(menu);
+    return shell;
+  }
+
   async function renderRows(rows) {
     bodyEl.textContent = "";
     rowsByDate = new Map();
@@ -1469,16 +2512,20 @@
             ? "Planned run without detected activity."
             : "Future/today pending activity."
       );
+      doneTd.appendChild(buildRowActions(row));
       doneTd.appendChild(doneChip);
       tr.appendChild(doneTd);
 
       const dateTd = document.createElement("td");
       dateTd.className = "date-cell";
+      const dateWrap = document.createElement("div");
+      dateWrap.className = "plan-date-cell-wrap";
       const dateMain = document.createElement("span");
       dateMain.className = "plan-date-main";
       dateMain.textContent = formatDisplayDate(row && row.date);
       dateMain.title = String((row && row.date) || "--");
-      dateTd.appendChild(dateMain);
+      dateWrap.appendChild(dateMain);
+      dateTd.appendChild(dateWrap);
       tr.appendChild(dateTd);
 
       const distanceTd = document.createElement("td");
@@ -1549,12 +2596,12 @@
         tr.appendChild(momTd);
       }
 
-      tr.appendChild(makeCell(formatMiles(row && row.t7_miles, 1), "metric-neutral"));
-      tr.appendChild(makeCell(formatRatio(row && row.t7_p7_ratio, 1), metricBandClass(row && row.bands && row.bands.t7_p7_ratio)));
-      tr.appendChild(makeCell(formatMiles(row && row.t30_miles, 1), "metric-neutral"));
-      tr.appendChild(makeCell(formatRatio(row && row.t30_p30_ratio, 1), metricBandClass(row && row.bands && row.bands.t30_p30_ratio)));
-      tr.appendChild(makeCell(formatRatio(row && row.avg30_miles_per_day, 2), "metric-neutral"));
-      tr.appendChild(makeCell(formatRatio(row && row.mi_t30_ratio, 1), miT30BandFromValue(row && row.mi_t30_ratio)));
+      tr.appendChild(makeCell(formatMiles(row && row.t7_miles, 1), "metric-neutral metric-t7"));
+      tr.appendChild(makeCell(formatRatio(row && row.t7_p7_ratio, 1), `${metricBandClass(row && row.bands && row.bands.t7_p7_ratio)} metric-t7-ratio`));
+      tr.appendChild(makeCell(formatMiles(row && row.t30_miles, 1), "metric-neutral metric-t30"));
+      tr.appendChild(makeCell(formatRatio(row && row.t30_p30_ratio, 1), `${metricBandClass(row && row.bands && row.bands.t30_p30_ratio)} metric-t30-ratio`));
+      tr.appendChild(makeCell(formatRatio(row && row.avg30_miles_per_day, 2), "metric-neutral metric-avg30"));
+      tr.appendChild(makeCell(formatRatio(row && row.mi_t30_ratio, 1), `${miT30BandFromValue(row && row.mi_t30_ratio)} metric-mi-t30`));
 
       chunkFragment.appendChild(tr);
       chunkCount += 1;
@@ -1639,26 +2686,31 @@
     const summary = payload.summary;
     const cards = [
       {
+        key: "day",
         label: "Day Plan vs Actual",
         value: `${formatMiles(summary.day_planned, 1)} / ${formatMiles(summary.day_actual, 1)}`,
         detail: `Δ ${formatSigned(summary.day_delta, 1)}`,
       },
       {
+        key: "t7",
         label: "Trailing 7d Plan vs Actual",
         value: `${formatMiles(summary.t7_planned, 1)} / ${formatMiles(summary.t7_actual, 1)}`,
         detail: `Δ ${formatSigned(summary.t7_delta, 1)} | ${formatPercentRatio(summary.t7_adherence_ratio)}`,
       },
       {
+        key: "t30",
         label: "Trailing 30d Plan vs Actual",
         value: `${formatMiles(summary.t30_planned, 1)} / ${formatMiles(summary.t30_actual, 1)}`,
         detail: `Δ ${formatSigned(summary.t30_delta, 1)} | ${formatPercentRatio(summary.t30_adherence_ratio)}`,
       },
       {
+        key: "week",
         label: "Week Plan vs Actual",
         value: `${formatMiles(summary.week_planned, 1)} / ${formatMiles(summary.week_actual, 1)}`,
         detail: `Δ ${formatSigned(summary.week_delta, 1)} | ${formatPercentRatio(summary.week_adherence_ratio)}`,
       },
       {
+        key: "month",
         label: "Month Plan vs Actual",
         value: `${formatMiles(summary.month_planned, 1)} / ${formatMiles(summary.month_actual, 1)}`,
         detail: `Δ ${formatSigned(summary.month_delta, 1)} | ${formatPercentRatio(summary.month_adherence_ratio)}`,
@@ -1668,6 +2720,7 @@
     for (const card of cards) {
       const item = document.createElement("div");
       item.className = "plan-summary-card";
+      item.dataset.summaryKey = String(card.key || "");
       const label = document.createElement("span");
       label.className = "plan-summary-label";
       label.textContent = card.label;
@@ -1681,6 +2734,23 @@
       item.appendChild(value);
       item.appendChild(detail);
       summaryEl.appendChild(item);
+    }
+  }
+
+  function updateLocalDaySummaryCard(row) {
+    if (!summaryEl || !row || typeof row !== "object") return;
+    const dayCard = summaryEl.querySelector('.plan-summary-card[data-summary-key="day"]');
+    if (!(dayCard instanceof HTMLElement)) {
+      setSummaryForDate(String(row.date || ""));
+      return;
+    }
+    const valueEl = dayCard.querySelector(".plan-summary-value");
+    const detailEl = dayCard.querySelector(".plan-summary-detail");
+    if (valueEl instanceof HTMLElement) {
+      valueEl.textContent = `${formatMiles(row.planned_miles, 1)} / ${formatMiles(row.actual_miles, 1)}`;
+    }
+    if (detailEl instanceof HTMLElement) {
+      detailEl.textContent = `Δ ${formatSigned(row.day_delta, 1)}`;
     }
   }
 
@@ -1810,13 +2880,17 @@
       const response = await fetch(`/plan/data.json?${params.toString()}`, { cache: "no-store" });
       const payload = await response.json();
       if (requestVersion !== loadRequestVersion) {
-        return;
+        return false;
       }
       if (!response.ok || payload.status !== "ok") {
         const error = String((payload && payload.error) || "Failed to load plan data");
+        if (renderedRows.length > 0 && bodyEl.childElementCount > 0) {
+          if (metaEl) metaEl.textContent = `Refresh failed. Keeping current grid. ${error}`;
+          return false;
+        }
         bodyEl.innerHTML = `<tr><td colspan="15">${error}</td></tr>`;
         if (metaEl) metaEl.textContent = "Load failed";
-        return;
+        return false;
       }
       if (typeof payload.center_date === "string" && payload.center_date) {
         centerDateEl.value = payload.center_date;
@@ -1838,6 +2912,7 @@
       setSummary(payload);
       const incomingRows = Array.isArray(payload.rows) ? payload.rows : [];
       renderedRows = append ? mergeRowsByDate(renderedRows, incomingRows) : incomingRows;
+      applyMetricContextPayload(payload, { append });
       await renderRows(renderedRows);
       const payloadStart = (typeof payload.start_date === "string" && isIsoDateString(payload.start_date))
         ? payload.start_date
@@ -1869,12 +2944,19 @@
           centerDateRowInView(centerTarget, centerBehavior);
         });
       }
-    } catch (_err) {
+      return true;
+    } catch (error) {
       if (requestVersion !== loadRequestVersion) {
-        return;
+        return false;
       }
-      bodyEl.innerHTML = "<tr><td colspan=\"15\">Network error while loading plan data.</td></tr>";
+      const message = String(error && error.message ? error.message : "Network error while loading plan data.");
+      if (renderedRows.length > 0 && bodyEl.childElementCount > 0) {
+        if (metaEl) metaEl.textContent = `Refresh failed. Keeping current grid. ${message}`;
+        return false;
+      }
+      bodyEl.innerHTML = `<tr><td colspan="15">${message}</td></tr>`;
       if (metaEl) metaEl.textContent = "Network error";
+      return false;
     }
   }
 
@@ -1967,11 +3049,26 @@
       if (!(target instanceof Element)) return;
       if (target.matches(".plan-session-type")) {
         const dateLocal = String(target.getAttribute("data-date") || "");
+        const sessionIndex = Number.parseInt(String(target.getAttribute("data-session-index") || "0"), 10);
         const row = rowsByDate.get(dateLocal);
         if (!row) return;
         const index = rowIndexByDate(dateLocal);
         if (index < 0) return;
         saveSessionPayload(row, index, renderedRows, dateLocal, undefined, { preserveFocus: true });
+        rerenderEditedRowAfterSessionShapeChange(dateLocal, sessionIndex);
+        if (isSosRunType(target.value)) {
+          requestAnimationFrame(() => {
+            const workoutInput = bodyEl.querySelector(
+              `.plan-session-workout[data-date="${dateLocal}"][data-session-index="${sessionIndex}"]`,
+            );
+            if (workoutInput instanceof HTMLInputElement) {
+              workoutInput.focus();
+              if (typeof workoutInput.select === "function") {
+                workoutInput.select();
+              }
+            }
+          });
+        }
         return;
       }
       if (target.matches(".plan-session-distance")) {
@@ -2025,6 +3122,7 @@
             sessionTypeSelect.value = mapped;
           }
           saveSessionPayload(row, index, renderedRows, dateLocal, undefined, { preserveFocus: true });
+          rerenderEditedRowAfterSessionShapeChange(dateLocal, sessionIndex);
           return;
         }
       }
@@ -2046,18 +3144,38 @@
 
   if (paceDrawerTab) {
     paceDrawerTab.addEventListener("click", () => {
-      const nextOpen = !(paceDrawer && paceDrawer.classList.contains("open"));
-      setPaceDrawerOpen(nextOpen);
+      if (activeDrawer === "pace") {
+        setActiveDrawer("");
+        return;
+      }
+      void openPlanDrawer("pace");
+    });
+  }
+  if (workoutDrawerTab) {
+    workoutDrawerTab.addEventListener("click", () => {
+      if (activeDrawer === "workout") {
+        setActiveDrawer("");
+        return;
+      }
+      void openPlanDrawer("workout");
     });
   }
   if (paceDrawerClose) {
     paceDrawerClose.addEventListener("click", () => {
-      setPaceDrawerOpen(false);
+      setActiveDrawer("");
+      closeWorkoutPickerPanel();
+    });
+  }
+  if (workoutDrawerClose) {
+    workoutDrawerClose.addEventListener("click", () => {
+      setActiveDrawer("");
+      closeWorkoutPickerPanel();
     });
   }
   if (paceBackdrop) {
     paceBackdrop.addEventListener("click", () => {
-      setPaceDrawerOpen(false);
+      setActiveDrawer("");
+      closeWorkoutPickerPanel();
     });
   }
   if (marathonGoalSetBtn && marathonGoalInputEl) {
@@ -2089,15 +3207,49 @@
       void saveMarathonGoal(paceDerivedGoal);
     });
   }
+  if (workoutPickerToggleEl) {
+    workoutPickerToggleEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (workoutPickerOpen) {
+        closeWorkoutPickerPanel();
+      } else {
+        openWorkoutPickerPanel();
+      }
+    });
+  }
+  if (workoutNewBtn) {
+    workoutNewBtn.addEventListener("click", () => {
+      void createNewWorkoutDraft();
+    });
+  }
+  if (workoutReloadBtn) {
+    workoutReloadBtn.addEventListener("click", () => {
+      void loadSelectedWorkoutDocument({ force: false });
+    });
+  }
+  if (workoutSaveBtn) {
+    workoutSaveBtn.addEventListener("click", () => {
+      void saveCurrentWorkoutYaml();
+    });
+  }
+  if (workoutYamlEditorEl) {
+    workoutYamlEditorEl.addEventListener("input", (event) => {
+      workoutYamlText = String(event.target && event.target.value ? event.target.value : "");
+      workoutYamlLoadError = "";
+      renderWorkoutWorkshop();
+    });
+  }
 
   bindWorkoutMenuHandlers();
+  bindRowActionMenuHandlers();
   loadCachedRunTypeOptions();
-  setPaceDrawerOpen(false);
+  setActiveDrawer("");
   setDistanceOptions([]);
   if (paceSetDerivedBtn instanceof HTMLButtonElement) {
     paceSetDerivedBtn.disabled = true;
   }
   void loadPaceWorkshop();
+  void loadWorkoutCatalog({ reloadDocument: true });
   if (!isIsoDateString(centerDateEl.value)) {
     centerDateEl.value = todayIsoLocal();
   }

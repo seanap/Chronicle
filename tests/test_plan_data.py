@@ -85,6 +85,13 @@ class TestPlanData(unittest.TestCase):
         self.assertIn("Easy", payload["run_type_options"])
         self.assertIn("summary", payload)
         self.assertIn("week_planned", payload["summary"])
+        self.assertIn("metric_context", payload)
+        self.assertEqual(payload["metric_context"]["end_date"], "2026-03-31")
+        self.assertLess(payload["metric_context"]["start_date"], payload["start_date"])
+        context_by_date = {str(item["date"]): item for item in payload["metric_context"]["days"]}
+        self.assertEqual(context_by_date["2026-02-22"]["run_type"], "Easy")
+        self.assertAlmostEqual(context_by_date["2026-02-22"]["planned_miles"], 6.2, places=3)
+        self.assertAlmostEqual(context_by_date["2026-02-21"]["actual_miles"], 13.1, places=2)
 
     def test_get_plan_payload_uses_session_sum_for_planned_and_planned_input(self) -> None:
         payload = get_plan_payload(

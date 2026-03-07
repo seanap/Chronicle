@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .config import Settings
 from .dashboard_data import dashboard_data_path
 from .storage import list_plan_days, list_plan_sessions, read_json
+from .workout_workshop import list_workout_definitions
 
 
 METERS_PER_MILE = 1609.34
@@ -370,6 +371,11 @@ def get_plan_payload(
             start_date=calc_start.isoformat(),
             end_date=calc_end.isoformat(),
         )
+    workout_lookup = {
+        str(item.get("workout_id") or ""): item
+        for item in list_workout_definitions(settings.processed_log_file)
+        if isinstance(item, dict) and not bool(item.get("invalid"))
+    }
 
     dates_full = _date_range(calc_start, calc_end)
     planned_miles: dict[str, float] = {}
@@ -403,6 +409,15 @@ def get_plan_payload(
                     continue
                 session_total += planned_piece
                 session_values.append(planned_piece)
+                workout_code = str(session.get("workout_code") or "").strip()
+                workout_record = workout_lookup.get(workout_code)
+                planned_workout = (
+                    str(workout_record.get("shorthand") or "").strip()
+                    if isinstance(workout_record, dict)
+                    else str(session.get("planned_workout") or session.get("workout_code") or "").strip()
+                )
+                if not workout_code and planned_workout:
+                    workout_code = planned_workout
                 session_details.append(
                     {
                         "ordinal": (
@@ -412,8 +427,8 @@ def get_plan_payload(
                         ),
                         "planned_miles": float(planned_piece),
                         "run_type": str(session.get("run_type") or "").strip(),
-                        "workout_code": str(session.get("workout_code") or session.get("planned_workout") or "").strip(),
-                        "planned_workout": str(session.get("planned_workout") or session.get("workout_code") or "").strip(),
+                        "workout_code": workout_code,
+                        "planned_workout": planned_workout,
                     }
                 )
         planned = session_total if session_total > 0 else planned_from_day
@@ -627,6 +642,16 @@ def get_plan_payload(
         "month_adherence_ratio": anchor_row.get("monthly_adherence_ratio"),
     }
 
+    metric_context_days = [
+        {
+            "date": day.isoformat(),
+            "planned_miles": float(planned_miles.get(day.isoformat(), 0.0)),
+            "actual_miles": float(actual_miles_by_day.get(day.isoformat(), 0.0)),
+            "run_type": str(run_type_by_date.get(day.isoformat()) or ""),
+        }
+        for day in dates_full
+    ]
+
     payload = {
         "status": "ok",
         "timezone": settings.timezone,
@@ -638,6 +663,11 @@ def get_plan_payload(
         "start_date": display_start.isoformat(),
         "end_date": display_end.isoformat(),
         "summary": summary,
+        "metric_context": {
+            "start_date": calc_start.isoformat(),
+            "end_date": calc_end.isoformat(),
+            "days": metric_context_days,
+        },
         "rows": rows,
     }
     if include_meta:

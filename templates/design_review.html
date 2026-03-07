@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chronicle Design Review</title>
+  <meta name="theme-color" content="#ff6a00">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32.png') }}">
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='chronicle.png') }}">
+  <link rel="stylesheet" href="/static/ui-theme.css">
+  <link rel="stylesheet" href="/static/design-review.css">
+</head>
+<body class="design-review-page">
+  {% include "_app_shell_nav.html" %}
+
+  <main class="review-shell">
+    <section class="review-hero dg-card">
+      <div>
+        <p class="review-kicker">MPA Review Workflow</p>
+        <h1>Eye Doctor Review</h1>
+        <p class="review-copy">
+          Compare the live MPA page against a review-only variant before approving a styling change. Product pages stay live and stable; candidate styling loads only on the preview route.
+        </p>
+      </div>
+      <div class="review-note">
+        <strong>Current direction:</strong>
+        <span>MPA is the product. SPA is frozen as a discarded prototype.</span>
+      </div>
+    </section>
+
+    <section class="review-controls dg-card">
+      <div class="review-controls-grid">
+        <label class="review-field">
+          <span>Page</span>
+          <select id="reviewPageSelect" class="dg-focusable"></select>
+        </label>
+        <label class="review-field">
+          <span>Variant</span>
+          <input id="reviewVariantInput" class="dg-focusable dg-mono" type="text" value="{{ review_variant_default }}" placeholder="a">
+        </label>
+        <label class="review-field">
+          <span>Viewport</span>
+          <select id="reviewViewportSelect" class="dg-focusable">
+            <option value="desktop" selected>Desktop</option>
+            <option value="mobile">Mobile</option>
+          </select>
+        </label>
+      </div>
+      <div class="review-actions">
+        <button id="reviewLoadBtn" class="review-btn review-btn-primary" type="button">Live vs Variant</button>
+        <button id="reviewSwapBtn" class="review-btn" type="button">Swap A / B</button>
+        <button id="reviewCopyLinkBtn" class="review-btn" type="button">Copy Permalink</button>
+      </div>
+      <p id="reviewPageDescription" class="review-page-description"></p>
+      <p class="review-help">
+        Variant preview route: <code id="reviewPreviewRoute" class="dg-mono"></code>
+      </p>
+      <p class="review-help">
+        Add optional files at <code class="dg-mono">static/review-variants/&lt;page&gt;/&lt;variant&gt;.css</code> and <code class="dg-mono">static/review-variants/&lt;page&gt;/&lt;variant&gt;.js</code>.
+      </p>
+    </section>
+
+    <section id="reviewComparison" class="review-comparison review-comparison-desktop">
+      <article class="review-pane dg-card">
+        <header class="review-pane-head">
+          <div>
+            <span class="review-pane-badge">A</span>
+            <strong>Current MPA</strong>
+          </div>
+          <code id="reviewLeftUrl" class="review-url dg-mono"></code>
+        </header>
+        <div class="review-stage">
+          <iframe id="reviewLeftFrame" title="Current MPA page comparison"></iframe>
+        </div>
+      </article>
+
+      <article class="review-pane dg-card">
+        <header class="review-pane-head">
+          <div>
+            <span class="review-pane-badge review-pane-badge-alt">B</span>
+            <strong>Candidate Variant</strong>
+          </div>
+          <code id="reviewRightUrl" class="review-url dg-mono"></code>
+        </header>
+        <div class="review-stage">
+          <iframe id="reviewRightFrame" title="Candidate MPA variant comparison"></iframe>
+        </div>
+      </article>
+    </section>
+
+    <section class="review-notes dg-card">
+      <div class="review-notes-head">
+        <div>
+          <h2>Decision Notes</h2>
+          <p>Use this to record “A or B” decisions, what improved, and what still feels off.</p>
+        </div>
+        <button id="reviewClearNotesBtn" class="review-btn" type="button">Clear Notes</button>
+      </div>
+      <textarea
+        id="reviewNotes"
+        class="review-notes-input dg-focusable"
+        placeholder="Example: B has better contrast in the filters, but A keeps the heatmap emphasis cleaner. Keep A spacing, adopt B button treatment."
+      ></textarea>
+    </section>
+  </main>
+
+  <script id="reviewPageData" type="application/json">{{ review_pages | tojson }}</script>
+  <script>
+    window.__CHRONICLE_REVIEW_DEFAULTS__ = {
+      page: {{ review_page_default | tojson }},
+      variant: {{ review_variant_default | tojson }}
+    };
+  </script>
+  <script src="/static/design-review.js"></script>
+</body>
+</html>

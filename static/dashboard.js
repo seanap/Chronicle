@@ -65,6 +65,13 @@ const dashboardSubtitle = document.getElementById("dashboardSubtitle");
 const dashboardTopStatus = document.getElementById("dashboardTopStatus");
 const dashboardSettingsToggle = document.getElementById("dashboardSettingsToggle");
 const dashboardSettingsPanel = document.getElementById("dashboardSettingsPanel");
+const dashboardFilterDrawerToggle = document.getElementById("dashboardFilterDrawerToggle");
+const dashboardFilterDrawer = document.getElementById("dashboardFilterDrawer");
+const dashboardScopeSummary = document.getElementById("dashboardScopeSummary");
+const dashboardScopeResetButton = document.getElementById("dashboardScopeResetButton");
+const customDateRangePanel = document.getElementById("customDateRangePanel");
+const customDateStartInput = document.getElementById("customDateStartInput");
+const customDateEndInput = document.getElementById("customDateEndInput");
 const dashboardThemeToggle = document.getElementById("dashboardThemeToggle");
 const isTouch = window.matchMedia("(hover: none) and (pointer: coarse)").matches;
 const hasTouchInput = Number(window.navigator?.maxTouchPoints || 0) > 0;
@@ -100,6 +107,83 @@ const TOUCH_TOOLTIP_TAP_MAX_SCROLL_PX = 2;
 const TOUCH_TOOLTIP_MAX_EFFECTIVE_ZOOM = 1.2;
 const TOUCH_TOOLTIP_MIN_SCALE = 0.5;
 const DASHBOARD_THEME_STORAGE_KEY = "chronicle.dashboard.theme";
+const DASHBOARD_PAYLOAD_CACHE_KEY = "chronicle.dashboard.payload.v1";
+const DASHBOARD_SCOPE_STORAGE_KEY = "chronicle.dashboard.scope.v1";
+const CUSTOM_RANGE_VALUE = "__custom__";
+const DASHBOARD_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
+const dashboardReducedMotionMedia = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+function runDashboardTransition(callback) {
+  if (typeof callback !== "function") return;
+  callback();
+}
+
+function isDashboardPayloadShape(value) {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && Array.isArray(value.years)
+    && Array.isArray(value.types)
+    && value.aggregates
+    && Array.isArray(value.activities)
+  );
+}
+
+function readCachedDashboardPayload() {
+  try {
+    const raw = localStorage.getItem(DASHBOARD_PAYLOAD_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!isDashboardPayloadShape(parsed)) {
+      localStorage.removeItem(DASHBOARD_PAYLOAD_CACHE_KEY);
+      return null;
+    }
+    return parsed;
+  } catch (_error) {
+    try {
+      localStorage.removeItem(DASHBOARD_PAYLOAD_CACHE_KEY);
+    } catch (_storageError) {
+      // Ignore localStorage errors in restricted browser modes.
+    }
+    return null;
+  }
+}
+
+function writeCachedDashboardPayload(payload) {
+  if (!isDashboardPayloadShape(payload)) return;
+  try {
+    localStorage.setItem(DASHBOARD_PAYLOAD_CACHE_KEY, JSON.stringify(payload));
+  } catch (_error) {
+    // Ignore localStorage errors in restricted browser modes.
+  }
+}
+
+function dashboardPayloadRevision(payload) {
+  if (!isDashboardPayloadShape(payload)) return "";
+  const latestActivityId = String(payload.latest_activity_id || "");
+  const latestActivityStart = String(payload.latest_activity_start_date || "");
+  const activityCount = Array.isArray(payload.activities) ? payload.activities.length : 0;
+  const yearCount = Array.isArray(payload.years) ? payload.years.length : 0;
+  const typeCount = Array.isArray(payload.types) ? payload.types.length : 0;
+  return [latestActivityId, latestActivityStart, activityCount, yearCount, typeCount].join("|");
+}
+
+async function fetchLiveDashboardPayload() {
+  const resp = await fetch("/dashboard/data.json", { cache: "no-store" });
+  if (!resp.ok) {
+    throw new Error(`Failed to load data.json (${resp.status})`);
+  }
+  const payload = await resp.json();
+  if (!isDashboardPayloadShape(payload)) {
+    throw new Error("Invalid dashboard data format.");
+  }
+  writeCachedDashboardPayload(payload);
+  return payload;
+}
 
 function resetPersistentSideStatSizing() {
   persistentSideStatCardWidth = 0;
@@ -149,6 +233,8 @@ function requestLayoutAlignment() {
   pendingAlignmentFrame = window.requestAnimationFrame(() => {
     pendingAlignmentFrame = null;
     alignStackedStatsToYAxisLabels();
+    syncChronicleStageScales(document);
+    syncChronicleLensLayouts(document);
   });
 }
 
@@ -715,6 +801,13 @@ function getYearMenuText(years, allYearsSelected) {
   return "No Years Selected";
 }
 
+function getScopeSummaryText(typeText, yearText, customRange) {
+  if (customRange?.start && customRange?.end) {
+    return `${typeText} • ${formatDisplayDate(customRange.start)} - ${formatDisplayDate(customRange.end)}`;
+  }
+  return `${typeText} • ${yearText}`;
+}
+
 function setMenuLabel(labelEl, text, fallbackText) {
   if (!labelEl) return;
   if (fallbackText && fallbackText !== text) {
@@ -833,13 +926,14 @@ function renderFilterMenuOptions(
       ? allOptionSelected
       : (isAllSelected || selectedValues.has(normalized));
 
-    const row = document.createElement("div");
+    const row = document.createElement("button");
+    row.type = "button";
     row.className = "filter-menu-option";
-    row.setAttribute("role", "button");
     if (isActive) {
       row.classList.add("active");
     }
     row.dataset.value = rawValue;
+    row.setAttribute("aria-pressed", isActive ? "true" : "false");
 
     const label = document.createElement("span");
     label.className = "filter-menu-option-label";
@@ -862,6 +956,57 @@ function renderFilterMenuOptions(
   });
 }
 
+function renderYearMenuOptions(
+  container,
+  visibleYears,
+  selection,
+  customActive,
+  onSelectPreset,
+  onSelectCustom,
+) {
+  if (!container) return;
+  container.innerHTML = "";
+  const list = ensureFilterMenuList(container);
+  if (!list) return;
+  const rows = [
+    { value: "all", label: "All Years", checked: selection.allMode && !customActive, active: selection.allMode && !customActive, handler: onSelectPreset },
+    ...visibleYears.map((year) => ({
+      value: String(year),
+      label: String(year),
+      checked: !selection.allMode && selection.selectedValues.has(Number(year)) && !customActive,
+      active: !selection.allMode && selection.selectedValues.has(Number(year)) && !customActive,
+      handler: onSelectPreset,
+    })),
+    { value: CUSTOM_RANGE_VALUE, label: "Custom Range", checked: customActive, active: customActive, handler: onSelectCustom },
+  ];
+  rows.forEach((option) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "filter-menu-option";
+    row.dataset.value = option.value;
+    row.setAttribute("aria-pressed", option.active ? "true" : "false");
+    if (option.active) {
+      row.classList.add("active");
+    }
+    const label = document.createElement("span");
+    label.className = "filter-menu-option-label";
+    label.textContent = option.label;
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "filter-menu-check";
+    check.checked = option.checked;
+    check.tabIndex = -1;
+    check.setAttribute("aria-hidden", "true");
+    row.appendChild(label);
+    row.appendChild(check);
+    row.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
+    row.addEventListener("click", () => option.handler(option.value));
+    list.appendChild(row);
+  });
+}
+
 function renderFilterMenuDoneButton(container, onDone) {
   if (!container) return;
   const footer = document.createElement("div");
@@ -876,6 +1021,24 @@ function renderFilterMenuDoneButton(container, onDone) {
   done.addEventListener("click", () => onDone());
   footer.appendChild(done);
   container.appendChild(footer);
+}
+
+function syncCustomDateRangePanel(customActive, customRange, bounds) {
+  if (customDateRangePanel) {
+    customDateRangePanel.setAttribute("data-active", customActive ? "true" : "false");
+  }
+  if (customDateStartInput) {
+    customDateStartInput.disabled = !customActive;
+    customDateStartInput.value = customRange?.start || "";
+    if (bounds?.start) customDateStartInput.min = bounds.start;
+    if (bounds?.end) customDateStartInput.max = bounds.end;
+  }
+  if (customDateEndInput) {
+    customDateEndInput.disabled = !customActive;
+    customDateEndInput.value = customRange?.end || "";
+    if (bounds?.start) customDateEndInput.min = bounds.start;
+    if (bounds?.end) customDateEndInput.max = bounds.end;
+  }
 }
 
 function syncFilterControlState({
@@ -901,6 +1064,8 @@ function syncFilterControlState({
   yearMenu,
   typeMenuButton,
   yearMenuButton,
+  yearMenuCustomActive,
+  customRange,
 }) {
   updateButtonState(typeButtons, selectedTypes, allTypesSelected, allTypeValues);
   updateButtonState(yearButtons, selectedYears, allYearsSelected, allYearValues, (v) => Number(v));
@@ -923,20 +1088,28 @@ function syncFilterControlState({
   );
   setMenuLabel(
     yearMenuLabel,
-    yearMenuText,
-    !yearMenuSelection.allMode
+    yearMenuCustomActive ? "Custom Range" : yearMenuText,
+    !yearMenuCustomActive
+    && !yearMenuSelection.allMode
     && yearMenuYears.length > 1
     && yearMenuYears.length < allYearValues.length
       ? "Multiple Years Selected"
       : "",
   );
+  if (dashboardScopeSummary) {
+    dashboardScopeSummary.textContent = getScopeSummaryText(
+      typeMenuText,
+      yearMenuCustomActive ? "Custom Range" : yearMenuText,
+      yearMenuCustomActive ? customRange : null,
+    );
+  }
   if (typeClearButton) {
     typeClearButton.textContent = "Clear";
     typeClearButton.disabled = allTypesSelected;
   }
   if (yearClearButton) {
-    yearClearButton.textContent = "Select All";
-    yearClearButton.disabled = allYearsSelected;
+    yearClearButton.textContent = yearMenuCustomActive ? "Exit Custom" : "Select All";
+    yearClearButton.disabled = !yearMenuCustomActive && allYearsSelected;
   }
   if (keepTypeMenuOpen) {
     setMenuOpenState(typeMenu, typeMenuButton, true);
@@ -948,10 +1121,10 @@ function syncFilterControlState({
 
 function setDashboardTitle(source) {
   const provider = providerDisplayName(source);
-  const title = "Heatmaps";
+  const title = "Chronicle View";
   const subtitle = provider
-    ? `${provider} activity patterns and yearly volume at a glance.`
-    : "Year-over-year training patterns at a glance.";
+    ? `${provider} activity layers that change how you read your fitness story.`
+    : "Activity layers that change how you read your fitness story.";
   if (dashboardTitle) {
     dashboardTitle.textContent = title;
   }
@@ -970,6 +1143,9 @@ function setDashboardTopStatus(text, tone = "neutral") {
 function applyDashboardTheme(theme) {
   const resolved = theme === "light" ? "light" : "dark";
   document.body.setAttribute("data-theme", resolved);
+  if (document.documentElement) {
+    document.documentElement.style.colorScheme = resolved;
+  }
   if (dashboardThemeToggle) {
     dashboardThemeToggle.checked = resolved === "dark";
   }
@@ -995,6 +1171,209 @@ function persistDashboardTheme(theme) {
   }
 }
 
+function normalizeDashboardScopeState(rawState) {
+  const next = rawState && typeof rawState === "object" ? rawState : {};
+  const scopeMode = next.scopeMode === "custom" ? "custom" : "preset";
+  const types = Array.isArray(next.types)
+    ? next.types.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  const years = Array.isArray(next.years)
+    ? next.years.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+    : [];
+  const start = normalizeDateKeyInput(next.start);
+  const end = normalizeDateKeyInput(next.end);
+  return {
+    types,
+    years,
+    scopeMode,
+    start: scopeMode === "custom" ? start : "",
+    end: scopeMode === "custom" ? end : "",
+  };
+}
+
+function readStoredDashboardScopeState() {
+  try {
+    const stored = localStorage.getItem(DASHBOARD_SCOPE_STORAGE_KEY);
+    if (!stored) return null;
+    return normalizeDashboardScopeState(JSON.parse(stored));
+  } catch (_error) {
+    try {
+      localStorage.removeItem(DASHBOARD_SCOPE_STORAGE_KEY);
+    } catch (_storageError) {
+      // Ignore localStorage errors in restricted browser modes.
+    }
+    return null;
+  }
+}
+
+function persistDashboardScopeState(state) {
+  try {
+    localStorage.setItem(
+      DASHBOARD_SCOPE_STORAGE_KEY,
+      JSON.stringify(normalizeDashboardScopeState(state)),
+    );
+  } catch (_error) {
+    // Ignore localStorage errors in restricted browser modes.
+  }
+}
+
+function parseCsvParam(rawValue) {
+  return String(rawValue || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function normalizeDateKeyInput(value) {
+  const normalized = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(normalized) ? normalized : "";
+}
+
+function getPayloadDateBounds(payload) {
+  const dates = (payload.activities || [])
+    .map((activity) => normalizeDateKeyInput(activity?.date))
+    .filter(Boolean)
+    .sort();
+  if (!dates.length) {
+    return { start: "", end: "" };
+  }
+  return {
+    start: dates[0],
+    end: dates[dates.length - 1],
+  };
+}
+
+function normalizeCustomDateRange(start, end, bounds) {
+  const fallbackStart = normalizeDateKeyInput(bounds?.start);
+  const fallbackEnd = normalizeDateKeyInput(bounds?.end);
+  let normalizedStart = normalizeDateKeyInput(start) || fallbackStart;
+  let normalizedEnd = normalizeDateKeyInput(end) || fallbackEnd;
+  if (!normalizedStart || !normalizedEnd) {
+    return { start: "", end: "" };
+  }
+  if (normalizedStart > normalizedEnd) {
+    [normalizedStart, normalizedEnd] = [normalizedEnd, normalizedStart];
+  }
+  if (fallbackStart && normalizedStart < fallbackStart) {
+    normalizedStart = fallbackStart;
+  }
+  if (fallbackEnd && normalizedEnd > fallbackEnd) {
+    normalizedEnd = fallbackEnd;
+  }
+  if (normalizedStart > normalizedEnd) {
+    normalizedStart = normalizedEnd;
+  }
+  return {
+    start: normalizedStart,
+    end: normalizedEnd,
+  };
+}
+
+function isDateWithinRange(dateStr, start, end) {
+  const normalizedDate = normalizeDateKeyInput(dateStr);
+  if (!normalizedDate || !start || !end) return false;
+  return normalizedDate >= start && normalizedDate <= end;
+}
+
+function buildDateScopedPayload(payload, start, end) {
+  if (!start || !end) return payload;
+  const nextAggregates = {};
+  const nextYears = new Set();
+  Object.entries(payload.aggregates || {}).forEach(([year, yearData]) => {
+    const nextYearData = {};
+    Object.entries(yearData || {}).forEach(([type, entries]) => {
+      const nextEntries = {};
+      Object.entries(entries || {}).forEach(([dateKey, entry]) => {
+        if (isDateWithinRange(dateKey, start, end)) {
+          nextEntries[dateKey] = entry;
+          nextYears.add(Number(year));
+        }
+      });
+      if (Object.keys(nextEntries).length) {
+        nextYearData[type] = nextEntries;
+      }
+    });
+    if (Object.keys(nextYearData).length) {
+      nextAggregates[year] = nextYearData;
+    }
+  });
+  const nextActivities = (payload.activities || []).filter((activity) => isDateWithinRange(activity?.date, start, end));
+  return {
+    ...payload,
+    years: Array.from(nextYears).filter((year) => Number.isFinite(year)).sort((a, b) => b - a),
+    aggregates: nextAggregates,
+    activities: nextActivities,
+  };
+}
+
+function readDashboardUrlState() {
+  const params = new URLSearchParams(window.location.search);
+  const types = parseCsvParam(params.get("types"));
+  const years = parseCsvParam(params.get("years"))
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+  const units = params.get("units") === "metric" ? "metric" : params.get("units") === "imperial" ? "imperial" : null;
+  const lens = String(params.get("lens") || "").trim() || null;
+  const start = normalizeDateKeyInput(params.get("start"));
+  const end = normalizeDateKeyInput(params.get("end"));
+  return {
+    types,
+    years,
+    units,
+    lens,
+    start,
+    end,
+    hasTypesParam: params.has("types"),
+    hasYearsParam: params.has("years"),
+    hasUnitsParam: params.has("units"),
+    hasLensParam: params.has("lens"),
+    hasStartParam: params.has("start"),
+    hasEndParam: params.has("end"),
+  };
+}
+
+function syncDashboardUrlState(state) {
+  if (!window.history || typeof window.history.replaceState !== "function") {
+    return;
+  }
+  const nextUrl = new URL(window.location.href);
+  if (Array.isArray(state.types) && state.types.length) {
+    nextUrl.searchParams.set("types", state.types.join(","));
+  } else {
+    nextUrl.searchParams.delete("types");
+  }
+  if (Array.isArray(state.years) && state.years.length) {
+    nextUrl.searchParams.set("years", state.years.join(","));
+  } else {
+    nextUrl.searchParams.delete("years");
+  }
+  if (state.units === "metric" || state.units === "imperial") {
+    nextUrl.searchParams.set("units", state.units);
+  } else {
+    nextUrl.searchParams.delete("units");
+  }
+  if (typeof state.lens === "string" && state.lens) {
+    nextUrl.searchParams.set("lens", state.lens);
+  } else {
+    nextUrl.searchParams.delete("lens");
+  }
+  if (typeof state.start === "string" && state.start) {
+    nextUrl.searchParams.set("start", state.start);
+  } else {
+    nextUrl.searchParams.delete("start");
+  }
+  if (typeof state.end === "string" && state.end) {
+    nextUrl.searchParams.set("end", state.end);
+  } else {
+    nextUrl.searchParams.delete("end");
+  }
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  const replacementUrl = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
+  if (replacementUrl !== currentUrl) {
+    window.history.replaceState({}, "", replacementUrl);
+  }
+}
+
 function setDashboardSettingsOpen(open) {
   const expanded = Boolean(open);
   if (dashboardSettingsPanel) {
@@ -1005,9 +1384,20 @@ function setDashboardSettingsOpen(open) {
   }
 }
 
+function setDashboardFilterDrawerOpen(open) {
+  const expanded = Boolean(open);
+  if (dashboardFilterDrawer) {
+    dashboardFilterDrawer.setAttribute("aria-hidden", expanded ? "false" : "true");
+  }
+  if (dashboardFilterDrawerToggle) {
+    dashboardFilterDrawerToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  }
+}
+
 function initDashboardChrome() {
   applyDashboardTheme(readStoredDashboardTheme());
   setDashboardSettingsOpen(false);
+  setDashboardFilterDrawerOpen(false);
 
   if (dashboardThemeToggle) {
     dashboardThemeToggle.addEventListener("change", () => {
@@ -1041,6 +1431,7 @@ function initDashboardChrome() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       setDashboardSettingsOpen(false);
+      setDashboardFilterDrawerOpen(false);
     }
   });
 }
@@ -1161,15 +1552,13 @@ function normalizeSideStatCardSize() {
 }
 
 function buildSectionLayoutPlan(list) {
-  const frequencyCard = list.querySelector(".labeled-card-row-frequency .more-stats");
-  const yearCards = Array.from(list.querySelectorAll(".labeled-card-row-year .year-card"));
-  if (!frequencyCard && !yearCards.length) return null;
+  const frequencyCard = list.querySelector(".chronicle-story-patterns");
+  const chronicleCard = list.querySelector(":scope > .chronicle-stage");
+  if (!frequencyCard && !chronicleCard) return null;
 
-  const yearGraphWidths = yearCards
-    .map((card) => getElementBoxWidth(card.querySelector(".heatmap-area")))
-    .filter((width) => width > 0);
-
-  let graphRailWidth = yearGraphWidths.length ? Math.max(...yearGraphWidths) : 0;
+  let graphRailWidth = chronicleCard
+    ? getElementBoxWidth(chronicleCard.querySelector(".chronicle-stage-graph-shell"))
+    : 0;
   let frequencyGap = null;
   let frequencyPadRight = null;
 
@@ -1203,69 +1592,28 @@ function buildSectionLayoutPlan(list) {
     }
   }
 
-  const cards = [
-    ...(frequencyCard ? [frequencyCard] : []),
-    ...yearCards,
-  ];
-
-  let shouldStackSection = false;
-  const desktopLike = isDesktopLikeViewport();
-  cards.forEach((card) => {
-    const statsColumn = card.classList.contains("more-stats")
-      ? card.querySelector(".more-stats-facts.side-stats-column")
-      : card.querySelector(".card-stats.side-stats-column");
-    if (!statsColumn) return;
-
-    const measuredMain = card.classList.contains("more-stats")
-      ? getElementBoxWidth(card.querySelector(".more-stats-grid"))
-      : getElementBoxWidth(card.querySelector(".heatmap-area"));
-    const mainWidth = graphRailWidth > 0 ? graphRailWidth : measuredMain;
-    const statsWidth = getElementBoxWidth(statsColumn);
-    const sideGap = readCssVar("--stats-column-gap", 12, card);
-    const requiredWidth = mainWidth + sideGap + statsWidth;
-    const availableWidth = getElementContentWidth(card);
-    const overflow = requiredWidth - availableWidth;
-    const tolerance = desktopLike
-      ? readCssVar("--stack-overflow-tolerance-desktop", 0, card)
-      : 0;
-    if (overflow > tolerance) {
-      shouldStackSection = true;
-    }
-  });
-
   return {
     frequencyCard,
-    yearCards,
     graphRailWidth,
     frequencyGap,
     frequencyPadRight,
-    shouldStackSection,
   };
 }
 
 function applySectionLayoutPlan(plan) {
   const {
     frequencyCard,
-    yearCards,
     graphRailWidth,
     frequencyGap,
     frequencyPadRight,
-    shouldStackSection,
   } = plan;
-  const cards = [
-    ...(frequencyCard ? [frequencyCard] : []),
-    ...yearCards,
-  ];
-
-  cards.forEach((card) => {
-    if (graphRailWidth > 0) {
-      card.style.setProperty("--card-graph-rail-width", `${graphRailWidth}px`);
-    } else {
-      card.style.removeProperty("--card-graph-rail-width");
-    }
-  });
 
   if (frequencyCard) {
+    if (graphRailWidth > 0) {
+      frequencyCard.style.setProperty("--card-graph-rail-width", `${graphRailWidth}px`);
+    } else {
+      frequencyCard.style.removeProperty("--card-graph-rail-width");
+    }
     if (Number.isFinite(frequencyGap)) {
       frequencyCard.style.setProperty("--frequency-graph-gap", `${Math.max(0, frequencyGap)}px`);
     } else {
@@ -1276,27 +1624,8 @@ function applySectionLayoutPlan(plan) {
     } else {
       frequencyCard.style.removeProperty("--frequency-grid-pad-right");
     }
+    frequencyCard.classList.remove("more-stats-stacked");
   }
-
-  if (frequencyCard) {
-    frequencyCard.classList.toggle("more-stats-stacked", shouldStackSection);
-    const metricChipRow = frequencyCard.querySelector(".more-stats-metric-chips");
-    const title = frequencyCard.querySelector(":scope > .labeled-card-title");
-    const facts = frequencyCard.querySelector(".more-stats-facts.side-stats-column");
-    if (metricChipRow && title && facts) {
-      const keepChipsWithTitle = shouldStackSection;
-      if (keepChipsWithTitle) {
-        title.appendChild(metricChipRow);
-        alignFrequencyMetricChipsToSecondGraphAxis(frequencyCard, title, metricChipRow);
-      } else if (facts.firstElementChild !== metricChipRow) {
-        metricChipRow.style.removeProperty("margin-left");
-        facts.insertBefore(metricChipRow, facts.firstChild);
-      }
-    }
-  }
-  yearCards.forEach((card) => {
-    card.classList.toggle("year-card-stacked", shouldStackSection);
-  });
 }
 
 function alignStackedStatsToYAxisLabels() {
@@ -2190,6 +2519,16 @@ function formatActivityCountLabel(count, types = []) {
   return `${count} ${count === 1 ? "Activity" : "Activities"}`;
 }
 
+function formatDisplayDate(dateStr) {
+  const value = String(dateStr || "").trim();
+  if (!value) return "";
+  const date = new Date(`${value}T12:00:00Z`);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return DASHBOARD_DATE_FORMATTER.format(date);
+}
+
 function fallbackColor(type) {
   if (!type) return FALLBACK_VAPORWAVE[0];
   let index = 0;
@@ -2285,6 +2624,17 @@ function formatEfficiency(value) {
   return formatNumber(numeric, 2);
 }
 
+function getChronicleLensMeta(metricKey, fallbackAccent = MULTI_TYPE_COLOR) {
+  if (metricKey && CHRONICLE_LENS_META[metricKey]) {
+    return CHRONICLE_LENS_META[metricKey];
+  }
+  return {
+    title: "Activity Lens",
+    summary: "Read the same training story through a steadier default activity view.",
+    accent: fallbackAccent || MULTI_TYPE_COLOR,
+  };
+}
+
 function buildYearMetricStatItems(totals, units, activeMetricKey, options = {}) {
   const intervalsEnabled = Boolean(options.intervalsEnabled);
   const hasFitness = totals.avg_fitness > 0;
@@ -2359,6 +2709,48 @@ const METRIC_LABEL_BY_KEY = Object.freeze({
   [EFFICIENCY_METRIC_KEY]: "Avg Efficency",
   [FITNESS_METRIC_KEY]: "Avg. Fitness",
   [FATIGUE_METRIC_KEY]: "Avg. Fatigue",
+});
+const CHRONICLE_LENS_META = Object.freeze({
+  [ACTIVE_DAYS_METRIC_KEY]: Object.freeze({
+    title: "Consistency Lens",
+    summary: "See where you kept showing up, even when the load stayed light.",
+    accent: "#ff8a5b",
+  }),
+  moving_time: Object.freeze({
+    title: "Time Lens",
+    summary: "Read the block by commitment instead of raw activity count.",
+    accent: "#76f1c7",
+  }),
+  distance: Object.freeze({
+    title: "Distance Lens",
+    summary: "Turn the story into pure coverage and surface where mileage stacked.",
+    accent: "#74c6ff",
+  }),
+  elevation_gain: Object.freeze({
+    title: "Elevation Lens",
+    summary: "Expose climbing blocks and mountainous weeks without flat-volume noise.",
+    accent: "#ffd36e",
+  }),
+  [PACE_METRIC_KEY]: Object.freeze({
+    title: "Pace Lens",
+    summary: "Reveal the sharper efforts and speed clusters hidden inside the same calendar.",
+    accent: "#b898ff",
+  }),
+  [EFFICIENCY_METRIC_KEY]: Object.freeze({
+    title: "Efficiency Lens",
+    summary: "Highlight the days where output looked cleaner than the effort felt.",
+    accent: "#7ae6ff",
+  }),
+  [FITNESS_METRIC_KEY]: Object.freeze({
+    title: "Fitness Lens",
+    summary: "Watch readiness accumulate and identify the densest growth periods.",
+    accent: "#7cf0a2",
+  }),
+  [FATIGUE_METRIC_KEY]: Object.freeze({
+    title: "Fatigue Lens",
+    summary: "Surface compression points where training stress outweighed freshness.",
+    accent: "#ff8db4",
+  }),
 });
 
 const FREQUENCY_METRIC_UNAVAILABLE_REASON_BY_KEY = {
@@ -2809,6 +3201,7 @@ function buildSummary(
 ) {
   const summaryUnits = normalizeUnits(units || DEFAULT_UNITS);
   summary.innerHTML = "";
+  summary.classList.add("summary-cohesive");
   summary.classList.remove(
     "summary-center-two-types",
     "summary-center-three-types",
@@ -2830,10 +3223,7 @@ function buildSummary(
   const typeCardsList = Array.isArray(typeCardTypes) && typeCardTypes.length
     ? typeCardTypes.slice()
     : types.slice();
-  const visibleTypeCardsList = typeCardsList.length > 1
-    ? typeCardsList
-    : [];
-  const typeCardSet = new Set(visibleTypeCardsList);
+  const typeCardSet = new Set(typeCardsList);
   const activeDays = new Set();
 
   Object.entries(payload.aggregates || {}).forEach(([year, yearData]) => {
@@ -2862,114 +3252,45 @@ function buildSummary(
     });
   });
 
-  visibleTypeCardsList.sort((a, b) => (typeTotals[b]?.count || 0) - (typeTotals[a]?.count || 0));
-
-  const cards = [
-    { title: "Total Activities", value: totals.count.toLocaleString() },
-  ];
-  if (showActiveDays) {
-    cards.push({
-      title: "Active Days",
-      value: activeDays.size.toLocaleString(),
-      metricKey: ACTIVE_DAYS_METRIC_KEY,
-      filterable: activeDays.size > 0,
-    });
-  }
-  cards.push(
-    {
-      title: "Total Time",
-      value: formatDuration(totals.moving_time),
-      metricKey: "moving_time",
-      filterable: totals.moving_time > 0,
-    },
-    {
-      title: "Total Distance",
-      value: totals.distance > 0
-        ? formatDistance(totals.distance, summaryUnits)
-        : STAT_PLACEHOLDER,
-      metricKey: "distance",
-      filterable: totals.distance > 0,
-    },
-    {
-      title: "Total Elevation",
-      value: totals.elevation > 0
-        ? formatElevation(totals.elevation, summaryUnits)
-        : STAT_PLACEHOLDER,
-      metricKey: "elevation_gain",
-      filterable: totals.elevation > 0,
-    },
-  );
-
-  cards.forEach((card) => {
-    const metricKey = typeof card.metricKey === "string" ? card.metricKey : "";
-    const isMetricCard = Boolean(metricKey);
-    const canToggleMetric = isMetricCard
-      && card.filterable
-      && typeof onYearMetricCardSelect === "function";
-    const el = document.createElement(canToggleMetric ? "button" : "div");
-    if (canToggleMetric) {
-      const isActiveMetric = activeYearMetricKey === metricKey;
-      el.type = "button";
-      el.className = "summary-card summary-card-action summary-year-metric-card";
-      el.dataset.metricKey = metricKey;
-      el.classList.toggle("active", isActiveMetric);
-      if (!isActiveMetric && hoverClearedYearMetricKey === metricKey) {
-        el.classList.add("summary-glow-cleared");
-      }
-      el.setAttribute("aria-pressed", isActiveMetric ? "true" : "false");
-      el.title = `Filter all year cards: ${card.title}`;
-      el.addEventListener("click", () => {
-        const currentlyActive = el.classList.contains("active");
-        onYearMetricCardSelect(metricKey, currentlyActive);
-      });
-      if (onYearMetricCardHoverReset) {
-        el.addEventListener("pointerleave", () => {
-          if (el.classList.contains("summary-glow-cleared")) {
-            el.classList.remove("summary-glow-cleared");
-          }
-          onYearMetricCardHoverReset(metricKey);
-        });
-      }
-    } else {
-      el.className = "summary-card";
-    }
-    const title = document.createElement("div");
-    title.className = "summary-title";
-    title.textContent = card.title;
-    const value = document.createElement("div");
-    value.className = "summary-value";
-    value.textContent = card.value;
-    el.appendChild(title);
-    el.appendChild(value);
-    summary.appendChild(el);
-  });
+  const visibleTypeCardsList = typeCardsList
+    .filter((type) => (typeTotals[type]?.count || 0) > 0)
+    .sort((a, b) => (typeTotals[b]?.count || 0) - (typeTotals[a]?.count || 0));
 
   if (showTypeBreakdown && visibleTypeCardsList.length) {
-    visibleTypeCardsList.forEach((type) => {
+    const typeRail = document.createElement("div");
+    typeRail.className = "summary-type-rail";
+
+    const typeRailNav = document.createElement("div");
+    typeRailNav.className = "summary-type-rail-nav";
+
+    visibleTypeCardsList.forEach((type, index) => {
       const typeCard = document.createElement("button");
       typeCard.type = "button";
-      typeCard.className = "summary-card summary-card-action summary-type-card";
+      typeCard.className = "summary-type-link";
       const isActiveTypeCard = Boolean(activeTypeCards && activeTypeCards.has(type));
       typeCard.classList.toggle("active", isActiveTypeCard);
       if (!isActiveTypeCard && hoverClearedType === type) {
         typeCard.classList.add("summary-glow-cleared");
       }
       typeCard.setAttribute("aria-pressed", isActiveTypeCard ? "true" : "false");
-      typeCard.title = `Filter: ${displayType(type)}`;
-      const title = document.createElement("div");
-      title.className = "summary-title";
-      title.textContent = summaryTypeTitle(type);
-      const value = document.createElement("div");
-      value.className = "summary-type";
+      typeCard.title = `Focus Chronicle on ${displayType(type)}`;
+      typeCard.style.setProperty("--summary-type-accent", getColors(type)[4]);
+
+      const label = document.createElement("span");
+      label.className = "summary-type-link-label";
+      label.textContent = summaryTypeTitle(type);
+      const count = document.createElement("span");
+      count.className = "summary-type-link-count";
+      count.textContent = formatNumber(typeTotals[type]?.count || 0, 0);
       const dot = document.createElement("span");
-      dot.className = "summary-dot";
-      dot.style.background = getColors(type)[4];
-      const text = document.createElement("span");
-      text.textContent = (typeTotals[type]?.count || 0).toLocaleString();
-      value.appendChild(dot);
-      value.appendChild(text);
-      typeCard.appendChild(title);
-      typeCard.appendChild(value);
+      dot.className = "summary-type-link-dot";
+      dot.style.setProperty("--summary-type-accent", getColors(type)[4]);
+      const textWrap = document.createElement("span");
+      textWrap.className = "summary-type-link-text";
+      typeCard.appendChild(dot);
+      textWrap.appendChild(label);
+      textWrap.appendChild(count);
+      typeCard.appendChild(textWrap);
       if (onTypeCardHoverReset) {
         typeCard.addEventListener("pointerleave", () => {
           if (typeCard.classList.contains("summary-glow-cleared")) {
@@ -2981,9 +3302,17 @@ function buildSummary(
       if (onTypeCardSelect) {
         typeCard.addEventListener("click", () => onTypeCardSelect(type, isActiveTypeCard));
       }
-      summary.appendChild(typeCard);
+      typeRailNav.appendChild(typeCard);
+      if (index < visibleTypeCardsList.length - 1) {
+        const separator = document.createElement("span");
+        separator.className = "summary-type-separator";
+        separator.setAttribute("aria-hidden", "true");
+        separator.textContent = "|";
+        typeRailNav.appendChild(separator);
+      }
     });
-    centerSummaryTypeCardTailRow(summary);
+    typeRail.appendChild(typeRailNav);
+    summary.appendChild(typeRail);
   }
 }
 
@@ -3121,7 +3450,7 @@ function buildHeatmapArea(aggregates, year, units, colors, type, layout, options
     const singleActivityLink = Number(entry.count || 0) === 1
       ? firstTooltipActivityLink(activityLinksByType, type)
       : "";
-    const lines = [createTooltipTextLine(dateStr)];
+    const lines = [createTooltipTextLine(formatDisplayDate(dateStr))];
     if (singleTypeLabel) {
       lines.push(createTooltipLinkedTypeLine("1 ", singleTypeLabel, "", singleActivityLink));
     } else {
@@ -3162,6 +3491,15 @@ function buildHeatmapArea(aggregates, year, units, colors, type, layout, options
       lines.push(createTooltipTextLine(`Duration: ${duration}`));
     }
     const tooltipContent = { lines };
+    const keyboardTooltipLabel = lines
+      .map((line) => (Array.isArray(line) ? line.map((segment) => String(segment?.text || "")).join("") : String(line || "")))
+      .join(". ");
+    if (filled) {
+      cell.classList.add("is-focusable");
+      cell.tabIndex = 0;
+      cell.setAttribute("role", "button");
+      cell.setAttribute("aria-label", keyboardTooltipLabel);
+    }
     const canPinTooltip = Boolean(flattenTooltipActivityLinks(activityLinksByType).length);
     if (!useTouchInteractions) {
       cell.addEventListener("mouseenter", (event) => {
@@ -3179,6 +3517,35 @@ function buildHeatmapArea(aggregates, year, units, colors, type, layout, options
         if (hasActiveTooltipCell()) return;
         hideTooltip();
       });
+      if (filled) {
+        cell.addEventListener("focus", () => {
+          if (isTooltipPinned()) return;
+          const point = getTooltipEventPoint(null, cell);
+          showTooltip(tooltipContent, point.x, point.y, { interactive: canPinTooltip });
+        });
+        cell.addEventListener("blur", () => {
+          if (isTooltipPinned()) return;
+          hideTooltip();
+        });
+        cell.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter" && event.key !== " ") {
+            return;
+          }
+          event.preventDefault();
+          if (canPinTooltip) {
+            if (pinnedTooltipCell === cell) {
+              clearPinnedTooltipCell();
+              hideTooltip();
+              return;
+            }
+            clearPinnedTooltipCell();
+            pinnedTooltipCell = cell;
+            cell.classList.add("active");
+          }
+          const point = getTooltipEventPoint(null, cell);
+          showTooltip(tooltipContent, point.x, point.y, { interactive: canPinTooltip });
+        });
+      }
       if (canPinTooltip) {
         cell.addEventListener("click", (event) => {
           if (pinnedTooltipCell === cell) {
@@ -3304,6 +3671,106 @@ function buildSideStatColumn(items, options = {}) {
     column.appendChild(card);
   });
   return column;
+}
+
+function createChronicleLensIcon(metricKey) {
+  const icon = document.createElement("span");
+  icon.className = "chronicle-lens-icon";
+  icon.setAttribute("aria-hidden", "true");
+  const svgByMetricKey = {
+    [ACTIVE_DAYS_METRIC_KEY]: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3.5" y="5" width="17" height="15" rx="3"></rect>
+        <path d="M7 3.5v3"></path>
+        <path d="M17 3.5v3"></path>
+        <path d="M3.5 9.5h17"></path>
+        <path d="M8.5 13l2 2 5-5"></path>
+      </svg>`,
+    moving_time: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="8.5"></circle>
+        <path d="M12 7.5v5l3 1.8"></path>
+      </svg>`,
+    distance: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 18c4.5-9.5 11.5-9.5 16 0"></path>
+        <path d="M6.5 15.5h0"></path>
+        <path d="M12 9.5h0"></path>
+        <path d="M17.5 15.5h0"></path>
+      </svg>`,
+    elevation_gain: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3.5 18.5 9.5 9l3.5 5 3-4.5 4.5 9"></path>
+        <path d="M15.5 6.5v5"></path>
+        <path d="m13.5 8.5 2-2 2 2"></path>
+      </svg>`,
+    [PACE_METRIC_KEY]: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 16a7 7 0 1 1 14 0"></path>
+        <path d="M12 12 16 9"></path>
+        <path d="M8 17.5h8"></path>
+      </svg>`,
+    [EFFICIENCY_METRIC_KEY]: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 8.5c1.4-2 3.4-3 6-3 3.8 0 6.5 2.7 6.5 6.5S15.8 18.5 12 18.5c-2.6 0-4.6-1-6-3"></path>
+        <path d="m4.5 8.5 1.5-3 3 1.5"></path>
+        <path d="m19.5 15.5-1.5 3-3-1.5"></path>
+      </svg>`,
+    [FITNESS_METRIC_KEY]: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 13h3l2-5 3 9 2-4h6"></path>
+      </svg>`,
+    [FATIGUE_METRIC_KEY]: `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13.5 3.5c-4.6 0-8 3.5-8 8s3.4 8 8 8c2.3 0 4.2-.7 5.8-2.2-1.1.4-2.3.5-3.5.3-4.1-.7-6.9-4.5-6.2-8.5.4-2 1.5-3.7 3-5 .2-.2.5-.4.9-.6Z"></path>
+      </svg>`,
+  };
+  icon.innerHTML = svgByMetricKey[metricKey] || svgByMetricKey[ACTIVE_DAYS_METRIC_KEY];
+  return icon;
+}
+
+function syncChronicleStageScales(scope = document) {
+  if (!scope || typeof scope.querySelectorAll !== "function") return;
+  scope.querySelectorAll(".chronicle-year-band-heatmap").forEach((wrapper) => {
+    const heatmapArea = wrapper.querySelector(".heatmap-area");
+    if (!heatmapArea) return;
+    wrapper.style.removeProperty("--chronicle-heatmap-scale");
+    wrapper.style.removeProperty("height");
+    const availableWidth = Number(wrapper.clientWidth || 0);
+    const naturalWidth = Number(heatmapArea.scrollWidth || 0);
+    const naturalHeight = Number(heatmapArea.scrollHeight || 0);
+    if (!(availableWidth > 0) || !(naturalWidth > 0) || !(naturalHeight > 0)) return;
+    const scale = Math.min(1, availableWidth / naturalWidth);
+    wrapper.style.setProperty("--chronicle-heatmap-scale", String(scale));
+    wrapper.style.height = `${Math.ceil(naturalHeight * scale)}px`;
+  });
+}
+
+function syncChronicleLensLayouts(scope = document) {
+  if (!scope || typeof scope.querySelectorAll !== "function") return;
+  scope.querySelectorAll(".chronicle-lens-row").forEach((row) => {
+    const buttons = Array.from(row.querySelectorAll(".chronicle-lens-button"));
+    row.querySelectorAll(".chronicle-lens-spacer").forEach((node) => node.remove());
+    if (!buttons.length) {
+      row.style.removeProperty("--chronicle-lens-columns");
+      return;
+    }
+    const availableWidth = Number(row.clientWidth || row.parentElement?.clientWidth || 0);
+    const minCellWidth = window.innerWidth <= 640 ? 118 : 132;
+    const computedStyle = window.getComputedStyle(row);
+    const columnGap = parseFloat(computedStyle.columnGap || computedStyle.gap || "14") || 14;
+    const maxPerRow = Math.max(1, Math.min(buttons.length, Math.floor((availableWidth + columnGap) / (minCellWidth + columnGap)) || 1));
+    const rowsNeeded = Math.max(1, Math.ceil(buttons.length / maxPerRow));
+    const columns = Math.max(1, Math.ceil(buttons.length / rowsNeeded));
+    row.style.setProperty("--chronicle-lens-columns", String(columns));
+    const placeholderCount = Math.max(0, (columns * rowsNeeded) - buttons.length);
+    for (let index = 0; index < placeholderCount; index += 1) {
+      const spacer = document.createElement("span");
+      spacer.className = "chronicle-lens-spacer";
+      spacer.setAttribute("aria-hidden", "true");
+      row.appendChild(spacer);
+    }
+  });
 }
 
 function getFilterableKeys(items) {
@@ -3608,6 +4075,305 @@ function buildCard(type, year, aggregates, units, options = {}) {
   return card;
 }
 
+function buildCombinedChronicleCard(payload, types, years, units, options = {}) {
+  const card = document.createElement("section");
+  card.className = "card chronicle-stage";
+  const layout = getLayout();
+  const stageYears = years
+    .map((year) => {
+      const yearAggregates = combineYearAggregates(payload.aggregates?.[String(year)] || {}, types);
+      const totalActivities = Object.values(yearAggregates).reduce((sum, entry) => sum + Number(entry?.count || 0), 0);
+      return {
+        year,
+        aggregates: yearAggregates,
+        totalActivities,
+      };
+    })
+    .filter((entry) => entry.totalActivities > 0);
+
+  if (!stageYears.length) {
+    return {
+      card: buildEmptySelectionCard(),
+      filterableMetricKeys: [],
+    };
+  }
+
+  const intervalsEnabled = Boolean(options.intervalsEnabled);
+  const selectedTypes = Array.isArray(types) ? types.slice() : [];
+  const accentFallback = getActivityFrequencyCardColor(selectedTypes);
+  const lensColor = options.metricHeatmapColor || accentFallback;
+  const metricMaxByKey = {
+    [ACTIVE_DAYS_METRIC_KEY]: 0,
+    distance: 0,
+    moving_time: 0,
+    elevation_gain: 0,
+    [PACE_METRIC_KEY]: 0,
+    [EFFICIENCY_METRIC_KEY]: 0,
+    [FITNESS_METRIC_KEY]: 0,
+    [FATIGUE_METRIC_KEY]: 0,
+  };
+  const metricRangeByKey = {};
+  const totals = {
+    count: 0,
+    active_days: 0,
+    distance: 0,
+    moving_time: 0,
+    elevation: 0,
+    avg_pace_mps: 0,
+    avg_efficiency_factor: 0,
+    avg_fitness: 0,
+    avg_fatigue: 0,
+    _pace_weight_seconds: 0,
+    _pace_weighted_sum: 0,
+    _eff_weight_seconds: 0,
+    _eff_weighted_sum: 0,
+    _fitness_weight: 0,
+    _fitness_sum: 0,
+    _fatigue_weight: 0,
+    _fatigue_sum: 0,
+  };
+
+  stageYears.forEach((yearEntry) => {
+    Object.values(yearEntry.aggregates || {}).forEach((entry) => {
+      totals.count += Number(entry.count || 0);
+      totals.active_days += Number(entry.count || 0) > 0 ? 1 : 0;
+      totals.distance += Number(entry.distance || 0);
+      totals.moving_time += Number(entry.moving_time || 0);
+      totals.elevation += Number(entry.elevation_gain || 0);
+      metricMaxByKey.distance = Math.max(metricMaxByKey.distance, Number(entry.distance || 0));
+      metricMaxByKey.moving_time = Math.max(metricMaxByKey.moving_time, Number(entry.moving_time || 0));
+      metricMaxByKey.elevation_gain = Math.max(metricMaxByKey.elevation_gain, Number(entry.elevation_gain || 0));
+      updateMetricRange(metricRangeByKey, "distance", entry.distance);
+      updateMetricRange(metricRangeByKey, "moving_time", entry.moving_time);
+      updateMetricRange(metricRangeByKey, "elevation_gain", entry.elevation_gain);
+
+      const entryPace = derivePaceMpsFromEntry(entry);
+      metricMaxByKey[PACE_METRIC_KEY] = Math.max(metricMaxByKey[PACE_METRIC_KEY], entryPace);
+      updateMetricRange(metricRangeByKey, PACE_METRIC_KEY, entryPace);
+
+      metricMaxByKey[EFFICIENCY_METRIC_KEY] = Math.max(
+        metricMaxByKey[EFFICIENCY_METRIC_KEY],
+        Number(entry[EFFICIENCY_METRIC_KEY] || 0),
+      );
+      updateMetricRange(metricRangeByKey, EFFICIENCY_METRIC_KEY, entry[EFFICIENCY_METRIC_KEY]);
+      metricMaxByKey[FITNESS_METRIC_KEY] = Math.max(
+        metricMaxByKey[FITNESS_METRIC_KEY],
+        Number(entry[FITNESS_METRIC_KEY] || 0),
+      );
+      updateMetricRange(metricRangeByKey, FITNESS_METRIC_KEY, entry[FITNESS_METRIC_KEY]);
+      metricMaxByKey[FATIGUE_METRIC_KEY] = Math.max(
+        metricMaxByKey[FATIGUE_METRIC_KEY],
+        Number(entry[FATIGUE_METRIC_KEY] || 0),
+      );
+      updateMetricRange(metricRangeByKey, FATIGUE_METRIC_KEY, entry[FATIGUE_METRIC_KEY]);
+
+      const entryMovingTime = Number(entry.moving_time || 0);
+      const entryCount = Number(entry.count || 0);
+      if (entryMovingTime > 0 && entryPace > 0) {
+        totals._pace_weighted_sum += entryPace * entryMovingTime;
+        totals._pace_weight_seconds += entryMovingTime;
+      }
+      const entryEfficiency = Number(entry[EFFICIENCY_METRIC_KEY] || 0);
+      if (entryMovingTime > 0 && entryEfficiency > 0) {
+        totals._eff_weighted_sum += entryEfficiency * entryMovingTime;
+        totals._eff_weight_seconds += entryMovingTime;
+      }
+      const entryFitness = Number(entry[FITNESS_METRIC_KEY] || 0);
+      if (entryCount > 0 && entryFitness > 0) {
+        totals._fitness_sum += entryFitness * entryCount;
+        totals._fitness_weight += entryCount;
+      }
+      const entryFatigue = Number(entry[FATIGUE_METRIC_KEY] || 0);
+      if (entryCount > 0 && entryFatigue > 0) {
+        totals._fatigue_sum += entryFatigue * entryCount;
+        totals._fatigue_weight += entryCount;
+      }
+    });
+  });
+  metricMaxByKey[ACTIVE_DAYS_METRIC_KEY] = totals.active_days > 0 ? 1 : 0;
+  if (totals._pace_weight_seconds > 0) {
+    totals.avg_pace_mps = totals._pace_weighted_sum / totals._pace_weight_seconds;
+  }
+  if (totals._eff_weight_seconds > 0) {
+    totals.avg_efficiency_factor = totals._eff_weighted_sum / totals._eff_weight_seconds;
+  }
+  if (totals._fitness_weight > 0) {
+    totals.avg_fitness = totals._fitness_sum / totals._fitness_weight;
+  }
+  if (totals._fatigue_weight > 0) {
+    totals.avg_fatigue = totals._fatigue_sum / totals._fatigue_weight;
+  }
+
+  const metricItems = buildYearMetricStatItems(totals, units, null, { intervalsEnabled });
+  const filterableMetricKeys = [ACTIVE_DAYS_METRIC_KEY];
+  metricItems.forEach((item) => {
+    if (!item || !item.filterable) return;
+    if (Array.isArray(item.filterableMetricKeys) && item.filterableMetricKeys.length) {
+      item.filterableMetricKeys.forEach((metricKey) => {
+        if (typeof metricKey === "string" && metricKey && !filterableMetricKeys.includes(metricKey)) {
+          filterableMetricKeys.push(metricKey);
+        }
+      });
+      return;
+    }
+    if (typeof item.key === "string" && item.key && !filterableMetricKeys.includes(item.key)) {
+      filterableMetricKeys.push(item.key);
+    }
+  });
+
+  const normalizedMetricKey = normalizeSingleSelectKey(
+    typeof options.initialMetricKey === "string" ? options.initialMetricKey : null,
+    filterableMetricKeys,
+  );
+  const activeMetricKey = normalizedMetricKey;
+  const lensMeta = getChronicleLensMeta(activeMetricKey, lensColor);
+  const lensRgb = hexToRgb(lensMeta.accent);
+  const lensSoft = lensRgb ? `rgba(${lensRgb.r}, ${lensRgb.g}, ${lensRgb.b}, 0.18)` : "rgba(255, 138, 91, 0.18)";
+  const lensGlow = lensRgb ? `rgba(${lensRgb.r}, ${lensRgb.g}, ${lensRgb.b}, 0.34)` : "rgba(255, 138, 91, 0.34)";
+  card.style.setProperty("--chronicle-accent", lensMeta.accent);
+  card.style.setProperty("--chronicle-accent-soft", lensSoft);
+  card.style.setProperty("--chronicle-accent-glow", lensGlow);
+  card.dataset.activeLens = activeMetricKey || ACTIVE_DAYS_METRIC_KEY;
+  card.dataset.totalActivities = String(Math.max(0, Math.round(totals.count)));
+
+  const body = document.createElement("div");
+  body.className = "chronicle-stage-body";
+
+  const graphShell = document.createElement("div");
+  graphShell.className = "chronicle-stage-graph-shell";
+  const graph = document.createElement("div");
+  graph.className = "chronicle-stage-graph";
+  const colorForEntry = (entry) => {
+    if (!entry.types || entry.types.length === 0) {
+      return {
+        background: DEFAULT_COLORS[0],
+        backgroundImage: "",
+      };
+    }
+    if (entry.types.length === 1) {
+      return {
+        background: getColors(entry.types[0])[4],
+        backgroundImage: "",
+      };
+    }
+    return {
+      background: getColors(entry.types[0])[4] || MULTI_TYPE_COLOR,
+      backgroundImage: buildMultiTypeBackgroundImage(entry.types),
+    };
+  };
+
+  const onLensChange = typeof options.onLensChange === "function"
+    ? options.onLensChange
+    : null;
+
+  stageYears.forEach((yearEntry, index) => {
+    const band = document.createElement("section");
+    band.className = "chronicle-year-band";
+
+    const bandMeta = document.createElement("div");
+    bandMeta.className = "chronicle-year-band-meta";
+    const bandYear = document.createElement("div");
+    bandYear.className = "chronicle-year-band-label";
+    bandYear.textContent = String(yearEntry.year);
+    const bandSummary = document.createElement("div");
+    bandSummary.className = "chronicle-year-band-summary";
+    bandSummary.textContent = `(${formatNumber(yearEntry.totalActivities, 0)})`;
+    bandMeta.appendChild(bandYear);
+    bandMeta.appendChild(bandSummary);
+
+    const heatmapArea = buildHeatmapArea(
+      yearEntry.aggregates,
+      yearEntry.year,
+      units,
+      DEFAULT_COLORS,
+      "all",
+      layout,
+      {
+        ...options,
+        weekStart: options.weekStart,
+        metricHeatmapKey: activeMetricKey,
+        metricMaxByKey,
+        metricRangeByKey,
+        metricHeatmapColor: lensMeta.accent,
+        metricHeatmapEmptyColor: DEFAULT_COLORS[0],
+        colorForEntry,
+        selectedTypes,
+      },
+    );
+    if (index > 0) {
+      heatmapArea.classList.add("heatmap-area-compact");
+    }
+    const heatmapWrap = document.createElement("div");
+    heatmapWrap.className = "chronicle-year-band-heatmap";
+    heatmapWrap.appendChild(heatmapArea);
+    band.appendChild(bandMeta);
+    band.appendChild(heatmapWrap);
+    graph.appendChild(band);
+  });
+
+  const lensRow = document.createElement("div");
+  lensRow.className = "chronicle-lens-row";
+  const metricValueByKey = {
+    [ACTIVE_DAYS_METRIC_KEY]: formatNumber(totals.active_days, 0),
+    moving_time: formatDuration(totals.moving_time),
+    distance: totals.distance > 0
+      ? formatDistance(totals.distance, units || DEFAULT_UNITS)
+      : STAT_PLACEHOLDER,
+    elevation_gain: totals.elevation > 0
+      ? formatElevation(totals.elevation, units || DEFAULT_UNITS)
+      : STAT_PLACEHOLDER,
+    [PACE_METRIC_KEY]: formatPaceFromMps(totals.avg_pace_mps, units || DEFAULT_UNITS),
+    [EFFICIENCY_METRIC_KEY]: formatEfficiency(totals.avg_efficiency_factor),
+    [FITNESS_METRIC_KEY]: totals.avg_fitness > 0 ? formatNumber(totals.avg_fitness, 0) : STAT_PLACEHOLDER,
+    [FATIGUE_METRIC_KEY]: totals.avg_fatigue > 0 ? formatNumber(totals.avg_fatigue, 0) : STAT_PLACEHOLDER,
+  };
+  filterableMetricKeys.forEach((metricKey) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chronicle-lens-button";
+    const lensSpec = getChronicleLensMeta(metricKey, lensColor);
+    button.style.setProperty("--chronicle-lens-accent", lensSpec.accent);
+    button.classList.toggle("active", metricKey === activeMetricKey);
+    button.setAttribute("aria-pressed", metricKey === activeMetricKey ? "true" : "false");
+    button.title = `${METRIC_LABEL_BY_KEY[metricKey] || "Lens"} filter`;
+    const topLine = document.createElement("span");
+    topLine.className = "chronicle-lens-button-topline";
+    topLine.appendChild(createChronicleLensIcon(metricKey));
+    const label = document.createElement("span");
+    label.className = "chronicle-lens-button-label";
+    label.textContent = METRIC_LABEL_BY_KEY[metricKey] || "Lens";
+    topLine.appendChild(label);
+    const value = document.createElement("span");
+    value.className = "chronicle-lens-button-value";
+    value.textContent = metricValueByKey[metricKey] || STAT_PLACEHOLDER;
+    button.appendChild(topLine);
+    button.appendChild(value);
+    button.addEventListener("click", () => {
+      if (!onLensChange) return;
+      onLensChange(metricKey === activeMetricKey ? null : metricKey);
+    });
+    lensRow.appendChild(button);
+  });
+
+  graphShell.appendChild(graph);
+  const storySlot = document.createElement("div");
+  storySlot.className = "chronicle-stage-story-slot";
+  body.appendChild(lensRow);
+  body.appendChild(graphShell);
+  body.appendChild(storySlot);
+  card.appendChild(body);
+
+  return {
+    card,
+    filterableMetricKeys,
+    attachStoryPatterns(panel) {
+      if (!(panel instanceof HTMLElement)) return;
+      storySlot.innerHTML = "";
+      storySlot.appendChild(panel);
+    },
+  };
+}
+
 function buildEmptySelectionCard() {
   const card = document.createElement("div");
   card.className = "card card-empty-selection";
@@ -3802,16 +4568,15 @@ function buildStatPanel(title, subtitle) {
 
 function buildStatsOverview(payload, types, years, color, options = {}) {
   const card = document.createElement("div");
-  card.className = "card more-stats";
+  card.className = "card more-stats chronicle-story-patterns";
 
   const body = document.createElement("div");
   body.className = "more-stats-body";
 
   const graphs = document.createElement("div");
   graphs.className = "more-stats-grid";
-  const facts = buildSideStatColumn([], { className: "more-stats-facts side-stats-column" });
-  const metricChipRow = document.createElement("div");
-  metricChipRow.className = "more-stats-metric-chips";
+  const facts = document.createElement("div");
+  facts.className = "more-stats-facts";
   const factGrid = document.createElement("div");
   factGrid.className = "more-stats-fact-grid";
 
@@ -3974,7 +4739,6 @@ function buildStatsOverview(payload, types, years, color, options = {}) {
     label: item.label,
     filterable: Number(metricTotals[item.key] || 0) > 0,
   }));
-  const metricButtons = new Map();
   const filterableMetricKeys = getFilterableKeys(metricItems);
   if (Number(metricTotals[ACTIVE_DAYS_METRIC_KEY] || 0) > 0) {
     filterableMetricKeys.push(ACTIVE_DAYS_METRIC_KEY);
@@ -3988,11 +4752,6 @@ function buildStatsOverview(payload, types, years, color, options = {}) {
       source,
     });
   };
-  const renderMetricButtonState = () => renderSingleSelectButtonState(
-    metricItems,
-    metricButtons,
-    activeMetricKey,
-  );
   if (baseData.activityCount <= 0) {
     if (onFactStateChange) {
       onFactStateChange({
@@ -4079,7 +4838,6 @@ function buildStatsOverview(payload, types, years, color, options = {}) {
     },
   ];
 
-  const factButtons = new Map();
   const filterableFactKeys = getFilterableKeys(factItems);
   activeFactKey = normalizeSingleSelectKey(activeFactKey, filterableFactKeys);
   const reportFactState = (source) => {
@@ -4090,11 +4848,6 @@ function buildStatsOverview(payload, types, years, color, options = {}) {
       source,
     });
   };
-  const renderFactButtonState = () => renderSingleSelectButtonState(
-    factItems,
-    factButtons,
-    activeFactKey,
-  );
 
   const renderFrequencyGraphs = () => {
     const activeFact = factItems.find((item) => item.key === activeFactKey) || null;
@@ -4182,72 +4935,77 @@ function buildStatsOverview(payload, types, years, color, options = {}) {
     hourPanel.body.appendChild(fallback);
   };
 
-  metricItems.forEach((item) => {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "more-stats-metric-chip";
-    chip.textContent = item.label;
-    chip.setAttribute("aria-disabled", item.filterable ? "false" : "true");
-    chip.setAttribute("aria-pressed", "false");
-    if (item.filterable) {
-      attachSingleSelectCardToggle(chip, {
-        itemKey: item.key,
-        getActiveKey: () => activeMetricKey,
-        setActiveKey: (nextMetricKey) => {
-          activeMetricKey = nextMetricKey;
-        },
-        onToggleComplete: () => {
-          renderMetricButtonState();
-          renderFrequencyGraphs();
-          reportMetricState("card");
-          schedulePostInteractionAlignment();
-        },
-      });
-    } else {
-      const unavailableReason = getFrequencyMetricUnavailableReason(item.key, item.label);
-      chip.classList.add("is-unavailable");
-      chip.title = unavailableReason;
-      chip.setAttribute("aria-label", `${item.label} unavailable. ${unavailableReason}`);
-      attachTooltip(chip, unavailableReason);
-    }
-    metricButtons.set(item.key, chip);
-    metricChipRow.appendChild(chip);
-  });
-
-  factItems.forEach((item) => {
-    const factCard = buildSideStatCard(item.label, item.value, {
-      tagName: "button",
-      className: "card-stat more-stats-fact-card more-stats-fact-button",
-      extraClasses: item.key ? [`fact-${item.key}`] : [],
-      disabled: !item.filterable,
-      ariaPressed: false,
+  const factButtons = new Map();
+  const renderFactButtonState = () => {
+    factItems.forEach((item) => {
+      const button = factButtons.get(item.key);
+      if (!button) return;
+      const active = item.key === activeFactKey;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+      if (active) {
+        button.classList.remove("fact-glow-cleared");
+      }
     });
-    if (item.filterable) {
-      attachSingleSelectCardToggle(factCard, {
-        itemKey: item.key,
-        getActiveKey: () => activeFactKey,
-        setActiveKey: (nextFactKey) => {
-          activeFactKey = nextFactKey;
-        },
-        onToggleComplete: () => {
-          renderFactButtonState();
-          renderFrequencyGraphs();
-          reportFactState("card");
-          schedulePostInteractionAlignment();
-        },
-      });
+  };
+
+  factItems.forEach((item, index) => {
+    const factButton = document.createElement("button");
+    factButton.type = "button";
+    factButton.className = "more-stats-fact-link";
+    if (!item.filterable) {
+      factButton.disabled = true;
     }
-    factButtons.set(item.key, factCard);
-    factGrid.appendChild(factCard);
+    factButton.setAttribute("aria-pressed", "false");
+    factButton.style.setProperty("--more-stats-fact-accent", color);
+
+    const label = document.createElement("span");
+    label.className = "more-stats-fact-label";
+    label.textContent = item.label;
+    const value = document.createElement("span");
+    value.className = "more-stats-fact-value";
+    value.textContent = item.value;
+    factButton.appendChild(label);
+    factButton.appendChild(value);
+
+    if (item.filterable) {
+      factButton.addEventListener("click", () => {
+        const clearing = activeFactKey === item.key;
+        activeFactKey = clearing ? null : item.key;
+        if (clearing) {
+          factButton.classList.add("fact-glow-cleared");
+          factButton.blur();
+        } else {
+          factButton.classList.remove("fact-glow-cleared");
+        }
+        renderFactButtonState();
+        renderFrequencyGraphs();
+        reportFactState("card");
+        schedulePostInteractionAlignment();
+      });
+      if (!useTouchInteractions) {
+        factButton.addEventListener("pointerleave", () => {
+          factButton.classList.remove("fact-glow-cleared");
+        });
+      }
+    }
+
+    factButtons.set(item.key, factButton);
+    factGrid.appendChild(factButton);
+    if (index < factItems.length - 1) {
+      const separator = document.createElement("span");
+      separator.className = "more-stats-fact-separator";
+      separator.setAttribute("aria-hidden", "true");
+      separator.textContent = "|";
+      factGrid.appendChild(separator);
+    }
   });
 
-  renderMetricButtonState();
   renderFactButtonState();
   renderFrequencyGraphs();
   reportMetricState("init");
   reportFactState("init");
 
-  facts.appendChild(metricChipRow);
   facts.appendChild(factGrid);
   body.appendChild(graphs);
   card.appendChild(body);
@@ -4373,13 +5131,26 @@ async function init() {
   syncStravaProfileLink();
   syncProfileLinkNavigationTarget();
   syncHeaderLinkPlacement();
-  const resp = await fetch("/dashboard/data.json");
-  if (!resp.ok) {
-    throw new Error(`Failed to load data.json (${resp.status})`);
-  }
-  const payload = await resp.json();
-  if (!payload || typeof payload !== "object") {
-    throw new Error("Invalid dashboard data format.");
+  const cachedPayload = readCachedDashboardPayload();
+  const cachedRevision = dashboardPayloadRevision(cachedPayload);
+  let payload;
+  let loadedFromCache = false;
+  let cacheFallbackReason = "";
+  try {
+    if (cachedPayload) {
+      payload = { ...cachedPayload, revalidating: true };
+      loadedFromCache = true;
+      cacheFallbackReason = "opening from local snapshot while live data refreshes";
+    } else {
+      payload = await fetchLiveDashboardPayload();
+    }
+  } catch (error) {
+    if (!cachedPayload) {
+      throw error;
+    }
+    payload = cachedPayload;
+    loadedFromCache = true;
+    cacheFallbackReason = String(error && error.message ? error.message : "Live dashboard refresh failed.");
   }
   const payloadRevalidating = Boolean(payload.revalidating);
   const repoCandidate = payloadRepoCandidate(payload);
@@ -4404,6 +5175,25 @@ async function init() {
     { value: "all", label: "All Activities" },
     ...payload.types.map((type) => ({ value: type, label: displayType(type) })),
   ];
+  const initialUrlState = readDashboardUrlState();
+  const storedScopeState = readStoredDashboardScopeState();
+  const resolvedScopeState = {
+    types: initialUrlState.hasTypesParam
+      ? initialUrlState.types
+      : (storedScopeState?.types || []),
+    years: initialUrlState.hasYearsParam
+      ? initialUrlState.years
+      : (storedScopeState?.years || []),
+    scopeMode: (initialUrlState.hasStartParam || initialUrlState.hasEndParam)
+      ? ((initialUrlState.start && initialUrlState.end) ? "custom" : "preset")
+      : (storedScopeState?.scopeMode || "preset"),
+    start: (initialUrlState.hasStartParam || initialUrlState.hasEndParam)
+      ? initialUrlState.start
+      : (storedScopeState?.start || ""),
+    end: (initialUrlState.hasStartParam || initialUrlState.hasEndParam)
+      ? initialUrlState.end
+      : (storedScopeState?.end || ""),
+  };
   const dashboardIntervalsEnabled = Boolean(payload?.intervals?.enabled);
   const setupUnits = normalizeUnits(payload.units || DEFAULT_UNITS);
   const setupWeekStart = normalizeWeekStart(payload.week_start || payload.weekStart);
@@ -4416,7 +5206,12 @@ async function init() {
   let selectedTypes = new Set();
   let allYearsMode = true;
   let selectedYears = new Set();
-  let currentUnitSystem = getUnitSystemFromUnits(setupUnits);
+  const payloadDateBounds = getPayloadDateBounds(payload);
+  let yearScopeMode = resolvedScopeState.scopeMode === "custom" && resolvedScopeState.start && resolvedScopeState.end
+    ? "custom"
+    : "preset";
+  let customDateRange = normalizeCustomDateRange(resolvedScopeState.start, resolvedScopeState.end, payloadDateBounds);
+  let currentUnitSystem = initialUrlState.units || getUnitSystemFromUnits(setupUnits);
   let currentUnits = getUnitsForSystem(currentUnitSystem);
   let currentVisibleYears = payload.years.slice().sort((a, b) => b - a);
   let hoverClearedSummaryType = null;
@@ -4430,6 +5225,25 @@ async function init() {
   let visibleFrequencyFilterableMetricKeys = new Set();
   let draftTypeMenuSelection = null;
   let draftYearMenuSelection = null;
+  let draftYearScopeMode = yearScopeMode;
+  let draftCustomDateRange = { ...customDateRange };
+
+  const initialSelectedTypes = payload.types.filter((type) => resolvedScopeState.types.includes(type));
+  if (initialSelectedTypes.length > 0 && initialSelectedTypes.length < payload.types.length) {
+    allTypesMode = false;
+    selectedTypes = new Set(initialSelectedTypes);
+  }
+  const initialSelectedYears = payload.years.filter((year) => resolvedScopeState.years.includes(Number(year)));
+  if (yearScopeMode !== "custom" && initialSelectedYears.length > 0 && initialSelectedYears.length < payload.years.length) {
+    allYearsMode = false;
+    selectedYears = new Set(initialSelectedYears);
+  }
+  if (initialUrlState.lens) {
+    payload.years.forEach((year) => {
+      selectedYearMetricByYear.set(Number(year), initialUrlState.lens);
+    });
+    selectedFrequencyMetricKey = initialUrlState.lens;
+  }
 
   function hasAnyYearMetricSelection() {
     for (const metricKey of selectedYearMetricByYear.values()) {
@@ -4445,6 +5259,7 @@ async function init() {
   function isDefaultFilterState() {
     return areAllTypesSelected()
       && areAllYearsSelected()
+      && yearScopeMode !== "custom"
       && !hasAnyYearMetricSelection()
       && !selectedFrequencyFactKey
       && !hasAnyFrequencyMetricSelection();
@@ -4476,7 +5291,7 @@ async function init() {
     currentUnitSystem = normalizedSystem;
     currentUnits = getUnitsForSystem(currentUnitSystem);
     syncUnitToggleState();
-    update();
+    refreshDashboard();
   }
 
   function setYearMetricSelection(year, metricKey) {
@@ -4542,6 +5357,9 @@ async function init() {
   }
 
   function selectedYearsList(visibleYears) {
+    if (yearScopeMode === "custom") {
+      return visibleYears.slice();
+    }
     if (areAllYearsSelected()) {
       return visibleYears.slice();
     }
@@ -4588,6 +5406,15 @@ async function init() {
   }
 
   function toggleYearMenu(value) {
+    if (value === CUSTOM_RANGE_VALUE) {
+      draftYearScopeMode = "custom";
+      draftCustomDateRange = normalizeCustomDateRange(
+        draftCustomDateRange.start,
+        draftCustomDateRange.end,
+        payloadDateBounds,
+      );
+      return;
+    }
     const selection = draftYearMenuSelection || cloneSelectionState(allYearsMode, selectedYears);
     const nextState = reduceMenuSelection({
       rawValue: value,
@@ -4598,6 +5425,7 @@ async function init() {
       allowToggleOffAll: true,
     });
     draftYearMenuSelection = nextState;
+    draftYearScopeMode = "preset";
   }
 
   function commitTypeMenuSelection() {
@@ -4608,6 +5436,14 @@ async function init() {
   }
 
   function commitYearMenuSelection() {
+    yearScopeMode = draftYearScopeMode;
+    customDateRange = normalizeCustomDateRange(draftCustomDateRange.start, draftCustomDateRange.end, payloadDateBounds);
+    if (yearScopeMode === "custom") {
+      allYearsMode = true;
+      selectedYears.clear();
+      draftYearMenuSelection = null;
+      return;
+    }
     if (!draftYearMenuSelection) return;
     allYearsMode = draftYearMenuSelection.allMode;
     selectedYears = new Set(draftYearMenuSelection.selectedValues);
@@ -4620,6 +5456,7 @@ async function init() {
   }
 
   function finalizeYearSelection() {
+    if (yearScopeMode === "custom") return;
     if (!areAllYearsSelected() && selectedYears.size === currentVisibleYears.length) {
       allYearsMode = true;
       selectedYears.clear();
@@ -4629,6 +5466,16 @@ async function init() {
   function setCardScrollKey(card, key) {
     if (!card || !card.dataset) return;
     card.dataset.scrollKey = String(key || "");
+  }
+
+  function refreshDashboard(options = {}) {
+    if (options.menuOnly) {
+      update(options);
+      return;
+    }
+    runDashboardTransition(() => {
+      update(options);
+    });
   }
 
   function update(options = {}) {
@@ -4641,32 +5488,44 @@ async function init() {
     const resetViewport = Boolean(options.resetViewport);
     const allTypesSelected = areAllTypesSelected();
     const types = selectedTypesList();
-    const visibleYears = getVisibleYears(payload.years);
-    currentVisibleYears = visibleYears.slice();
-    if (!areAllYearsSelected()) {
-      const visibleSet = new Set(visibleYears.map(Number));
+    const baseVisibleYears = getVisibleYears(payload.years);
+    currentVisibleYears = baseVisibleYears.slice();
+    if (yearScopeMode !== "custom" && !areAllYearsSelected()) {
+      const visibleSet = new Set(baseVisibleYears.map(Number));
       Array.from(selectedYears).forEach((year) => {
         if (!visibleSet.has(Number(year))) {
           selectedYears.delete(year);
         }
       });
     }
+    const activeCustomRange = normalizeCustomDateRange(
+      yearScopeMode === "custom" ? customDateRange.start : "",
+      yearScopeMode === "custom" ? customDateRange.end : "",
+      payloadDateBounds,
+    );
+    const scopedPayload = yearScopeMode === "custom"
+      ? buildDateScopedPayload(payload, activeCustomRange.start, activeCustomRange.end)
+      : payload;
+    const visibleYears = getVisibleYears(scopedPayload.years);
     const allYearsSelected = areAllYearsSelected();
     const yearOptions = [
       { value: "all", label: "All Years" },
-      ...visibleYears.map((year) => ({ value: String(year), label: String(year) })),
+      ...baseVisibleYears.map((year) => ({ value: String(year), label: String(year) })),
+      { value: CUSTOM_RANGE_VALUE, label: "Custom Range" },
     ];
     const typeMenuSelection = draftTypeMenuSelection || { allMode: allTypesMode, selectedValues: selectedTypes };
     const yearMenuSelection = draftYearMenuSelection || { allMode: allYearsMode, selectedValues: selectedYears };
-    const typeMenuTypes = selectedTypesListForState(typeMenuSelection, payload.types);
-    const yearMenuYears = selectedYearsListForState(yearMenuSelection, visibleYears);
+    const typeMenuTypes = selectedTypesListForState(typeMenuSelection, scopedPayload.types || payload.types);
+    const yearMenuYears = draftYearScopeMode === "custom"
+      ? visibleYears.slice()
+      : selectedYearsListForState(yearMenuSelection, baseVisibleYears);
     yearMenuYears.sort((a, b) => b - a);
 
     renderFilterButtons(yearButtons, yearOptions, (value) => {
       draftYearMenuSelection = null;
       setMenuOpenState(yearMenu, yearMenuButton, false);
       toggleYear(value);
-      update();
+      refreshDashboard();
     });
     renderFilterMenuOptions(
       typeMenuOptions,
@@ -4682,25 +5541,33 @@ async function init() {
       commitTypeMenuSelection();
       finalizeTypeSelection();
       setMenuOpenState(typeMenu, typeMenuButton, false);
-      update();
+      refreshDashboard();
     });
-    renderFilterMenuOptions(
+    renderYearMenuOptions(
       yearMenuOptions,
-      yearOptions,
-      yearMenuSelection.selectedValues,
-      yearMenuSelection.allMode,
+      baseVisibleYears,
+      yearMenuSelection,
+      draftYearScopeMode === "custom",
       (value) => {
         toggleYearMenu(value);
         update({ keepYearMenuOpen: true, menuOnly: true });
       },
-      (v) => Number(v),
+      () => {
+        toggleYearMenu(CUSTOM_RANGE_VALUE);
+        update({ keepYearMenuOpen: true, menuOnly: true });
+      },
     );
     renderFilterMenuDoneButton(yearMenuOptions, () => {
       commitYearMenuSelection();
       finalizeYearSelection();
       setMenuOpenState(yearMenu, yearMenuButton, false);
-      update();
+      refreshDashboard();
     });
+    syncCustomDateRangePanel(
+      draftYearScopeMode === "custom",
+      draftYearScopeMode === "custom" ? draftCustomDateRange : activeCustomRange,
+      payloadDateBounds,
+    );
 
     syncFilterControlState({
       typeButtons,
@@ -4708,7 +5575,7 @@ async function init() {
       selectedTypes,
       selectedYears,
       allTypeValues: payload.types,
-      allYearValues: currentVisibleYears,
+      allYearValues: baseVisibleYears,
       allTypesSelected,
       allYearsSelected,
       typeMenuTypes,
@@ -4725,6 +5592,8 @@ async function init() {
       yearMenu,
       typeMenuButton,
       yearMenuButton,
+      yearMenuCustomActive: draftYearScopeMode === "custom",
+      customRange: draftYearScopeMode === "custom" ? draftCustomDateRange : activeCustomRange,
     });
 
     syncOpenFilterMenuMaxHeights();
@@ -4745,36 +5614,12 @@ async function init() {
     years.sort((a, b) => b - a);
     const previousSummaryYearMetricKey = getActiveSummaryYearMetricKey();
     const initialFrequencyMetricKey = selectedFrequencyMetricKey;
-    const getInitialYearMetricKey = (year) => {
-      const storedMetricKey = selectedYearMetricByYear.get(Number(year));
-      if (typeof storedMetricKey === "string" && storedMetricKey) {
-        return storedMetricKey;
-      }
-      return typeof previousSummaryYearMetricKey === "string" && previousSummaryYearMetricKey
-        ? previousSummaryYearMetricKey
-        : null;
-    };
     const frequencyCardColor = getActivityFrequencyCardColor(types);
-    const showCombinedTypes = types.length > 1;
     const activeSummaryTypeCards = allTypesSelected ? new Set() : new Set(types);
     const nextVisibleYearMetricYears = new Set();
     const nextFilterableYearMetricsByYear = new Map();
     const nextVisibleFrequencyFilterableFactKeys = new Set();
     const nextVisibleFrequencyFilterableMetricKeys = new Set();
-    const onYearMetricStateChange = ({ year, metricKey, filterableMetricKeys, source }) => {
-      const normalizedYear = Number(year);
-      if (!Number.isFinite(normalizedYear)) return;
-      const filterableSet = toStringSet(filterableMetricKeys);
-      nextFilterableYearMetricsByYear.set(normalizedYear, filterableSet);
-      const normalizedMetricKey = typeof metricKey === "string" && filterableSet.has(metricKey)
-        ? metricKey
-        : null;
-      setYearMetricSelection(normalizedYear, normalizedMetricKey);
-      if (source === "card") {
-        syncSummaryYearMetricButtons();
-        syncResetAllButtonState();
-      }
-    };
     const onFrequencyFactStateChange = ({ factKey, filterableFactKeys }) => {
       nextVisibleFrequencyFilterableFactKeys.clear();
       toStringSet(filterableFactKeys).forEach((key) => {
@@ -4811,127 +5656,63 @@ async function init() {
         typeLabelsByDate,
         typeBreakdownsByDate,
         activityLinksByDateType,
-      } = buildCombinedTypeDetailsByDate(payload, types, years);
-      if (showCombinedTypes) {
-        const section = document.createElement("div");
-        section.className = "type-section";
-        const list = document.createElement("div");
-        list.className = "type-list";
-        const yearTotals = getTypesYearTotals(payload, types, years);
-        const cardYears = years.filter((year) => (yearTotals.get(year) || 0) > 0);
-        const combinedSelectionKey = `combined:${types.join("|")}`;
-        if (showMoreStats) {
-          const frequencyCard = buildStatsOverview(payload, types, cardYears, frequencyCardColor, {
-            units: currentUnits,
-            initialFactKey: selectedFrequencyFactKey,
-            initialMetricKey: initialFrequencyMetricKey,
-            onFactStateChange: onFrequencyFactStateChange,
-            onMetricStateChange: onFrequencyMetricStateChange,
+      } = buildCombinedTypeDetailsByDate(scopedPayload, types, years);
+      const section = document.createElement("div");
+      section.className = "type-section chronicle-stage-section";
+      const list = document.createElement("div");
+      list.className = "type-list";
+      const yearTotals = getTypesYearTotals(scopedPayload, types, years);
+      const cardYears = years.filter((year) => (yearTotals.get(year) || 0) > 0);
+      const combinedSelectionKey = `combined:${types.join("|")}`;
+      const activeLensAccent = getChronicleLensMeta(
+        previousSummaryYearMetricKey,
+        frequencyCardColor,
+      ).accent;
+      const chronicleStage = buildCombinedChronicleCard(scopedPayload, types, cardYears, currentUnits, {
+        metricHeatmapColor: frequencyCardColor,
+        weekStart: setupWeekStart,
+        initialMetricKey: previousSummaryYearMetricKey,
+        intervalsEnabled: dashboardIntervalsEnabled,
+        selectedTypes: types,
+        typeBreakdownsByDate,
+        typeLabelsByDate,
+        activityLinksByDateType,
+        onLensChange: (metricKey) => {
+          hoverClearedSummaryYearMetricKey = null;
+          selectedFrequencyFactKey = null;
+          visibleYearMetricYears.forEach((year) => {
+            const filterableSet = filterableYearMetricsByYear.get(year) || new Set();
+            setYearMetricSelection(year, metricKey && filterableSet.has(metricKey) ? metricKey : null);
           });
-          setCardScrollKey(frequencyCard, `${combinedSelectionKey}:frequency`);
-          list.appendChild(
-            buildLabeledCardRow(
-              "Activity Frequency",
-              frequencyCard,
-              "frequency",
-            ),
-          );
+          selectedFrequencyMetricKey = metricKey && visibleFrequencyFilterableMetricKeys.has(metricKey)
+            ? metricKey
+            : null;
+          refreshDashboard();
+        },
+      });
+      setCardScrollKey(chronicleStage.card, `${combinedSelectionKey}:stage`);
+      list.appendChild(chronicleStage.card);
+      cardYears.forEach((year) => {
+        nextVisibleYearMetricYears.add(Number(year));
+        nextFilterableYearMetricsByYear.set(Number(year), new Set(chronicleStage.filterableMetricKeys));
+      });
+      if (showMoreStats) {
+        const frequencyCard = buildStatsOverview(scopedPayload, types, cardYears, activeLensAccent, {
+          units: currentUnits,
+          initialFactKey: selectedFrequencyFactKey,
+          initialMetricKey: initialFrequencyMetricKey,
+          onFactStateChange: onFrequencyFactStateChange,
+          onMetricStateChange: onFrequencyMetricStateChange,
+        });
+        setCardScrollKey(frequencyCard, `${combinedSelectionKey}:frequency`);
+        if (typeof chronicleStage.attachStoryPatterns === "function") {
+          chronicleStage.attachStoryPatterns(frequencyCard);
+        } else {
+          list.appendChild(frequencyCard);
         }
-        cardYears.forEach((year) => {
-          const yearData = payload.aggregates?.[String(year)] || {};
-          const aggregates = combineYearAggregates(yearData, types);
-          const colorForEntry = (entry) => {
-            if (!entry.types || entry.types.length === 0) {
-              return {
-                background: DEFAULT_COLORS[0],
-                backgroundImage: "",
-              };
-            }
-            if (entry.types.length === 1) {
-              return {
-                background: getColors(entry.types[0])[4],
-                backgroundImage: "",
-              };
-            }
-            return {
-              background: getColors(entry.types[0])[4] || MULTI_TYPE_COLOR,
-              backgroundImage: buildMultiTypeBackgroundImage(entry.types),
-            };
-          };
-          const card = buildCard(
-            "all",
-            year,
-            aggregates,
-            currentUnits,
-            {
-              colorForEntry,
-              metricHeatmapColor: frequencyCardColor,
-              weekStart: setupWeekStart,
-              cardMetricYear: year,
-              initialMetricKey: getInitialYearMetricKey(year),
-              onYearMetricStateChange,
-              intervalsEnabled: dashboardIntervalsEnabled,
-              selectedTypes: types,
-              typeBreakdownsByDate,
-              typeLabelsByDate,
-              activityLinksByDateType,
-            },
-          );
-          setCardScrollKey(card, `${combinedSelectionKey}:year:${year}`);
-          trackYearMetricAvailability(year, nextVisibleYearMetricYears);
-          list.appendChild(buildLabeledCardRow(String(year), card, "year"));
-        });
-        section.appendChild(list);
-        heatmaps.appendChild(section);
-      } else {
-        types.forEach((type) => {
-          const section = document.createElement("div");
-          section.className = "type-section";
-
-          const list = document.createElement("div");
-          list.className = "type-list";
-          const yearTotals = getTypeYearTotals(payload, type, years);
-          const cardYears = years.filter((year) => (yearTotals.get(year) || 0) > 0);
-          const typeCardKey = `type:${type}`;
-          if (showMoreStats) {
-            const frequencyCard = buildStatsOverview(payload, [type], cardYears, frequencyCardColor, {
-              units: currentUnits,
-              initialFactKey: selectedFrequencyFactKey,
-              initialMetricKey: initialFrequencyMetricKey,
-              onFactStateChange: onFrequencyFactStateChange,
-              onMetricStateChange: onFrequencyMetricStateChange,
-            });
-            setCardScrollKey(frequencyCard, `${typeCardKey}:frequency`);
-            list.appendChild(
-              buildLabeledCardRow(
-                "Activity Frequency",
-                frequencyCard,
-                "frequency",
-              ),
-            );
-          }
-          cardYears.forEach((year) => {
-            const aggregates = payload.aggregates?.[String(year)]?.[type] || {};
-            const card = buildCard(type, year, aggregates, currentUnits, {
-              metricHeatmapColor: getColors(type)[4],
-              weekStart: setupWeekStart,
-              cardMetricYear: year,
-              initialMetricKey: getInitialYearMetricKey(year),
-              onYearMetricStateChange,
-              intervalsEnabled: dashboardIntervalsEnabled,
-              activityLinksByDateType,
-            });
-            setCardScrollKey(card, `${typeCardKey}:year:${year}`);
-            trackYearMetricAvailability(year, nextVisibleYearMetricYears);
-            list.appendChild(buildLabeledCardRow(String(year), card, "year"));
-          });
-          if (!list.childElementCount) {
-            return;
-          }
-          section.appendChild(list);
-          heatmaps.appendChild(section);
-        });
       }
+      section.appendChild(list);
+      heatmaps.appendChild(section);
     }
     filterableYearMetricsByYear = nextFilterableYearMetricsByYear;
     visibleYearMetricYears = nextVisibleYearMetricYears;
@@ -4945,16 +5726,32 @@ async function init() {
     }
     pruneYearMetricSelectionsByFilterability(selectedYearMetricByYear, filterableYearMetricsByYear);
 
-    const activeSummaryYearMetricKey = getActiveSummaryMetricDisplayKey();
+    const activeSummaryLensKey = getActiveSummaryYearMetricKey();
+    const activeSummaryYearMetricKey = activeSummaryLensKey;
     if (activeSummaryYearMetricKey && hoverClearedSummaryYearMetricKey === activeSummaryYearMetricKey) {
       hoverClearedSummaryYearMetricKey = null;
     }
     syncResetAllButtonState();
+    syncDashboardUrlState({
+      types: allTypesSelected ? [] : types.slice(),
+      years: yearScopeMode === "custom" || allYearsSelected ? [] : years.slice(),
+      units: currentUnitSystem,
+      lens: activeSummaryLensKey,
+      start: yearScopeMode === "custom" ? activeCustomRange.start : "",
+      end: yearScopeMode === "custom" ? activeCustomRange.end : "",
+    });
+    persistDashboardScopeState({
+      types: allTypesSelected ? [] : types.slice(),
+      years: yearScopeMode === "custom" || allYearsSelected ? [] : years.slice(),
+      scopeMode: yearScopeMode === "custom" ? "custom" : "preset",
+      start: yearScopeMode === "custom" ? activeCustomRange.start : "",
+      end: yearScopeMode === "custom" ? activeCustomRange.end : "",
+    });
 
     const showTypeBreakdown = payload.types.length > 0;
     const showActiveDays = Boolean(heatmaps);
     buildSummary(
-      payload,
+      scopedPayload,
       types,
       years,
       currentUnits,
@@ -4966,7 +5763,7 @@ async function init() {
       (type, wasActiveTypeCard) => {
         hoverClearedSummaryType = wasActiveTypeCard ? type : null;
         toggleTypeFromSummaryCard(type);
-        update();
+        refreshDashboard();
       },
       (type) => {
         if (hoverClearedSummaryType === type) {
@@ -4993,7 +5790,7 @@ async function init() {
             ? metricKey
             : null;
         }
-        update();
+        refreshDashboard();
       },
       (metricKey) => {
         if (hoverClearedSummaryYearMetricKey === metricKey) {
@@ -5022,11 +5819,26 @@ async function init() {
     draftTypeMenuSelection = null;
     setMenuOpenState(typeMenu, typeMenuButton, false);
     toggleType(value);
-    update();
+    refreshDashboard();
   });
+  if (dashboardFilterDrawerToggle) {
+    dashboardFilterDrawerToggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const open = dashboardFilterDrawer?.getAttribute("aria-hidden") === "true";
+      if (!open) {
+        draftTypeMenuSelection = null;
+        draftYearMenuSelection = null;
+        setMenuOpenState(typeMenu, typeMenuButton, false);
+        setMenuOpenState(yearMenu, yearMenuButton, false);
+        update({ menuOnly: true });
+      }
+      setDashboardFilterDrawerOpen(open);
+    });
+  }
   if (typeMenuButton) {
     typeMenuButton.addEventListener("click", (event) => {
       event.stopPropagation();
+      setDashboardFilterDrawerOpen(true);
       const open = !typeMenu?.classList.contains("open");
       if (open) {
         draftTypeMenuSelection = cloneSelectionState(allTypesMode, selectedTypes);
@@ -5042,6 +5854,7 @@ async function init() {
   if (yearMenuButton) {
     yearMenuButton.addEventListener("click", (event) => {
       event.stopPropagation();
+      setDashboardFilterDrawerOpen(true);
       const open = !yearMenu?.classList.contains("open");
       if (open) {
         draftYearMenuSelection = cloneSelectionState(allYearsMode, selectedYears);
@@ -5061,17 +5874,54 @@ async function init() {
       setMenuOpenState(typeMenu, typeMenuButton, false);
       allTypesMode = true;
       selectedTypes.clear();
-      update();
+      refreshDashboard();
     });
   }
   if (yearClearButton) {
     yearClearButton.addEventListener("click", () => {
-      if (areAllYearsSelected()) return;
+      if (yearScopeMode !== "custom" && areAllYearsSelected()) return;
       draftYearMenuSelection = null;
+      draftYearScopeMode = "preset";
+      draftCustomDateRange = { ...normalizeCustomDateRange(payloadDateBounds.start, payloadDateBounds.end, payloadDateBounds) };
       setMenuOpenState(yearMenu, yearMenuButton, false);
+      yearScopeMode = "preset";
       allYearsMode = true;
       selectedYears.clear();
-      update();
+      refreshDashboard();
+    });
+  }
+  if (customDateStartInput) {
+    customDateStartInput.addEventListener("change", () => {
+      draftYearScopeMode = "custom";
+      draftCustomDateRange = normalizeCustomDateRange(
+        customDateStartInput.value,
+        customDateEndInput?.value || draftCustomDateRange.end,
+        payloadDateBounds,
+      );
+      yearScopeMode = "custom";
+      customDateRange = { ...draftCustomDateRange };
+      refreshDashboard();
+    });
+  }
+  if (customDateEndInput) {
+    customDateEndInput.addEventListener("change", () => {
+      draftYearScopeMode = "custom";
+      draftCustomDateRange = normalizeCustomDateRange(
+        customDateStartInput?.value || draftCustomDateRange.start,
+        customDateEndInput.value,
+        payloadDateBounds,
+      );
+      yearScopeMode = "custom";
+      customDateRange = { ...draftCustomDateRange };
+      refreshDashboard();
+    });
+  }
+  if (dashboardScopeResetButton) {
+    dashboardScopeResetButton.addEventListener("click", () => {
+      if (resetAllButton) {
+        resetAllButton.click();
+      }
+      setDashboardFilterDrawerOpen(false);
     });
   }
   if (imperialUnitsButton) {
@@ -5091,10 +5941,13 @@ async function init() {
       }
       draftTypeMenuSelection = null;
       draftYearMenuSelection = null;
+      draftYearScopeMode = "preset";
+      draftCustomDateRange = { ...normalizeCustomDateRange(payloadDateBounds.start, payloadDateBounds.end, payloadDateBounds) };
       setMenuOpenState(typeMenu, typeMenuButton, false);
       setMenuOpenState(yearMenu, yearMenuButton, false);
       allTypesMode = true;
       selectedTypes.clear();
+      yearScopeMode = "preset";
       allYearsMode = true;
       selectedYears.clear();
       selectedYearMetricByYear.clear();
@@ -5106,7 +5959,7 @@ async function init() {
       visibleFrequencyFilterableMetricKeys.clear();
       hoverClearedSummaryType = null;
       hoverClearedSummaryYearMetricKey = null;
-      update({
+      refreshDashboard({
         resetCardScroll: true,
         resetViewport: true,
       });
@@ -5116,6 +5969,15 @@ async function init() {
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
     let shouldRefreshMenus = false;
+    if (
+      dashboardFilterDrawer
+      && dashboardFilterDrawer.getAttribute("aria-hidden") === "false"
+      && dashboardFilterDrawerToggle
+      && !dashboardFilterDrawer.contains(target)
+      && !dashboardFilterDrawerToggle.contains(target)
+    ) {
+      setDashboardFilterDrawerOpen(false);
+    }
     if (typeMenu && !typeMenu.contains(target)) {
       if (typeMenu.classList.contains("open")) {
         setMenuOpenState(typeMenu, typeMenuButton, false);
@@ -5141,9 +6003,20 @@ async function init() {
     }
   });
   syncUnitToggleState();
+  setDashboardFilterDrawerOpen(false);
   update();
   const activityCount = Array.isArray(payload.activities) ? payload.activities.length : 0;
-  if (payloadRevalidating) {
+  if (loadedFromCache && payloadRevalidating) {
+    setDashboardTopStatus(
+      `Ready (${activityCount} activities) • Cached snapshot (${cacheFallbackReason || "refreshing live data"})`,
+      "ok",
+    );
+  } else if (loadedFromCache) {
+    setDashboardTopStatus(
+      `Ready (${activityCount} activities) • Cached snapshot (${cacheFallbackReason || "live refresh failed"})`,
+      "ok",
+    );
+  } else if (payloadRevalidating) {
     setDashboardTopStatus(`Ready (${activityCount} activities) • Refreshing in background`, "ok");
   } else {
     setDashboardTopStatus(`Ready (${activityCount} activities)`, "ok");
@@ -5167,6 +6040,26 @@ async function init() {
     }).catch(() => {});
   }
 
+  if (loadedFromCache) {
+    void fetchLiveDashboardPayload()
+      .then((livePayload) => {
+        const liveActivityCount = Array.isArray(livePayload.activities) ? livePayload.activities.length : 0;
+        const liveRevision = dashboardPayloadRevision(livePayload);
+        if (liveRevision && liveRevision !== cachedRevision) {
+          setDashboardTopStatus(`Ready (${liveActivityCount} activities) • New dashboard data cached. Reload to update`, "ok");
+          return;
+        }
+        setDashboardTopStatus(`Ready (${liveActivityCount} activities)`, "ok");
+      })
+      .catch((error) => {
+        const detail = String(error && error.message ? error.message : "Live refresh failed.");
+        setDashboardTopStatus(
+          `Ready (${activityCount} activities) • Cached snapshot (${detail})`,
+          "ok",
+        );
+      });
+  }
+
   window.addEventListener("resize", () => {
     requestSummaryTypeTailCentering();
     if (resizeTimer) {
@@ -5186,7 +6079,7 @@ async function init() {
       syncProfileLinkNavigationTarget();
       syncHeaderLinkPlacement();
       resetPersistentSideStatSizing();
-      update();
+      requestLayoutAlignment();
     }, 150);
   });
 

@@ -17,6 +17,9 @@
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='chronicle.png') }}">
   <link rel="stylesheet" href="/static/ui-theme.css">
   <link rel="stylesheet" href="/static/setup.css">
+  {% if review_variant_css_url %}
+  <link rel="stylesheet" href="{{ review_variant_css_url }}">
+  {% endif %}
 </head>
 <body>
   {% include "_app_shell_nav.html" %}
@@ -55,5 +58,8 @@
     </div>
   </div>
   <script src="/static/setup.js"></script>
+  {% if review_variant_js_url %}
+  <script src="{{ review_variant_js_url }}"></script>
+  {% endif %}
 </body>
 </html>

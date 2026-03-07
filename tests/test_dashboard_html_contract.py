@@ -23,15 +23,16 @@ class TestDashboardHtmlContract(unittest.TestCase):
             "typeClearButton",
             "yearClearButton",
             "resetAllButton",
-            "footerHostedPrefix",
-            "footerHostedLink",
-            "footerPoweredLabel",
-            "footerPoweredLink",
         ]
         for element_id in required_ids:
             self.assertIn(f'id="{element_id}"', html, f"Missing dashboard mount id: {element_id}")
 
         self.assertIn('<script src="/static/dashboard.js"></script>', html)
+        self.assertIn('href="#dashboardMain"', html)
+        self.assertIn('role="status" aria-live="polite"', html)
+        self.assertIn('aria-controls="typeMenuOptions"', html)
+        self.assertIn('aria-controls="yearMenuOptions"', html)
+        self.assertIn("Loading…", html)
 
     def test_dashboard_script_uses_backend_type_meta_contract(self) -> None:
         script_path = Path("static/dashboard.js")
