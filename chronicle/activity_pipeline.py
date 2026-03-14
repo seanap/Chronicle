@@ -2040,6 +2040,8 @@ def _select_activity_profile(
     settings: Settings,
     detailed_activity: dict[str, Any],
     training: dict[str, Any] | None = None,
+    *,
+    allow_working_profile_fallback: bool = False,
 ) -> dict[str, Any]:
     profiles = [
         profile
@@ -2087,7 +2089,7 @@ def _select_activity_profile(
                 "working_profile_id": working_profile_id or "default",
                 "selection_mode": "criteria_match",
             }
-    if working_profile_id and working_profile_id != "default":
+    if allow_working_profile_fallback and working_profile_id and working_profile_id != "default":
         return {
             "profile_id": working_profile_id,
             "profile_label": str(working_profile.get("label") or working_profile_id.title()),
@@ -2125,7 +2127,12 @@ def preview_profile_match(
     if not isinstance(activity, dict) or not activity:
         raise ValueError("Template context must include activity data for profile preview.")
 
-    selected = _select_activity_profile(settings, activity, training=training)
+    selected = _select_activity_profile(
+        settings,
+        activity,
+        training=training,
+        allow_working_profile_fallback=True,
+    )
     profile_id = str(selected.get("profile_id") or "default")
     profile = get_template_profile(settings, profile_id)
     criteria = profile.get("criteria") if isinstance(profile, dict) else {}
@@ -2246,7 +2253,26 @@ def preview_specific_profile_against_activity(
     }
 
 
-def _profile_activity_update_payload(profile_id: str, detailed_activity: dict[str, Any], description: str) -> dict[str, Any]:
+def _garmin_activity_type_to_strava_type(activity_type: Any) -> str | None:
+    normalized = _normalize_activity_type_key(activity_type)
+    if normalized in {"run", "running", "trailrun", "trailrunning"}:
+        return "Run"
+    if normalized in {"walk", "walking", "hike", "hiking"}:
+        return "Walk"
+    if normalized in {"ride", "cycling", "biking", "roadbiking", "mountainbiking"}:
+        return "Ride"
+    if normalized in {"strength", "strengthtraining", "weighttraining", "weightlifting", "strengthworkout"}:
+        return "Workout"
+    return None
+
+
+def _profile_activity_update_payload(
+    profile_id: str,
+    detailed_activity: dict[str, Any],
+    description: str,
+    *,
+    training: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {"description": description}
     if profile_id == "strength_training":
         payload["private"] = True
@@ -2269,6 +2295,23 @@ def _profile_activity_update_payload(profile_id: str, detailed_activity: dict[st
         payload["type"] = "Walk" if is_walk else "Run"
         payload["name"] = "Treadmill Walk" if is_walk else "Treadmill Run"
         payload["trainer"] = True
+        return payload
+
+    if profile_id == "default" and isinstance(training, dict) and bool(training.get("_garmin_activity_aligned")):
+        garmin_last = training.get("garmin_last_activity")
+        if isinstance(garmin_last, dict):
+            current_type_key = _normalize_activity_type_key(detailed_activity.get("sport_type") or detailed_activity.get("type"))
+            current_name = str(detailed_activity.get("name") or "").strip()
+            garmin_type_key = _normalize_activity_type_key(garmin_last.get("activity_type"))
+            garmin_type = _garmin_activity_type_to_strava_type(garmin_last.get("activity_type"))
+            garmin_name = str(garmin_last.get("activity_name") or "").strip()
+            stale_onewheel_title = current_name == "Onewheel Float 🛹" or "onewheel" in current_name.lower()
+            stale_onewheel_type = current_type_key == "ebikeride"
+            if (stale_onewheel_title or stale_onewheel_type) and garmin_type_key not in {"", "other"}:
+                if garmin_type:
+                    payload["type"] = garmin_type
+                if garmin_name:
+                    payload["name"] = garmin_name
     return payload
 
 
@@ -3476,7 +3519,12 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             logger.error("Template render failed for profile %s: %s", profile_id, error_text)
             raise RuntimeError(f"Template render failed for profile '{profile_id}': {error_text}")
 
-        update_payload = _profile_activity_update_payload(profile_id, detailed_activity, description)
+        update_payload = _profile_activity_update_payload(
+            profile_id,
+            detailed_activity,
+            description,
+            training=training,
+        )
         _run_required_call(
             settings,
             "strava.update_activity",

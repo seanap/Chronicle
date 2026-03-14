@@ -273,6 +273,23 @@ class TestStrengthProfileBehavior(unittest.TestCase):
         self.assertEqual(payload.get("type"), "EBikeRide")
         self.assertEqual(payload.get("name"), "Onewheel Float 🛹")
 
+    def test_default_profile_update_payload_reverts_stale_onewheel_title_and_type_from_garmin(self) -> None:
+        payload = _profile_activity_update_payload(
+            "default",
+            {"id": 123, "sport_type": "EBikeRide", "type": "EBikeRide", "name": "Onewheel Float 🛹"},
+            "Miles 1.01",
+            training={
+                "_garmin_activity_aligned": True,
+                "garmin_last_activity": {
+                    "activity_type": "running",
+                    "activity_name": "Forsyth County - Zone 2",
+                },
+            },
+        )
+        self.assertEqual(payload.get("description"), "Miles 1.01")
+        self.assertEqual(payload.get("type"), "Run")
+        self.assertEqual(payload.get("name"), "Forsyth County - Zone 2")
+
     def test_strength_profile_matches_workout_sport_type(self) -> None:
         settings = SimpleNamespace(
             profile_trail_gain_per_mile_ft=220.0,
@@ -721,7 +738,7 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
         self.assertEqual(selected.get("profile_id"), "default")
         self.assertEqual(selected.get("reasons"), ["fallback"])
 
-    def test_profile_selection_falls_back_to_working_profile_before_default(self) -> None:
+    def test_profile_selection_defaults_without_working_profile_fallback_for_processing(self) -> None:
         settings = SimpleNamespace(
             profile_trail_gain_per_mile_ft=220.0,
             profile_long_run_miles=10.0,
@@ -746,6 +763,37 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
             return_value={"profile_id": "trail", "label": "Trail", "enabled": True},
         ):
             selected = _select_activity_profile(settings, activity)
+
+        self.assertEqual(selected.get("profile_id"), "default")
+        self.assertEqual(selected.get("reasons"), ["fallback"])
+        self.assertEqual(selected.get("working_profile_id"), "trail")
+        self.assertEqual(selected.get("selection_mode"), "default_fallback")
+
+    def test_profile_selection_can_fall_back_to_working_profile_for_preview(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        profiles = [
+            {"profile_id": "default", "label": "Default", "enabled": True, "priority": 0},
+            {"profile_id": "trail", "label": "Trail", "enabled": True, "priority": 70},
+        ]
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "name": "Neighborhood easy run",
+            "distance": 4000.0,
+            "elev_gain": 50.0,
+        }
+
+        with patch("chronicle.activity_pipeline.list_template_profiles", return_value=profiles), patch(
+            "chronicle.activity_pipeline.get_working_template_profile",
+            return_value={"profile_id": "trail", "label": "Trail", "enabled": True},
+        ):
+            selected = _select_activity_profile(settings, activity, allow_working_profile_fallback=True)
 
         self.assertEqual(selected.get("profile_id"), "trail")
         self.assertEqual(selected.get("reasons"), ["working_profile_fallback"])
