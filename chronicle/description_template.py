@@ -1527,18 +1527,13 @@ def _profile_builtin_criteria(settings: Settings | None, profile_id: str) -> dic
         return {
             "kind": "activity",
             "description": "Garmin VESCDash-backed Onewheel/EUC activities.",
-            "any_of": [
+            "all_of": [
+                {"garmin_activity_type_in": ["other"]},
                 {
-                    "all_of": [
-                        {"garmin_activity_type_in": ["other"]},
-                        {
-                            "garmin_connectiq_app_ids_any": [
-                                "0432631a-d5e3-4272-a072-fa8c7e24c483",
-                            ]
-                        },
+                    "garmin_connectiq_app_ids_any": [
+                        "0432631a-d5e3-4272-a072-fa8c7e24c483",
                     ]
                 },
-                {"text_contains_any": ["onewheel", "euc", "electric unicycle"]},
             ],
         }
     if normalized == "walk":

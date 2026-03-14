@@ -908,18 +908,13 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
                 "priority": 79,
                 "criteria": {
                     "kind": "activity",
-                    "any_of": [
+                    "all_of": [
+                        {"garmin_activity_type_in": ["other"]},
                         {
-                            "all_of": [
-                                {"garmin_activity_type_in": ["other"]},
-                                {
-                                    "garmin_connectiq_app_ids_any": [
-                                        "0432631a-d5e3-4272-a072-fa8c7e24c483",
-                                    ]
-                                },
+                            "garmin_connectiq_app_ids_any": [
+                                "0432631a-d5e3-4272-a072-fa8c7e24c483",
                             ]
                         },
-                        {"text_contains_any": ["onewheel", "euc", "electric unicycle"]},
                     ],
                 },
             },
@@ -962,18 +957,13 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
                 "priority": 79,
                 "criteria": {
                     "kind": "activity",
-                    "any_of": [
+                    "all_of": [
+                        {"garmin_activity_type_in": ["other"]},
                         {
-                            "all_of": [
-                                {"garmin_activity_type_in": ["other"]},
-                                {
-                                    "garmin_connectiq_app_ids_any": [
-                                        "0432631a-d5e3-4272-a072-fa8c7e24c483",
-                                    ]
-                                },
+                            "garmin_connectiq_app_ids_any": [
+                                "0432631a-d5e3-4272-a072-fa8c7e24c483",
                             ]
                         },
-                        {"text_contains_any": ["onewheel", "euc", "electric unicycle"]},
                     ],
                 },
             },
@@ -990,6 +980,55 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
             "garmin_last_activity": {
                 "activity_type": "other",
                 "connectiq_app_ids": ["0432631a-d5e3-4272-a072-fa8c7e24c483"],
+            },
+        }
+
+        with patch("chronicle.activity_pipeline.list_template_profiles", return_value=profiles):
+            selected = _select_activity_profile(settings, activity, training=training)
+
+        self.assertEqual(selected.get("profile_id"), "default")
+
+    def test_profile_selection_does_not_route_mutated_onewheel_title_when_garmin_alignment_is_running(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        profiles = [
+            {"profile_id": "default", "label": "Default", "enabled": True, "priority": 0},
+            {
+                "profile_id": "onewheel",
+                "label": "Onewheel",
+                "enabled": True,
+                "priority": 79,
+                "criteria": {
+                    "kind": "activity",
+                    "all_of": [
+                        {"garmin_activity_type_in": ["other"]},
+                        {
+                            "garmin_connectiq_app_ids_any": [
+                                "0432631a-d5e3-4272-a072-fa8c7e24c483",
+                            ]
+                        },
+                    ],
+                },
+            },
+        ]
+        activity = {
+            "sport_type": "EBikeRide",
+            "type": "EBikeRide",
+            "name": "Onewheel Float 🛹",
+            "description": "🛞 Onewheel ride on the N/A",
+            "distance": 1622.0,
+            "moving_time": 645,
+        }
+        training = {
+            "_garmin_activity_aligned": True,
+            "garmin_last_activity": {
+                "activity_type": "running",
+                "connectiq_app_ids": [],
             },
         }
 
