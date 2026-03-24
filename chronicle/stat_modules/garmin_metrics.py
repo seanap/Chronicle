@@ -62,6 +62,96 @@ def safe_get(value: Any, keys: list[Any], default: Any = "N/A") -> Any:
     return cursor
 
 
+def _looks_like_training_status_record(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(
+        key in value
+        for key in (
+            "trainingStatusFeedbackPhrase",
+            "acuteTrainingLoadDTO",
+            "weeklyTrainingLoad",
+            "fitnessTrend",
+            "loadLevelTrend",
+        )
+    )
+
+
+def _select_training_status_record(
+    training_status: dict[str, Any],
+    *,
+    last_activity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    latest_training_status_data = safe_get(
+        training_status,
+        ["mostRecentTrainingStatus", "latestTrainingStatusData"],
+        default={},
+    )
+    if _looks_like_training_status_record(latest_training_status_data):
+        return latest_training_status_data
+    if not isinstance(latest_training_status_data, dict):
+        return {}
+
+    device_id = None
+    if isinstance(last_activity, dict):
+        device_id = last_activity.get("deviceId")
+    if device_id not in (None, ""):
+        by_device = latest_training_status_data.get(str(device_id))
+        if _looks_like_training_status_record(by_device):
+            return by_device
+
+    for candidate in latest_training_status_data.values():
+        if _looks_like_training_status_record(candidate):
+            return candidate
+    return {}
+
+
+def _looks_like_training_readiness_entry(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(
+        key in value
+        for key in (
+            "level",
+            "score",
+            "sleepScore",
+            "feedbackShort",
+            "feedbackLong",
+            "recoveryTime",
+        )
+    )
+
+
+def _select_training_readiness_entry(payload: Any) -> dict[str, Any]:
+    if _looks_like_training_readiness_entry(payload):
+        return payload
+    if isinstance(payload, list):
+        for item in payload:
+            if _looks_like_training_readiness_entry(item):
+                return item
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    for key in ("dailyReadiness", "trainingReadiness", "readiness", "item", "result"):
+        nested = payload.get(key)
+        if _looks_like_training_readiness_entry(nested):
+            return nested
+        if isinstance(nested, list):
+            for item in nested:
+                if _looks_like_training_readiness_entry(item):
+                    return item
+
+    for nested in payload.values():
+        if _looks_like_training_readiness_entry(nested):
+            return nested
+        if isinstance(nested, list):
+            for item in nested:
+                if _looks_like_training_readiness_entry(item):
+                    return item
+    return {}
+
+
 def _default_metrics() -> dict[str, Any]:
     return {
         "vo2max": "N/A",
@@ -976,35 +1066,17 @@ def fetch_training_status_and_scores(client: Any) -> dict[str, Any]:
         logger.error("Failed to fetch Garmin training status: %s", exc)
         training_status = {}
 
-    latest_status_data = safe_get(
-        training_status,
-        ["mostRecentTrainingStatus", "latestTrainingStatusData", "3417115846"],
-        default={},
-    )
-    if not isinstance(latest_status_data, dict):
-        latest_status_data = {}
+    latest_status_data = _select_training_status_record(training_status, last_activity=last_activity)
     acute_load_dto = latest_status_data.get("acuteTrainingLoadDTO")
     if not isinstance(acute_load_dto, dict):
         acute_load_dto = {}
 
-    feedback = safe_get(
-        training_status,
-        ["mostRecentTrainingStatus", "latestTrainingStatusData", "3417115846", "trainingStatusFeedbackPhrase"],
-    )
-    acwr_status_raw = safe_get(
-        training_status,
-        ["mostRecentTrainingStatus", "latestTrainingStatusData", "3417115846", "acuteTrainingLoadDTO", "acwrStatus"],
-    )
+    feedback = latest_status_data.get("trainingStatusFeedbackPhrase", "N/A")
+    acwr_status_raw = safe_get(latest_status_data, ["acuteTrainingLoadDTO", "acwrStatus"])
 
     metrics["vo2max"] = safe_get(training_status, ["mostRecentVO2Max", "generic", "vo2MaxPreciseValue"])
-    metrics["chronic_load"] = safe_get(
-        training_status,
-        ["mostRecentTrainingStatus", "latestTrainingStatusData", "3417115846", "acuteTrainingLoadDTO", "dailyTrainingLoadChronic"],
-    )
-    metrics["acute_load"] = safe_get(
-        training_status,
-        ["mostRecentTrainingStatus", "latestTrainingStatusData", "3417115846", "acuteTrainingLoadDTO", "dailyTrainingLoadAcute"],
-    )
+    metrics["chronic_load"] = safe_get(latest_status_data, ["acuteTrainingLoadDTO", "dailyTrainingLoadChronic"])
+    metrics["acute_load"] = safe_get(latest_status_data, ["acuteTrainingLoadDTO", "dailyTrainingLoadAcute"])
     metrics["load_tunnel_min"] = latest_status_data.get("loadTunnelMin", "N/A")
     metrics["load_tunnel_max"] = latest_status_data.get("loadTunnelMax", "N/A")
     metrics["weekly_training_load"] = latest_status_data.get("weeklyTrainingLoad", "N/A")
@@ -1063,7 +1135,7 @@ def fetch_training_status_and_scores(client: Any) -> dict[str, Any]:
 
     try:
         readiness = client.get_training_readiness(start_date)
-        readiness_entry = readiness[0] if isinstance(readiness, list) and readiness else {}
+        readiness_entry = _select_training_readiness_entry(readiness)
         readiness_level = safe_get(readiness_entry, ["level"], default="N/A")
         metrics["training_readiness_score"] = safe_get(readiness_entry, ["score"], default="N/A")
         metrics["sleep_score"] = safe_get(readiness_entry, ["sleepScore"], default="N/A")

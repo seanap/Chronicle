@@ -275,6 +275,54 @@ class _ExerciseSetEdgeClient:
         }
 
 
+class _DynamicGarminClient(_DummyGarminClient):
+    def get_last_activity(self):
+        payload = dict(super().get_last_activity())
+        payload["deviceId"] = 999999999
+        return payload
+
+    def get_training_status(self, _end_date):
+        return {
+            "mostRecentVO2Max": {"generic": {"vo2MaxPreciseValue": 57.2}},
+            "mostRecentTrainingStatus": {
+                "latestTrainingStatusData": {
+                    "999999999": {
+                        "trainingStatusFeedbackPhrase": "PRODUCTIVE_BUILDING",
+                        "fitnessTrend": "IMPROVING",
+                        "loadLevelTrend": "WITHIN_RANGE",
+                        "weeklyTrainingLoad": 568,
+                        "loadTunnelMin": 60,
+                        "loadTunnelMax": 92,
+                        "acuteTrainingLoadDTO": {
+                            "acwrStatus": "OPTIMAL",
+                            "dailyTrainingLoadChronic": 72,
+                            "dailyTrainingLoadAcute": 78,
+                            "dailyAcuteChronicWorkloadRatio": 1.12,
+                            "acwrPercent": 112,
+                        },
+                    }
+                }
+            },
+        }
+
+    def get_training_readiness(self, _start_date):
+        return {
+            "dailyReadiness": {
+                "level": "HIGH",
+                "score": 83,
+                "sleepScore": 86,
+                "feedbackShort": "Recovering well",
+                "recoveryTime": 34200,
+                "sleepScoreFactorPercent": 82,
+                "sleepHistoryFactorPercent": 77,
+                "hrvFactorPercent": 69,
+                "stressHistoryFactorPercent": 74,
+                "acwrFactorPercent": 88,
+                "recoveryTimeFactorPercent": 71,
+            }
+        }
+
+
 class TestVo2MaxExpandedMetrics(unittest.TestCase):
     def test_fetch_training_status_returns_expanded_fields(self) -> None:
         metrics = fetch_training_status_and_scores(_DummyGarminClient())
@@ -312,6 +360,16 @@ class TestVo2MaxExpandedMetrics(unittest.TestCase):
         details = metrics["fitness_age_details"]
         self.assertIsInstance(details, dict)
         self.assertEqual(details["chronological_age"], 40)
+
+    def test_fetch_training_status_handles_dynamic_device_id_and_dict_readiness(self) -> None:
+        metrics = fetch_training_status_and_scores(_DynamicGarminClient())
+
+        self.assertEqual(metrics["training_status_key"], "Productive")
+        self.assertEqual(metrics["readiness_level"], "HIGH")
+        self.assertEqual(metrics["training_readiness_score"], 83)
+        self.assertEqual(metrics["sleep_score"], 86)
+        self.assertEqual(metrics["weekly_training_load"], 568)
+        self.assertEqual(metrics["daily_acwr_ratio"], 1.12)
 
     def test_get_activity_context_for_strava_activity_matches_strength_session(self) -> None:
         strava_activity = {

@@ -2325,8 +2325,20 @@ def _get_garmin_client(settings: Settings) -> Any | None:
     try:
         from garminconnect import Garmin
 
+        tokenstore_dir = settings.state_dir / "garmin_tokens"
         client = Garmin(settings.garmin_email, settings.garmin_password)
+        if tokenstore_dir.exists():
+            try:
+                client.login(str(tokenstore_dir))
+                return client
+            except Exception as exc:
+                logger.warning("Garmin token login failed, retrying with credentials: %s", exc)
+
         client.login()
+        try:
+            client.garth.dump(str(tokenstore_dir))
+        except Exception as exc:
+            logger.debug("Failed to persist Garmin session tokens: %s", exc)
         return client
     except Exception as exc:
         logger.error("Garmin login failed: %s", exc)
