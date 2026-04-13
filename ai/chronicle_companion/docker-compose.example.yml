@@ -1,0 +1,22 @@
+services:
+  chronicle-codex-companion:
+    build:
+      context: ../..
+      dockerfile: ai/chronicle_companion/Dockerfile
+    image: chronicle-codex-companion:latest
+    container_name: chronicle-codex-companion
+    env_file:
+      - .env
+    environment:
+      - EDITOR_AI_CODEX_CLI_PATH=/usr/local/bin/codex
+      - EDITOR_AI_WORKSPACE_DIR=/app/ai/chronicle_companion
+    working_dir: /app
+    volumes:
+      - ../..:/app
+      - codex-home:/root/.codex
+    ports:
+      - "8788:8788"
+    restart: unless-stopped
+
+volumes:
+  codex-home:

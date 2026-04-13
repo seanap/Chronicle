@@ -1,0 +1,16 @@
+[Unit]
+Description=Chronicle Codex Companion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/opt/chronicle/Auto-Stat-Description
+EnvironmentFile=/opt/chronicle/Auto-Stat-Description/ai/chronicle_companion/.env
+ExecStart=/opt/chronicle/Auto-Stat-Description/.venv/bin/python ai/chronicle_companion/service.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
