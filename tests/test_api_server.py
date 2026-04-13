@@ -22,6 +22,9 @@ class TestApiServer(unittest.TestCase):
         self._original_settings = api_server.settings
         self._original_state_dir_env = os.environ.get("STATE_DIR")
         self._original_setup_env_file = os.environ.get("SETUP_ENV_FILE")
+        self._original_enable_agent_control_api = os.environ.get("ENABLE_AGENT_CONTROL_API")
+        self._original_agent_control_read_api_key = os.environ.get("AGENT_CONTROL_READ_API_KEY")
+        self._original_agent_control_write_api_key = os.environ.get("AGENT_CONTROL_WRITE_API_KEY")
 
     def tearDown(self) -> None:
         api_server.run_once = self._original_run_once
@@ -37,6 +40,18 @@ class TestApiServer(unittest.TestCase):
             os.environ.pop("SETUP_ENV_FILE", None)
         else:
             os.environ["SETUP_ENV_FILE"] = self._original_setup_env_file
+        if self._original_enable_agent_control_api is None:
+            os.environ.pop("ENABLE_AGENT_CONTROL_API", None)
+        else:
+            os.environ["ENABLE_AGENT_CONTROL_API"] = self._original_enable_agent_control_api
+        if self._original_agent_control_read_api_key is None:
+            os.environ.pop("AGENT_CONTROL_READ_API_KEY", None)
+        else:
+            os.environ["AGENT_CONTROL_READ_API_KEY"] = self._original_agent_control_read_api_key
+        if self._original_agent_control_write_api_key is None:
+            os.environ.pop("AGENT_CONTROL_WRITE_API_KEY", None)
+        else:
+            os.environ["AGENT_CONTROL_WRITE_API_KEY"] = self._original_agent_control_write_api_key
 
     def _set_temp_state_dir(self, temp_dir: str) -> None:
         os.environ["STATE_DIR"] = temp_dir
@@ -123,6 +138,179 @@ class TestApiServer(unittest.TestCase):
         self.assertIn("context_modes", payload)
         self.assertIn("helper_transforms", payload["catalog"])
         self.assertTrue(str(payload.get("context_source")).startswith("sample:"))
+
+    def test_editor_assistant_status_endpoint(self) -> None:
+        with patch.object(
+            api_server,
+            "editor_assistant_status",
+            return_value={"enabled": True, "available": True, "reason": None},
+        ):
+            response = self.client.get("/editor/assistant/status")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["assistant"]["available"])
+
+    def test_editor_assistant_customize_endpoint(self) -> None:
+        with patch.object(
+            api_server,
+            "generate_editor_customization",
+            return_value={
+                "suggested_text": "🌤️🚦 Training Readiness: {{ training.readiness_score }}",
+                "placement_hint": "replace readiness line",
+                "notes": "Shorter readiness line",
+            },
+        ), patch.object(
+            api_server,
+            "editor_assistant_status",
+            return_value={"enabled": True, "available": True, "reason": None},
+        ):
+            response = self.client.post(
+                "/editor/assistant/customize",
+                json={
+                    "request": "Make the readiness line shorter.",
+                    "template": "Hello {{ activity.distance_miles }}",
+                    "context_mode": "sample",
+                    "profile_id": "default",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["suggestion"]["placement_hint"], "replace readiness line")
+
+    def test_editor_assistant_customize_requires_request(self) -> None:
+        response = self.client.post(
+            "/editor/assistant/customize",
+            json={"template": "Hello", "context_mode": "sample", "profile_id": "default"},
+        )
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "error")
+
+    def test_agent_control_capabilities_endpoint(self) -> None:
+        response = self.client.get("/agent-control/capabilities")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertIn("plans", payload["capabilities"]["resources"])
+
+    def test_agent_control_template_draft_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            create_response = self.client.post(
+                "/agent-control/drafts",
+                json={
+                    "resource_kind": "template",
+                    "payload": {
+                        "profile_id": "default",
+                        "template": "Hello {{ activity.name }}",
+                        "context_mode": "sample",
+                    },
+                },
+                headers={"X-Chronicle-Agent-Key": "write-secret"},
+            )
+            self.assertEqual(create_response.status_code, 201)
+            created = create_response.get_json()["draft"]
+            self.assertEqual(created["status"], "validated")
+
+            dry_run_response = self.client.post(
+                f"/agent-control/drafts/{created['draft_id']}/apply",
+                json={"dry_run": True},
+            )
+            self.assertEqual(dry_run_response.status_code, 200)
+            dry_run_payload = dry_run_response.get_json()
+            self.assertTrue(dry_run_payload["result"]["dry_run"])
+
+            apply_response = self.client.post(
+                f"/agent-control/drafts/{created['draft_id']}/apply",
+                json={},
+            )
+            self.assertEqual(apply_response.status_code, 200)
+            applied = apply_response.get_json()["draft"]
+            self.assertEqual(applied["status"], "applied")
+
+    def test_agent_task_plan_next_week_creates_job_and_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            with patch.object(
+                api_server,
+                "generate_plan_next_week_draft",
+                return_value={
+                    "title": "Next week",
+                    "summary": "Hold volume steady.",
+                    "warnings": [],
+                    "days": [{"date_local": "2026-04-20", "planned_total_miles": 6}],
+                },
+            ):
+                response = self.client.post(
+                    "/agent/tasks/plan-next-week",
+                    json={"request": "Create the next week's plan.", "week_start_local": "2026-04-20"},
+                )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["job"]["status"], "awaiting_approval")
+            self.assertEqual(payload["draft"]["resource_kind"], "plan_week")
+
+    def test_agent_task_bundle_create_creates_drafts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            with patch.object(
+                api_server,
+                "generate_bundle_create",
+                return_value={
+                    "summary": "Create a hill profile bundle.",
+                    "warnings": [],
+                    "profile_yaml": None,
+                    "template_text": "Bundle {{ activity.name }}",
+                    "workout_payload": {"workout_id": "hill-repeats", "label": "Hill Repeats", "shorthand": "8x60s"},
+                },
+            ):
+                response = self.client.post(
+                    "/agent/tasks/bundle-create",
+                    json={"request": "Create a hill training bundle.", "profile_id": "default"},
+                )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["job"]["status"], "awaiting_approval")
+            self.assertGreaterEqual(len(payload["drafts"]), 2)
+
+    def test_agent_control_requires_write_key_for_remote_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._set_temp_state_dir(temp_dir)
+            os.environ["ENABLE_AGENT_CONTROL_API"] = "true"
+            os.environ["AGENT_CONTROL_WRITE_API_KEY"] = "write-secret"
+            api_server.settings = api_server.Settings.from_env()
+            api_server.settings.ensure_state_paths()
+
+            create_response = self.client.post(
+                "/agent-control/drafts",
+                json={
+                    "resource_kind": "template",
+                    "payload": {
+                        "profile_id": "default",
+                        "template": "Hello {{ activity.name }}",
+                        "context_mode": "sample",
+                    },
+                },
+                headers={"X-Chronicle-Agent-Key": "write-secret"},
+            )
+            self.assertEqual(create_response.status_code, 201)
+            draft_id = create_response.get_json()["draft"]["draft_id"]
+
+            apply_response = self.client.post(
+                f"/agent-control/drafts/{draft_id}/apply",
+                json={},
+                environ_base={"REMOTE_ADDR": "192.168.1.100"},
+            )
+            self.assertEqual(apply_response.status_code, 401)
+            authed_response = self.client.post(
+                f"/agent-control/drafts/{draft_id}/apply",
+                json={},
+                environ_base={"REMOTE_ADDR": "192.168.1.100"},
+                headers={"X-Chronicle-Agent-Key": "write-secret"},
+            )
+            self.assertEqual(authed_response.status_code, 200)
 
     def test_ready_endpoint(self) -> None:
         response = self.client.get("/ready")

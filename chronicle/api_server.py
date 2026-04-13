@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 
 import requests
@@ -18,8 +21,26 @@ from .activity_pipeline import (
     preview_specific_profile_match,
     run_once,
 )
+from .agent_runner import (
+    COMPANION_PROTOCOL_VERSION,
+    generate_bundle_create,
+    generate_plan_next_week_draft,
+)
+from .agent_store import (
+    append_audit_event,
+    create_draft as create_agent_draft,
+    create_job as create_agent_job,
+    get_draft as get_agent_draft,
+    get_job as get_agent_job,
+    list_audit_events,
+    list_drafts as list_agent_drafts,
+    list_jobs as list_agent_jobs,
+    update_draft as update_agent_draft,
+    update_job as update_agent_job,
+)
 from .config import Settings
 from .dashboard_data import get_dashboard_payload
+from .editor_ai import EditorAssistantRequest, editor_assistant_status, generate_editor_customization
 from .garmin_sync_queue import (
     initiate_garmin_sync_request,
     mark_garmin_sync_request_failed,
@@ -236,6 +257,454 @@ def _effective_settings() -> Settings:
     current = Settings.from_env()
     current.ensure_state_paths()
     return current
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _resource_version(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _agent_control_is_local_request() -> bool:
+    remote = str(request.remote_addr or "").strip().lower()
+    return remote in {"", "127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+
+
+def _agent_control_actor() -> str:
+    explicit = str(request.headers.get("X-Chronicle-Agent-Actor") or "").strip()
+    if explicit:
+        return explicit
+    remote = str(request.remote_addr or "").strip() or "unknown"
+    return f"remote:{remote}"
+
+
+def _require_agent_control_access(current: Settings, scope: str = "read") -> tuple[dict[str, Any], int] | None:
+    if not current.enable_agent_control_api and not _agent_control_is_local_request():
+        return {"status": "error", "error": "Agent control API is disabled."}, 404
+
+    read_key = str(current.agent_control_read_api_key or "").strip()
+    write_key = str(current.agent_control_write_api_key or "").strip()
+    if not read_key and not write_key:
+        return None if _agent_control_is_local_request() else (
+            {"status": "error", "error": "Agent control API keys are not configured."},
+            503,
+        )
+
+    presented = str(request.headers.get("X-Chronicle-Agent-Key") or "").strip()
+    if scope == "write":
+        if write_key and presented == write_key:
+            return None
+        return {"status": "error", "error": "Write access denied."}, 401
+
+    if presented and presented in {read_key, write_key}:
+        return None
+    return {"status": "error", "error": "Read access denied."}, 401
+
+
+def _agent_control_base_url(current: Settings) -> str:
+    configured = str(current.agent_control_base_url or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    return str(request.url_root or "").rstrip("/")
+
+
+def _current_template_base_version(current: Settings, profile_id: str) -> str:
+    active = get_active_template(current, profile_id=profile_id)
+    version = str(active.get("current_version") or "").strip()
+    if version:
+        return version
+    return _resource_version(
+        {
+            "template": active.get("template"),
+            "name": active.get("name"),
+            "profile_id": profile_id,
+        }
+    )
+
+
+def _current_profile_base_version(current: Settings, profile_id: str) -> str:
+    document = get_template_profile_document(current, profile_id)
+    return _resource_version(
+        {
+            "profile_id": document.get("profile", {}).get("profile_id"),
+            "yaml_text": document.get("yaml_text"),
+        }
+    )
+
+
+def _current_workout_base_version(current: Settings, workout_id: str) -> str:
+    document = get_workout_definition_document(current.processed_log_file, workout_id)
+    return _resource_version(
+        {
+            "workout_id": document.get("workout", {}).get("workout_id"),
+            "yaml_text": document.get("yaml_text"),
+            "workout": document.get("workout"),
+        }
+    )
+
+
+def _resolve_week_start_local(raw_value: str | None, *, current: Settings) -> str:
+    if raw_value and raw_value.strip():
+        return _resolve_plan_date(raw_value)
+    try:
+        local_tz = ZoneInfo(current.timezone)
+    except ZoneInfoNotFoundError:
+        local_tz = timezone.utc
+    today_local = datetime.now(local_tz).date()
+    week_start = today_local - timedelta(days=today_local.weekday()) + timedelta(days=7)
+    return week_start.isoformat()
+
+
+def _week_date_span(week_start_local: str) -> tuple[str, str]:
+    start = date.fromisoformat(week_start_local)
+    end = start + timedelta(days=6)
+    return start.isoformat(), end.isoformat()
+
+
+def _current_plan_week_base_version(current: Settings, week_start_local: str) -> str:
+    start_date, end_date = _week_date_span(week_start_local)
+    payload = get_plan_payload(
+        current,
+        center_date=week_start_local,
+        start_date=start_date,
+        end_date=end_date,
+        include_meta=False,
+    )
+    return _resource_version({"week_start_local": week_start_local, "rows": payload.get("rows") or []})
+
+
+def _agent_control_capabilities(current: Settings) -> dict[str, Any]:
+    return {
+        "protocol_version": COMPANION_PROTOCOL_VERSION,
+        "base_url": _agent_control_base_url(current),
+        "resources": ["templates", "profiles", "workouts", "plans", "drafts", "jobs", "audit"],
+        "tasks": ["template_customize", "plan_next_week", "bundle_create"],
+        "apply_requires_write_key": True,
+    }
+
+
+def _validate_template_draft_payload(current: Settings, payload: dict[str, Any]) -> dict[str, Any]:
+    requested_profile_id = str(payload.get("profile_id") or "").strip().lower()
+    allow_missing_profile = bool(payload.get("allow_missing_profile"))
+    profile_exists = True
+    if requested_profile_id:
+        profile = get_template_profile(current, requested_profile_id)
+        if profile is None:
+            if not allow_missing_profile:
+                raise ValueError(f"Unknown profile_id: {requested_profile_id}")
+            profile_id = requested_profile_id
+            profile_exists = False
+        else:
+            profile_id = requested_profile_id
+    else:
+        profile_id = _resolve_profile_id(None)
+    template_text = str(payload.get("template") or "").strip()
+    if not template_text:
+        raise ValueError("template must be a non-empty string.")
+    context_mode = _resolve_context_mode(payload.get("context_mode", "sample"))
+    context, context_source = _context_for_mode(context_mode, fixture_name=payload.get("fixture_name"))
+    validation = validate_template_text(template_text, context)
+    if not profile_exists:
+        validation = {
+            **validation,
+            "warnings": list(validation.get("warnings") or [])
+            + [f"Profile '{profile_id}' does not exist yet. Apply the profile draft before publishing this template."],
+        }
+    return {
+        "valid": bool(validation.get("valid")),
+        "context_source": context_source if context is not None else None,
+        "validation": validation,
+        "profile_id": profile_id,
+        "profile_exists": profile_exists,
+        "base_version": _current_template_base_version(current, profile_id) if profile_exists else None,
+    }
+
+
+def _validate_profile_draft_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    profile_id = str(payload.get("profile_id") or payload.get("profile_name") or "").strip()
+    yaml_text = str(payload.get("yaml_text") or "").strip()
+    if not profile_id:
+        raise ValueError("profile_id or profile_name is required.")
+    if not yaml_text:
+        raise ValueError("yaml_text must be a non-empty string.")
+    profile = parse_template_profile_yaml_document(yaml_text, profile_id=profile_id)
+    return {
+        "valid": True,
+        "profile_id": str(profile.get("profile_id") or profile_id),
+        "profile": profile,
+    }
+
+
+def _validate_workout_draft_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    yaml_text = str(payload.get("yaml_text") or "").strip()
+    workout_id = str(payload.get("workout_id") or payload.get("workout_code") or "").strip()
+    if yaml_text:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp_dir:
+            runtime_path = Path(temp_dir) / "processed_activities.log"
+            runtime_path.touch()
+            document = create_workout_definition_from_yaml(
+                runtime_path,
+                yaml_text=yaml_text,
+                workout_name=workout_id or None,
+            )
+        workout = dict(document.get("workout") or {})
+    else:
+        raw_workout = payload.get("workout")
+        if not isinstance(raw_workout, dict):
+            raw_workout = payload if any(payload.get(key) is not None for key in ("workout_id", "workout_code", "label", "shorthand")) else None
+        if not isinstance(raw_workout, dict):
+            raise ValueError("workout or yaml_text is required.")
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp_dir:
+            runtime_path = Path(temp_dir) / "processed_activities.log"
+            runtime_path.touch()
+            workout = upsert_workout_definition(runtime_path, raw_workout)
+    return {"valid": True, "workout": workout}
+
+
+def _normalize_plan_week_draft(current: Settings, payload: dict[str, Any]) -> dict[str, Any]:
+    raw_days = payload.get("days")
+    if not isinstance(raw_days, list) or not raw_days:
+        raise ValueError("days must be a non-empty array.")
+    pending_days: list[dict[str, object]] = []
+    response_days: list[dict[str, object]] = []
+    for item in raw_days:
+        if not isinstance(item, dict):
+            raise ValueError("each day entry must be an object.")
+        date_key = _resolve_plan_date(str(item.get("date_local") or ""))
+        day_payload = {key: value for key, value in item.items() if key != "date_local"}
+        existing_day = get_plan_day(current.processed_log_file, date_local=date_key) or {}
+        run_type, notes, is_complete, planned_total_miles, sessions = _coerce_plan_day_payload(
+            current.processed_log_file,
+            day_payload,
+            existing_day=existing_day,
+        )
+        pending_days.append(
+            {
+                "date_local": date_key,
+                "timezone_name": current.timezone,
+                "run_type": run_type,
+                "planned_total_miles": planned_total_miles,
+                "actual_total_miles": existing_day.get("actual_total_miles"),
+                "is_complete": is_complete,
+                "notes": notes,
+                **({"sessions": sessions} if sessions is not None else {}),
+            }
+        )
+        response_days.append(
+            _plan_day_success_payload(
+                current.processed_log_file,
+                date_key=date_key,
+                planned_total_miles=planned_total_miles,
+                sessions=sessions if sessions is not None else [],
+                run_type=run_type,
+                notes=notes,
+                is_complete=is_complete,
+            )
+        )
+    week_start_local = _resolve_plan_date(str(payload.get("week_start_local") or response_days[0]["date_local"]))
+    return {
+        "valid": True,
+        "week_start_local": week_start_local,
+        "pending_days": pending_days,
+        "days": response_days,
+        "base_version": _current_plan_week_base_version(current, week_start_local),
+    }
+
+
+def _validate_agent_draft(current: Settings, draft: dict[str, Any]) -> dict[str, Any]:
+    resource_kind = str(draft.get("resource_kind") or "").strip()
+    payload = draft.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("Draft payload must be an object.")
+    if resource_kind == "template":
+        return _validate_template_draft_payload(current, payload)
+    if resource_kind == "profile":
+        return _validate_profile_draft_payload(payload)
+    if resource_kind == "workout":
+        return _validate_workout_draft_payload(payload)
+    if resource_kind == "plan_week":
+        return _normalize_plan_week_draft(current, payload)
+    raise ValueError(f"Unsupported resource_kind '{resource_kind}'.")
+
+
+def _ensure_expected_version(current_version: str, expected_version: str | None) -> None:
+    expected = str(expected_version or "").strip()
+    if expected and expected != current_version:
+        raise ValueError(
+            f"Version conflict. expected_version={expected} current_version={current_version}."
+        )
+
+
+def _apply_agent_draft(current: Settings, draft: dict[str, Any], *, actor: str) -> dict[str, Any]:
+    resource_kind = str(draft.get("resource_kind") or "").strip()
+    payload = draft.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("Draft payload must be an object.")
+    validation = _validate_agent_draft(current, draft)
+    if not bool(validation.get("valid", True)):
+        raise ValueError("Draft validation failed. Resolve validation errors before applying.")
+
+    if resource_kind == "template":
+        validation_profile = dict(validation).get("profile_id")
+        profile_id = str(validation_profile or payload.get("profile_id") or "").strip().lower()
+        if not profile_id:
+            profile_id = _resolve_profile_id(None)
+        if not bool(validation.get("profile_exists", True)):
+            raise ValueError(
+                f"Profile '{profile_id}' does not exist yet. Apply the profile draft before publishing this template."
+            )
+        _ensure_expected_version(
+            _current_template_base_version(current, profile_id),
+            draft.get("base_version"),
+        )
+        saved = save_active_template(
+            current,
+            str(payload.get("template") or ""),
+            name=str(payload.get("name")) if payload.get("name") is not None else None,
+            author=actor,
+            source=str(payload.get("source") or "agent-control-apply"),
+            notes=str(payload.get("notes")) if payload.get("notes") is not None else None,
+            profile_id=profile_id,
+        )
+        return {"resource_kind": resource_kind, "active": saved}
+
+    if resource_kind == "profile":
+        profile_id = str(payload.get("profile_id") or payload.get("profile_name") or "").strip()
+        yaml_text = str(payload.get("yaml_text") or "")
+        try:
+            _ensure_expected_version(
+                _current_profile_base_version(current, profile_id),
+                draft.get("base_version"),
+            )
+            document = save_template_profile_yaml(
+                current,
+                profile_id,
+                yaml_text=yaml_text,
+            )
+        except ValueError:
+            document = create_template_profile_from_yaml(
+                current,
+                yaml_text=yaml_text,
+                profile_name=profile_id or None,
+            )
+        return {"resource_kind": resource_kind, "profile": document.get("profile"), "document": document}
+
+    if resource_kind == "workout":
+        yaml_text = str(payload.get("yaml_text") or "").strip()
+        workout_id = str(payload.get("workout_id") or payload.get("workout_code") or "").strip()
+        if workout_id:
+            try:
+                _ensure_expected_version(
+                    _current_workout_base_version(current, workout_id),
+                    draft.get("base_version"),
+                )
+            except ValueError:
+                if workout_id and str(draft.get("base_version") or "").strip():
+                    raise
+        if yaml_text:
+            try:
+                document = save_workout_definition_yaml(
+                    current.processed_log_file,
+                    workout_id,
+                    yaml_text,
+                )
+            except ValueError:
+                document = create_workout_definition_from_yaml(
+                    current.processed_log_file,
+                    yaml_text,
+                    workout_name=workout_id or None,
+                )
+            return {"resource_kind": resource_kind, "workout": document.get("workout"), "document": document}
+        raw_workout = payload.get("workout")
+        if not isinstance(raw_workout, dict):
+            raw_workout = payload
+        workout = upsert_workout_definition(current.processed_log_file, raw_workout)
+        return {"resource_kind": resource_kind, "workout": workout}
+
+    if resource_kind == "plan_week":
+        week_start_local = str(validation.get("week_start_local") or "").strip()
+        _ensure_expected_version(
+            _current_plan_week_base_version(current, week_start_local),
+            draft.get("base_version"),
+        )
+        saved = upsert_plan_days_bulk(
+            current.processed_log_file,
+            days=list(validation.get("pending_days") or []),
+        )
+        if not saved:
+            raise RuntimeError("Failed to persist plan week draft.")
+        return {
+            "resource_kind": resource_kind,
+            "week_start_local": week_start_local,
+            "days": validation.get("days") or [],
+            "saved_count": len(validation.get("days") or []),
+        }
+
+    raise ValueError(f"Unsupported resource_kind '{resource_kind}'.")
+
+
+def _build_next_week_context(current: Settings, week_start_local: str) -> dict[str, Any]:
+    week_start = date.fromisoformat(week_start_local)
+    prior_start = (week_start - timedelta(days=28)).isoformat()
+    prior_end = (week_start - timedelta(days=1)).isoformat()
+    week_end = (week_start + timedelta(days=6)).isoformat()
+    prior_payload = get_plan_payload(
+        current,
+        center_date=prior_end,
+        start_date=prior_start,
+        end_date=prior_end,
+        include_meta=False,
+    )
+    next_payload = get_plan_payload(
+        current,
+        center_date=week_start_local,
+        start_date=week_start_local,
+        end_date=week_end,
+        include_meta=False,
+    )
+    workouts = list_workout_definitions(current.processed_log_file)
+    return {
+        "week_start_local": week_start_local,
+        "week_end_local": week_end,
+        "prior_window": {
+            "start_date": prior_start,
+            "end_date": prior_end,
+            "summary": prior_payload.get("summary") or {},
+            "rows": prior_payload.get("rows") or [],
+        },
+        "target_week": {
+            "start_date": week_start_local,
+            "end_date": week_end,
+            "rows": next_payload.get("rows") or [],
+        },
+        "workouts": workouts,
+        "run_type_options": list(RUN_TYPE_OPTIONS),
+        "version": _current_plan_week_base_version(current, week_start_local),
+    }
+
+
+def _build_bundle_context(current: Settings) -> dict[str, Any]:
+    working_profile_id = str(get_working_template_profile(current).get("profile_id") or "default")
+    active_template = get_active_template(current, profile_id=working_profile_id)
+    workouts = list_workout_definitions(current.processed_log_file)
+    return {
+        "working_profile_id": working_profile_id,
+        "profiles": list_template_profiles(current),
+        "active_template": {
+            "profile_id": active_template.get("profile_id"),
+            "name": active_template.get("name"),
+            "template": active_template.get("template"),
+            "current_version": active_template.get("current_version"),
+        },
+        "workouts": workouts,
+        "run_type_options": list(RUN_TYPE_OPTIONS),
+    }
 
 
 def _setup_effective_values() -> dict[str, object]:
@@ -2158,6 +2627,11 @@ def editor_page() -> str:
     return render_template("editor.html")
 
 
+@app.get("/editor/assistant/status")
+def editor_assistant_status_get() -> tuple[dict, int]:
+    return {"status": "ok", "assistant": editor_assistant_status(settings)}, 200
+
+
 @app.get("/editor/profiles")
 def editor_profiles_get() -> tuple[dict, int]:
     working = get_working_template_profile(settings)
@@ -3079,6 +3553,59 @@ def editor_preview() -> tuple[dict, int]:
     }, 200
 
 
+@app.post("/editor/assistant/customize")
+def editor_assistant_customize_post() -> tuple[dict, int]:
+    body = request.get_json(silent=True) or {}
+    customization_request = str(body.get("request") or "").strip()
+    if not customization_request:
+        return {"status": "error", "error": "request must be a non-empty string."}, 400
+
+    template_text = body.get("template")
+    try:
+        profile_id = _resolve_profile_id(body.get("profile_id"))
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    if template_text is None:
+        template_text = get_active_template(settings, profile_id=profile_id)["template"]
+    if not isinstance(template_text, str) or not template_text.strip():
+        return {"status": "error", "error": "template must be a non-empty string."}, 400
+
+    try:
+        context_mode = _resolve_context_mode(body.get("context_mode"))
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    context, context_source = _context_for_mode(
+        context_mode,
+        fixture_name=body.get("fixture_name"),
+    )
+    normalized_context = normalize_template_context(context or {})
+    available_context_keys = tuple(
+        sorted(str(key).strip() for key in normalized_context.keys() if str(key).strip())
+    )
+    assistant_request = EditorAssistantRequest(
+        request_text=customization_request,
+        template_text=template_text,
+        profile_id=profile_id,
+        context_mode=context_mode,
+        fixture_name=str(body.get("fixture_name") or "").strip() or None,
+        preview_text=str(body.get("preview_text") or "").strip() or None,
+        selected_text=str(body.get("selected_text") or "").strip() or None,
+        available_context_keys=available_context_keys,
+    )
+    try:
+        suggestion = generate_editor_customization(settings, assistant_request)
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}, 503
+
+    return {
+        "status": "ok",
+        "assistant": editor_assistant_status(settings),
+        "context_source": context_source if context is not None else None,
+        "suggestion": suggestion,
+    }, 200
+
+
 @app.get("/editor/schema")
 def editor_schema() -> tuple[dict, int]:
     raw_mode = request.args.get("context_mode")
@@ -3139,6 +3666,667 @@ def editor_catalog() -> tuple[dict, int]:
         "fixtures": list_sample_template_fixtures(),
         "context_modes": ["latest", "sample", "latest_or_sample", "fixture"],
     }, 200
+
+
+@app.get("/agent-control/handshake")
+def agent_control_handshake_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    return {
+        "status": "ok",
+        "protocol_version": COMPANION_PROTOCOL_VERSION,
+        "capabilities": _agent_control_capabilities(current),
+        "assistant": editor_assistant_status(current),
+    }, 200
+
+
+@app.get("/agent-control/capabilities")
+def agent_control_capabilities_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    return {"status": "ok", "capabilities": _agent_control_capabilities(current)}, 200
+
+
+@app.get("/agent-control/templates/active")
+def agent_control_template_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    try:
+        profile_id = _resolve_profile_id(request.args.get("profile_id"))
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    active = get_active_template(current, profile_id=profile_id)
+    return {
+        "status": "ok",
+        "resource_kind": "template",
+        "base_version": _current_template_base_version(current, profile_id),
+        "active": active,
+    }, 200
+
+
+@app.get("/agent-control/profiles")
+def agent_control_profiles_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    working = get_working_template_profile(current)
+    profiles = list_template_profiles(current)
+    return {
+        "status": "ok",
+        "resource_kind": "profiles",
+        "working_profile_id": working.get("profile_id"),
+        "profiles": profiles,
+    }, 200
+
+
+@app.get("/agent-control/profiles/<string:profile_id>")
+def agent_control_profile_get(profile_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    try:
+        document = get_template_profile_document(current, profile_id)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 404
+    return {
+        "status": "ok",
+        "resource_kind": "profile",
+        "base_version": _current_profile_base_version(current, profile_id),
+        **document,
+    }, 200
+
+
+@app.get("/agent-control/workouts")
+def agent_control_workouts_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    workouts = list_workout_definitions(current.processed_log_file)
+    return {
+        "status": "ok",
+        "resource_kind": "workouts",
+        "workouts": workouts,
+        "count": len(workouts),
+    }, 200
+
+
+@app.get("/agent-control/workouts/<string:workout_id>")
+def agent_control_workout_get(workout_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    try:
+        document = get_workout_definition_document(current.processed_log_file, workout_id)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 404
+    return {
+        "status": "ok",
+        "resource_kind": "workout",
+        "base_version": _current_workout_base_version(current, workout_id),
+        **document,
+    }, 200
+
+
+@app.get("/agent-control/plans/week")
+def agent_control_plan_week_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    try:
+        week_start_local = _resolve_week_start_local(request.args.get("week_start_local"), current=current)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    start_date, end_date = _week_date_span(week_start_local)
+    payload = get_plan_payload(
+        current,
+        center_date=week_start_local,
+        start_date=start_date,
+        end_date=end_date,
+        include_meta=False,
+    )
+    return {
+        "status": "ok",
+        "resource_kind": "plan_week",
+        "week_start_local": week_start_local,
+        "week_end_local": end_date,
+        "base_version": _current_plan_week_base_version(current, week_start_local),
+        "plan": payload,
+    }, 200
+
+
+@app.get("/agent-control/plans/next-week-context")
+def agent_control_next_week_context_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    try:
+        week_start_local = _resolve_week_start_local(request.args.get("week_start_local"), current=current)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+    return {
+        "status": "ok",
+        "context": _build_next_week_context(current, week_start_local),
+    }, 200
+
+
+@app.get("/agent-control/drafts")
+def agent_control_drafts_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    resource_kind = str(request.args.get("resource_kind") or "").strip() or None
+    drafts = list_agent_drafts(current.state_dir, resource_kind=resource_kind)
+    return {"status": "ok", "drafts": drafts, "count": len(drafts)}, 200
+
+
+@app.post("/agent-control/drafts")
+def agent_control_drafts_post() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+    resource_kind = str(body.get("resource_kind") or "").strip()
+    payload = body.get("payload")
+    if resource_kind not in {"template", "profile", "workout", "plan_week"}:
+        return {"status": "error", "error": "resource_kind must be one of: template, profile, workout, plan_week."}, 400
+    if not isinstance(payload, dict):
+        return {"status": "error", "error": "payload must be a JSON object."}, 400
+
+    draft = create_agent_draft(
+        current.state_dir,
+        resource_kind=resource_kind,
+        payload=payload,
+        title=str(body.get("title") or resource_kind),
+        base_version=str(body.get("base_version") or "").strip() or None,
+        requested_by=str(body.get("requested_by") or _agent_control_actor()),
+        source=str(body.get("source") or "agent-control"),
+        metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else None,
+    )
+
+    validation_payload: dict[str, Any] | None = None
+    if bool(body.get("validate", True)):
+        try:
+            validation_payload = _validate_agent_draft(current, draft)
+        except ValueError as exc:
+            validation_payload = {"valid": False, "error": str(exc)}
+            draft = update_agent_draft(
+                current.state_dir,
+                draft["draft_id"],
+                status="validation_failed",
+                validation=validation_payload,
+            )
+        else:
+            draft = update_agent_draft(
+                current.state_dir,
+                draft["draft_id"],
+                status="validated" if bool(validation_payload.get("valid")) else "validation_failed",
+                validation=validation_payload,
+                base_version=draft.get("base_version") or validation_payload.get("base_version"),
+            )
+
+    append_audit_event(
+        current.state_dir,
+        event_type="draft.created",
+        actor=_agent_control_actor(),
+        resource_kind=resource_kind,
+        resource_id=str(draft.get("draft_id") or ""),
+        payload={"title": draft.get("title"), "validated": bool(validation_payload)},
+    )
+    return {"status": "ok", "draft": draft}, 201
+
+
+@app.get("/agent-control/drafts/<string:draft_id>")
+def agent_control_draft_get(draft_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    draft = get_agent_draft(current.state_dir, draft_id)
+    if draft is None:
+        return {"status": "error", "error": "Unknown draft_id."}, 404
+    return {"status": "ok", "draft": draft}, 200
+
+
+@app.put("/agent-control/drafts/<string:draft_id>")
+def agent_control_draft_put(draft_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+    draft = get_agent_draft(current.state_dir, draft_id)
+    if draft is None:
+        return {"status": "error", "error": "Unknown draft_id."}, 404
+
+    updates: dict[str, Any] = {}
+    if "title" in body:
+        updates["title"] = str(body.get("title") or draft.get("title") or "draft")
+    if "payload" in body:
+        if not isinstance(body.get("payload"), dict):
+            return {"status": "error", "error": "payload must be a JSON object."}, 400
+        updates["payload"] = body.get("payload")
+        updates["validation"] = None
+        updates["status"] = "draft"
+    if "metadata" in body:
+        if body.get("metadata") is not None and not isinstance(body.get("metadata"), dict):
+            return {"status": "error", "error": "metadata must be a JSON object when provided."}, 400
+        updates["metadata"] = body.get("metadata") or {}
+    if "base_version" in body:
+        updates["base_version"] = str(body.get("base_version") or "").strip() or None
+    if not updates:
+        return {"status": "error", "error": "Provide title, payload, metadata, and/or base_version."}, 400
+
+    draft = update_agent_draft(current.state_dir, draft_id, **updates)
+    append_audit_event(
+        current.state_dir,
+        event_type="draft.updated",
+        actor=_agent_control_actor(),
+        resource_kind=str(draft.get("resource_kind") or ""),
+        resource_id=draft_id,
+        payload={"fields": sorted(updates.keys())},
+    )
+    return {"status": "ok", "draft": draft}, 200
+
+
+@app.post("/agent-control/drafts/<string:draft_id>/validate")
+def agent_control_draft_validate_post(draft_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    draft = get_agent_draft(current.state_dir, draft_id)
+    if draft is None:
+        return {"status": "error", "error": "Unknown draft_id."}, 404
+    try:
+        validation = _validate_agent_draft(current, draft)
+    except ValueError as exc:
+        validation = {"valid": False, "error": str(exc)}
+        draft = update_agent_draft(
+            current.state_dir,
+            draft_id,
+            status="validation_failed",
+            validation=validation,
+        )
+        http_code = 400
+    else:
+        draft = update_agent_draft(
+            current.state_dir,
+            draft_id,
+            status="validated" if bool(validation.get("valid")) else "validation_failed",
+            validation=validation,
+            base_version=draft.get("base_version") or validation.get("base_version"),
+        )
+        http_code = 200 if bool(validation.get("valid")) else 400
+    append_audit_event(
+        current.state_dir,
+        event_type="draft.validated",
+        actor=_agent_control_actor(),
+        resource_kind=str(draft.get("resource_kind") or ""),
+        resource_id=draft_id,
+        payload={"valid": bool(draft.get("validation", {}).get("valid"))},
+    )
+    return {"status": "ok" if http_code == 200 else "error", "draft": draft}, http_code
+
+
+@app.post("/agent-control/drafts/<string:draft_id>/apply")
+def agent_control_draft_apply_post(draft_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="write")
+    if access_error is not None:
+        return access_error
+    draft = get_agent_draft(current.state_dir, draft_id)
+    if draft is None:
+        return {"status": "error", "error": "Unknown draft_id."}, 404
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+    expected_version = str(body.get("expected_version") or "").strip() or None
+    dry_run = bool(body.get("dry_run", False))
+    draft_to_apply = dict(draft)
+    if expected_version:
+        draft_to_apply["base_version"] = expected_version
+
+    try:
+        validation = _validate_agent_draft(current, draft_to_apply)
+        if dry_run:
+            result = {"dry_run": True, "validation": validation}
+        else:
+            result = _apply_agent_draft(current, draft_to_apply, actor=_agent_control_actor())
+    except ValueError as exc:
+        status_code = 409 if "Version conflict" in str(exc) else 400
+        updated = update_agent_draft(
+            current.state_dir,
+            draft_id,
+            status="apply_failed",
+            validation=draft.get("validation"),
+            apply_result={"error": str(exc)},
+        )
+        return {"status": "error", "error": str(exc), "draft": updated}, status_code
+    except RuntimeError as exc:
+        updated = update_agent_draft(
+            current.state_dir,
+            draft_id,
+            status="apply_failed",
+            validation=draft.get("validation"),
+            apply_result={"error": str(exc)},
+        )
+        return {"status": "error", "error": str(exc), "draft": updated}, 500
+
+    updated = update_agent_draft(
+        current.state_dir,
+        draft_id,
+        status="validated" if dry_run else "applied",
+        validation=validation,
+        apply_result=result if not dry_run else None,
+        base_version=draft_to_apply.get("base_version") or draft.get("base_version") or validation.get("base_version"),
+    )
+    append_audit_event(
+        current.state_dir,
+        event_type="draft.applied" if not dry_run else "draft.dry_run",
+        actor=_agent_control_actor(),
+        resource_kind=str(updated.get("resource_kind") or ""),
+        resource_id=draft_id,
+        payload=result,
+    )
+    return {"status": "ok", "draft": updated, "result": result}, 200
+
+
+@app.get("/agent-control/jobs")
+def agent_control_jobs_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    task_kind = str(request.args.get("task_kind") or "").strip() or None
+    jobs = list_agent_jobs(current.state_dir, task_kind=task_kind)
+    return {"status": "ok", "jobs": jobs, "count": len(jobs)}, 200
+
+
+@app.get("/agent-control/jobs/<string:job_id>")
+def agent_control_job_get(job_id: str) -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    job = get_agent_job(current.state_dir, job_id)
+    if job is None:
+        return {"status": "error", "error": "Unknown job_id."}, 404
+    return {"status": "ok", "job": job}, 200
+
+
+@app.get("/agent-control/audit")
+def agent_control_audit_get() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    try:
+        limit = max(1, min(500, int(request.args.get("limit", "100"))))
+    except ValueError:
+        limit = 100
+    events = list_audit_events(current.state_dir, limit=limit)
+    return {"status": "ok", "events": events, "count": len(events)}, 200
+
+
+@app.post("/agent/tasks/plan-next-week")
+def agent_task_plan_next_week_post() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+    user_request = str(body.get("request") or "").strip()
+    if not user_request:
+        return {"status": "error", "error": "request must be a non-empty string."}, 400
+    try:
+        week_start_local = _resolve_week_start_local(body.get("week_start_local"), current=current)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}, 400
+
+    actor = _agent_control_actor()
+    job = create_agent_job(
+        current.state_dir,
+        task_kind="plan_next_week",
+        request_payload={"request": user_request, "week_start_local": week_start_local},
+        requested_by=actor,
+        source=str(body.get("source") or "agent-task"),
+    )
+    append_audit_event(
+        current.state_dir,
+        event_type="job.created",
+        actor=actor,
+        resource_kind="job",
+        resource_id=str(job.get("job_id") or ""),
+        payload={"task_kind": "plan_next_week"},
+    )
+    try:
+        update_agent_job(current.state_dir, job["job_id"], status="running")
+        context_payload = _build_next_week_context(current, week_start_local)
+        proposal = generate_plan_next_week_draft(
+            current,
+            user_request=user_request,
+            week_start_local=week_start_local,
+            context_payload=context_payload,
+            chronicle_context={
+                "base_url": _agent_control_base_url(current),
+                "api_key": str(current.agent_control_read_api_key or current.agent_control_write_api_key or "").strip(),
+                "protocol_version": COMPANION_PROTOCOL_VERSION,
+            },
+        )
+        draft = create_agent_draft(
+            current.state_dir,
+            resource_kind="plan_week",
+            payload={
+                "week_start_local": week_start_local,
+                "days": proposal.get("days") or [],
+            },
+            title=str(proposal.get("title") or f"Plan draft {week_start_local}"),
+            base_version=str(context_payload.get("version") or "").strip() or None,
+            requested_by=actor,
+            source="agent-task-plan-next-week",
+            metadata={
+                "summary": str(proposal.get("summary") or ""),
+                "warnings": list(proposal.get("warnings") or []),
+            },
+        )
+        validation = _validate_agent_draft(current, draft)
+        draft = update_agent_draft(
+            current.state_dir,
+            draft["draft_id"],
+            status="validated" if bool(validation.get("valid")) else "validation_failed",
+            validation=validation,
+            base_version=draft.get("base_version") or validation.get("base_version"),
+        )
+        job = update_agent_job(
+            current.state_dir,
+            job["job_id"],
+            status="awaiting_approval",
+            result={
+                "draft_id": draft["draft_id"],
+                "summary": proposal.get("summary"),
+                "warnings": proposal.get("warnings") or [],
+                "week_start_local": week_start_local,
+            },
+        )
+        append_audit_event(
+            current.state_dir,
+            event_type="task.plan_next_week.completed",
+            actor=actor,
+            resource_kind="job",
+            resource_id=job["job_id"],
+            payload={"draft_id": draft["draft_id"]},
+        )
+        return {"status": "ok", "job": job, "draft": draft, "proposal": proposal}, 200
+    except ValueError as exc:
+        job = update_agent_job(current.state_dir, job["job_id"], status="failed", error=str(exc))
+        return {"status": "error", "error": str(exc), "job": job}, 400
+    except RuntimeError as exc:
+        job = update_agent_job(current.state_dir, job["job_id"], status="failed", error=str(exc))
+        return {"status": "error", "error": str(exc), "job": job}, 503
+
+
+@app.post("/agent/tasks/bundle-create")
+def agent_task_bundle_create_post() -> tuple[dict, int]:
+    current = _effective_settings()
+    access_error = _require_agent_control_access(current, scope="read")
+    if access_error is not None:
+        return access_error
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "Request body must be a JSON object."}, 400
+    user_request = str(body.get("request") or "").strip()
+    if not user_request:
+        return {"status": "error", "error": "request must be a non-empty string."}, 400
+
+    actor = _agent_control_actor()
+    requested_profile_id = str(body.get("profile_id") or "").strip().lower() or None
+    requested_workout_id = str(body.get("workout_id") or "").strip().lower() or None
+    job = create_agent_job(
+        current.state_dir,
+        task_kind="bundle_create",
+        request_payload={
+            "request": user_request,
+            "profile_id": requested_profile_id,
+            "workout_id": requested_workout_id,
+        },
+        requested_by=actor,
+        source=str(body.get("source") or "agent-task"),
+    )
+    append_audit_event(
+        current.state_dir,
+        event_type="job.created",
+        actor=actor,
+        resource_kind="job",
+        resource_id=str(job.get("job_id") or ""),
+        payload={"task_kind": "bundle_create"},
+    )
+    try:
+        update_agent_job(current.state_dir, job["job_id"], status="running")
+        bundle = generate_bundle_create(
+            current,
+            user_request=user_request,
+            chronicle_context=_build_bundle_context(current),
+        )
+
+        created_drafts: list[dict[str, Any]] = []
+        if isinstance(bundle.get("profile_yaml"), str) and str(bundle.get("profile_yaml")).strip():
+            profile_draft = create_agent_draft(
+                current.state_dir,
+                resource_kind="profile",
+                payload={
+                    "profile_id": requested_profile_id or body.get("profile_name") or "agent-generated-profile",
+                    "yaml_text": str(bundle.get("profile_yaml") or ""),
+                },
+                title=f"Profile draft for {requested_profile_id or 'agent-generated-profile'}",
+                requested_by=actor,
+                source="agent-task-bundle-create",
+                metadata={"summary": str(bundle.get("summary") or ""), "warnings": list(bundle.get("warnings") or [])},
+            )
+            profile_validation = _validate_agent_draft(current, profile_draft)
+            profile_draft = update_agent_draft(
+                current.state_dir,
+                profile_draft["draft_id"],
+                status="validated",
+                validation=profile_validation,
+            )
+            created_drafts.append(profile_draft)
+            if requested_profile_id is None:
+                requested_profile_id = str(profile_validation.get("profile_id") or "").strip().lower() or None
+
+        if isinstance(bundle.get("template_text"), str) and str(bundle.get("template_text")).strip():
+            template_profile_id = requested_profile_id or str(get_working_template_profile(current).get("profile_id") or "default")
+            template_draft = create_agent_draft(
+                current.state_dir,
+                resource_kind="template",
+                payload={
+                    "profile_id": template_profile_id,
+                    "template": str(bundle.get("template_text") or ""),
+                    "context_mode": "sample",
+                    "allow_missing_profile": requested_profile_id is not None,
+                },
+                title=f"Template draft for {template_profile_id}",
+                requested_by=actor,
+                source="agent-task-bundle-create",
+                metadata={"summary": str(bundle.get("summary") or ""), "warnings": list(bundle.get("warnings") or [])},
+            )
+            template_validation = _validate_agent_draft(current, template_draft)
+            template_draft = update_agent_draft(
+                current.state_dir,
+                template_draft["draft_id"],
+                status="validated" if bool(template_validation.get("valid")) else "validation_failed",
+                validation=template_validation,
+                base_version=template_validation.get("base_version"),
+            )
+            created_drafts.append(template_draft)
+
+        if isinstance(bundle.get("workout_payload"), dict):
+            workout_payload = dict(bundle.get("workout_payload") or {})
+            if requested_workout_id and not workout_payload.get("workout_id") and not workout_payload.get("workout_code"):
+                workout_payload["workout_id"] = requested_workout_id
+            workout_draft = create_agent_draft(
+                current.state_dir,
+                resource_kind="workout",
+                payload=workout_payload,
+                title=f"Workout draft for {requested_workout_id or workout_payload.get('workout_id') or 'agent-generated-workout'}",
+                requested_by=actor,
+                source="agent-task-bundle-create",
+                metadata={"summary": str(bundle.get("summary") or ""), "warnings": list(bundle.get("warnings") or [])},
+            )
+            workout_validation = _validate_agent_draft(current, workout_draft)
+            workout_draft = update_agent_draft(
+                current.state_dir,
+                workout_draft["draft_id"],
+                status="validated",
+                validation=workout_validation,
+            )
+            created_drafts.append(workout_draft)
+
+        job = update_agent_job(
+            current.state_dir,
+            job["job_id"],
+            status="awaiting_approval",
+            result={
+                "draft_ids": [str(item.get("draft_id") or "") for item in created_drafts],
+                "summary": str(bundle.get("summary") or ""),
+                "warnings": list(bundle.get("warnings") or []),
+            },
+        )
+        append_audit_event(
+            current.state_dir,
+            event_type="task.bundle_create.completed",
+            actor=actor,
+            resource_kind="job",
+            resource_id=job["job_id"],
+            payload={"draft_count": len(created_drafts)},
+        )
+        return {"status": "ok", "job": job, "drafts": created_drafts, "bundle": bundle}, 200
+    except ValueError as exc:
+        job = update_agent_job(current.state_dir, job["job_id"], status="failed", error=str(exc))
+        return {"status": "error", "error": str(exc), "job": job}, 400
+    except RuntimeError as exc:
+        job = update_agent_job(current.state_dir, job["job_id"], status="failed", error=str(exc))
+        return {"status": "error", "error": str(exc), "job": job}, 503
 
 
 def _rerun_status_code(result: object) -> str:
