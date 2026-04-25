@@ -39,7 +39,7 @@ The profile seed template leads with the challenge scoreboard:
 📈 Total: 151.8 mi | +15,112' | 🏔️ 110
 ```
 
-The lower section keeps the default streak, awards, and technical training data. It intentionally omits the default historical totals for past 7 days, past 30 days, and year-to-date.
+The lower section uses the `sean_default` streak, activity-award, weather, readiness, and technical training layout. It intentionally omits the default historical totals for past 7 days, past 30 days, and year-to-date.
 
 ## Pace Indicators
 
@@ -122,6 +122,15 @@ challenge.royale_hill.longitude
 challenge.royale_hill.radius_feet
 challenge.royale_hill.current_activity_summits
 challenge.royale_hill.current_activity_source
+
+activity.royale_hill_summits
+activity.summits.royale_hill
+
+summits.royale_hill.activity
+summits.royale_hill.today
+summits.royale_hill.month
+summits.royale_hill.year
+summits.royale_hill.source
 ```
 
 ## Data Sources
@@ -130,11 +139,28 @@ Distance totals are computed from Strava activity history already collected for 
 
 Elevation totals are computed from Smashrun activities when Smashrun is enabled and available. This keeps the challenge elevation aligned with the source used for the badge target.
 
-Royale Hill summits are computed from Strava `latlng` activity streams. Chronicle counts each transition from outside the summit radius to inside the `60ft` radius as one summit. If streams are unavailable, Chronicle falls back to the activity polyline when present. Per-activity summit counts are persisted in runtime state so totals remain stable after processing.
+Royale Hill summits are a standalone local metric, not a challenge-owned counter. Chronicle computes the metric for every newly processed activity by reading Strava `latlng` streams and counting each transition from outside the summit radius to inside the `60ft` radius. If streams are unavailable, Chronicle falls back to the activity polyline when present. Per-activity summit counts are stored in the runtime SQLite database in `activity_summit_metrics`, keyed by activity and location.
+
+The 300/30 challenge reads Royale Hill from the stored metric table. `challenge.today.royale_hill_summits` and `challenge.totals.royale_hill_summits` include all activities with stored Royale Hill summits during the relevant local date range, so double and triple sessions naturally add together and non-run GPS activities are not excluded from the summit layer.
+
+## Backfill
+
+To seed Royale Hill summits for historical runs since January 1, 2024:
+
+```bash
+python -m chronicle.activity_pipeline --backfill-royale-hill-summits --backfill-since 2024-01-01
+```
+
+By default, the backfill analyzes running activities only: `Run`, `TrailRun`, and `VirtualRun`. To analyze every Strava activity type with GPS streams:
+
+```bash
+python -m chronicle.activity_pipeline --backfill-royale-hill-summits --backfill-since 2024-01-01 --backfill-all-activity-types
+```
 
 ## Operational Notes
 
 - Keep `ENABLE_SMASHRUN=true` and `SMASHRUN_ACCESS_TOKEN` configured for elevation totals.
 - The Strava token must have access to activity streams for Royale Hill summit counting.
 - The profile can be enabled before May, but it will not match non-May activities.
-- If a run is reprocessed, Royale Hill summit counts for that activity are recalculated and replaced.
+- If an activity is reprocessed, Royale Hill summit counts for that activity are recalculated and replaced.
+- Summit tracking is not limited by the optional service-call budget because it is part of the challenge accounting path.

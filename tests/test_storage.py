@@ -1,7 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +13,7 @@ from chronicle.storage import (
     complete_activity_job_run,
     enqueue_activity_job,
     get_activity_job,
+    get_activity_summit_metric,
     get_activity_state,
     get_plan_day,
     get_plan_setting,
@@ -34,6 +35,8 @@ from chronicle.storage import (
     set_runtime_values,
     set_plan_setting,
     set_worker_heartbeat,
+    sum_activity_summit_metrics,
+    upsert_activity_summit_metric,
     upsert_plan_days_bulk,
     upsert_plan_day,
     write_json,
@@ -105,6 +108,62 @@ class TestStorage(unittest.TestCase):
                 "2026-02-22T00:00:00+00:00",
             )
             self.assertNotIn("worker.missing", values)
+
+    def test_activity_summit_metric_round_trip_and_period_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "processed.log"
+            record = upsert_activity_summit_metric(
+                path,
+                activity_id=123,
+                location_key="royale_hill",
+                location_name="Royale Hill",
+                local_date=date(2026, 5, 15),
+                start_date_utc="2026-05-15T12:00:00Z",
+                sport_type="Run",
+                count=6,
+                source="strava_streams",
+                latitude=34.24659,
+                longitude=-83.96339,
+                radius_feet=60,
+            )
+
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["activity_id"], "123")
+            self.assertEqual(record["location_key"], "royale_hill")
+            self.assertEqual(record["count"], 6)
+
+            stored = get_activity_summit_metric(path, 123, "royale_hill")
+            self.assertIsNotNone(stored)
+            assert stored is not None
+            self.assertEqual(stored["local_date"], "2026-05-15")
+            self.assertEqual(stored["source"], "strava_streams")
+
+            upsert_activity_summit_metric(
+                path,
+                activity_id=456,
+                location_key="royale_hill",
+                location_name="Royale Hill",
+                local_date=date(2026, 6, 1),
+                start_date_utc="2026-06-01T12:00:00Z",
+                sport_type="Ride",
+                count=2,
+                source="strava_streams",
+                latitude=34.24659,
+                longitude=-83.96339,
+                radius_feet=60,
+            )
+
+            self.assertEqual(
+                sum_activity_summit_metrics(
+                    path,
+                    location_key="royale_hill",
+                    start_date=date(2026, 5, 1),
+                    end_date_exclusive=date(2026, 6, 1),
+                ),
+                6,
+            )
+            self.assertEqual(sum_activity_summit_metrics(path, location_key="royale_hill"), 8)
 
     def test_plan_day_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

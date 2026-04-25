@@ -34,6 +34,7 @@ from .storage import (
     complete_activity_job_run,
     delete_runtime_value,
     enqueue_activity_job,
+    get_activity_summit_metric,
     get_runtime_lock_owner,
     get_runtime_value,
     get_runtime_values,
@@ -45,6 +46,8 @@ from .storage import (
     start_activity_job_run,
     set_runtime_value,
     set_runtime_values,
+    sum_activity_summit_metrics,
+    upsert_activity_summit_metric,
     write_config_snapshot,
     write_json,
 )
@@ -72,6 +75,8 @@ CHALLENGE_300_30_ELEVATION_GOAL_FEET = 29029.0
 ROYALE_HILL_LATITUDE = 34.24659
 ROYALE_HILL_LONGITUDE = -83.96339
 ROYALE_HILL_RADIUS_FEET = 60.0
+ROYALE_HILL_LOCATION_KEY = "royale_hill"
+ROYALE_HILL_LOCATION_NAME = "Royale Hill"
 ROYALE_HILL_SUMMIT_REGISTRY_KEY = "challenge.royale_hill.activity_summits"
 
 
@@ -1550,67 +1555,59 @@ def _count_radius_entries(
     return count
 
 
-def _load_royale_hill_registry(settings: Settings) -> dict[str, Any]:
-    payload = get_runtime_value(settings.processed_log_file, ROYALE_HILL_SUMMIT_REGISTRY_KEY, {})
-    return payload if isinstance(payload, dict) else {}
-
-
-def _store_royale_hill_summit_count(
-    settings: Settings,
-    *,
-    activity_id: Any,
-    local_date: date | None,
-    sport_type: str,
-    count: int,
-    source: str,
-) -> dict[str, Any]:
-    registry = _load_royale_hill_registry(settings)
-    activity_key = str(activity_id or "").strip()
-    if not activity_key:
-        return registry
-    registry[activity_key] = {
-        "activity_id": activity_key,
-        "local_date": local_date.isoformat() if isinstance(local_date, date) else None,
-        "sport_type": str(sport_type or ""),
-        "count": max(0, int(count)),
-        "source": source,
-        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    set_runtime_value(settings.processed_log_file, ROYALE_HILL_SUMMIT_REGISTRY_KEY, registry)
-    return registry
-
-
-def _royale_hill_registry_total(registry: dict[str, Any], *, through_date: date | None = None) -> int:
-    total = 0
-    for record in registry.values():
+def _migrate_legacy_royale_hill_registry(settings: Settings) -> None:
+    registry = get_runtime_value(settings.processed_log_file, ROYALE_HILL_SUMMIT_REGISTRY_KEY, {})
+    if not isinstance(registry, dict):
+        return
+    for activity_id, record in registry.items():
         if not isinstance(record, dict):
             continue
-        local_date_raw = record.get("local_date")
-        if not isinstance(local_date_raw, str):
+        activity_key = str(record.get("activity_id") or activity_id or "").strip()
+        if not activity_key:
             continue
-        try:
-            local_date = date.fromisoformat(local_date_raw)
-        except ValueError:
+        if get_activity_summit_metric(settings.processed_log_file, activity_key, ROYALE_HILL_LOCATION_KEY):
             continue
-        if local_date < CHALLENGE_300_30_START or local_date >= CHALLENGE_300_30_END_EXCLUSIVE:
-            continue
-        if through_date is not None and local_date > through_date:
-            continue
-        total += max(0, int(_as_float(record.get("count")) or 0))
-    return total
+        upsert_activity_summit_metric(
+            settings.processed_log_file,
+            activity_id=activity_key,
+            location_key=ROYALE_HILL_LOCATION_KEY,
+            location_name=ROYALE_HILL_LOCATION_NAME,
+            local_date=record.get("local_date") if isinstance(record.get("local_date"), str) else None,
+            start_date_utc=None,
+            sport_type=str(record.get("sport_type") or ""),
+            count=max(0, int(_as_float(record.get("count")) or 0)),
+            source=str(record.get("source") or "legacy_registry"),
+            latitude=ROYALE_HILL_LATITUDE,
+            longitude=ROYALE_HILL_LONGITUDE,
+            radius_feet=ROYALE_HILL_RADIUS_FEET,
+        )
 
 
-def _royale_hill_registry_date_total(registry: dict[str, Any], target_date: date | None) -> int:
+def _royale_hill_metric_date_total(settings: Settings, target_date: date | None) -> int:
     if target_date is None:
         return 0
-    total = 0
-    for record in registry.values():
-        if not isinstance(record, dict):
-            continue
-        if record.get("local_date") != target_date.isoformat():
-            continue
-        total += max(0, int(_as_float(record.get("count")) or 0))
-    return total
+    _migrate_legacy_royale_hill_registry(settings)
+    return sum_activity_summit_metrics(
+        settings.processed_log_file,
+        location_key=ROYALE_HILL_LOCATION_KEY,
+        start_date=target_date,
+        end_date_exclusive=target_date + timedelta(days=1),
+    )
+
+
+def _royale_hill_metric_period_total(
+    settings: Settings,
+    *,
+    start_date: date,
+    end_date_exclusive: date,
+) -> int:
+    _migrate_legacy_royale_hill_registry(settings)
+    return sum_activity_summit_metrics(
+        settings.processed_log_file,
+        location_key=ROYALE_HILL_LOCATION_KEY,
+        start_date=start_date,
+        end_date_exclusive=end_date_exclusive,
+    )
 
 
 def _collect_royale_hill_current_summits(
@@ -1622,32 +1619,36 @@ def _collect_royale_hill_current_summits(
     service_state: dict[str, Any] | None,
 ) -> dict[str, Any]:
     activity_id = detailed_activity.get("id")
-    registry = _load_royale_hill_registry(settings)
     activity_key = str(activity_id or "").strip()
-    existing = registry.get(activity_key) if activity_key else None
-
-    if not _is_challenge_running_activity(detailed_activity):
-        return {
-            "count": 0,
-            "source": "not_running_activity",
-            "registry": registry,
-        }
+    _migrate_legacy_royale_hill_registry(settings)
+    existing = (
+        get_activity_summit_metric(settings.processed_log_file, activity_key, ROYALE_HILL_LOCATION_KEY)
+        if activity_key
+        else None
+    )
 
     points: list[tuple[float, float]] = []
     source = "unavailable"
     if activity_key:
-        streams = _run_service_call(
-            settings,
-            "strava.activity_streams",
-            strava_client.get_activity_streams,
-            int(activity_key),
-            service_state=service_state,
-            cache_key=f"strava.activity_streams:{activity_key}:latlng",
-            cache_ttl_seconds=settings.service_cache_ttl_seconds,
-        )
-        points = _latlng_points_from_streams(streams)
-        if points:
-            source = "strava_streams"
+        try:
+            numeric_activity_id = int(activity_key)
+        except ValueError:
+            numeric_activity_id = None
+        if numeric_activity_id is not None:
+            streams = _run_service_call(
+                settings,
+                "strava.activity_streams",
+                strava_client.get_activity_streams,
+                numeric_activity_id,
+                # Summit tracking should run for every processed activity, even
+                # when optional service-call budget is exhausted.
+                service_state=None,
+                cache_key=f"strava.activity_streams:{activity_key}:latlng",
+                cache_ttl_seconds=settings.service_cache_ttl_seconds,
+            )
+            points = _latlng_points_from_streams(streams)
+            if points:
+                source = "strava_streams"
 
     if not points:
         points = _activity_polyline_points(detailed_activity)
@@ -1659,12 +1660,26 @@ def _collect_royale_hill_current_summits(
             return {
                 "count": max(0, int(_as_float(existing.get("count")) or 0)),
                 "source": str(existing.get("source") or "stored"),
-                "registry": registry,
+                "record": existing,
             }
+        record = upsert_activity_summit_metric(
+            settings.processed_log_file,
+            activity_id=activity_key,
+            location_key=ROYALE_HILL_LOCATION_KEY,
+            location_name=ROYALE_HILL_LOCATION_NAME,
+            local_date=local_date,
+            start_date_utc=str(detailed_activity.get("start_date") or "").strip() or None,
+            sport_type=str(detailed_activity.get("sport_type") or detailed_activity.get("type") or ""),
+            count=0,
+            source="unavailable",
+            latitude=ROYALE_HILL_LATITUDE,
+            longitude=ROYALE_HILL_LONGITUDE,
+            radius_feet=ROYALE_HILL_RADIUS_FEET,
+        )
         return {
             "count": 0,
             "source": "unavailable",
-            "registry": registry,
+            "record": record or {},
         }
 
     count = _count_radius_entries(
@@ -1673,18 +1688,71 @@ def _collect_royale_hill_current_summits(
         longitude=ROYALE_HILL_LONGITUDE,
         radius_feet=ROYALE_HILL_RADIUS_FEET,
     )
-    registry = _store_royale_hill_summit_count(
-        settings,
+    record = upsert_activity_summit_metric(
+        settings.processed_log_file,
         activity_id=activity_key,
+        location_key=ROYALE_HILL_LOCATION_KEY,
+        location_name=ROYALE_HILL_LOCATION_NAME,
         local_date=local_date,
+        start_date_utc=str(detailed_activity.get("start_date") or "").strip() or None,
         sport_type=str(detailed_activity.get("sport_type") or detailed_activity.get("type") or ""),
         count=count,
         source=source,
+        latitude=ROYALE_HILL_LATITUDE,
+        longitude=ROYALE_HILL_LONGITUDE,
+        radius_feet=ROYALE_HILL_RADIUS_FEET,
     )
     return {
         "count": count,
         "source": source,
-        "registry": registry,
+        "record": record or {},
+    }
+
+
+def _build_royale_hill_summit_context(
+    settings: Settings,
+    *,
+    activity_date: date | None,
+    summit_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = summit_result if isinstance(summit_result, dict) else {}
+    activity_count = max(0, int(_as_float(result.get("count")) or 0))
+    source = str(result.get("source") or "")
+    today_total = _royale_hill_metric_date_total(settings, activity_date)
+    month_total = 0
+    year_total = 0
+    if activity_date is not None:
+        month_start = activity_date.replace(day=1)
+        if month_start.month == 12:
+            month_end = date(month_start.year + 1, 1, 1)
+        else:
+            month_end = date(month_start.year, month_start.month + 1, 1)
+        year_start = date(activity_date.year, 1, 1)
+        year_end = date(activity_date.year + 1, 1, 1)
+        month_total = _royale_hill_metric_period_total(
+            settings,
+            start_date=month_start,
+            end_date_exclusive=month_end,
+        )
+        year_total = _royale_hill_metric_period_total(
+            settings,
+            start_date=year_start,
+            end_date_exclusive=year_end,
+        )
+    return {
+        "royale_hill": {
+            "location_key": ROYALE_HILL_LOCATION_KEY,
+            "location_name": ROYALE_HILL_LOCATION_NAME,
+            "latitude": ROYALE_HILL_LATITUDE,
+            "longitude": ROYALE_HILL_LONGITUDE,
+            "radius_feet": ROYALE_HILL_RADIUS_FEET,
+            "activity": activity_count,
+            "today": today_total,
+            "month": month_total,
+            "year": year_total,
+            "source": source,
+            "record": result.get("record") if isinstance(result.get("record"), dict) else {},
+        }
     }
 
 
@@ -1697,6 +1765,7 @@ def _build_300_30_challenge_context(
     *,
     profile_id: str,
     service_state: dict[str, Any] | None,
+    summit_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timezone_name = str(getattr(settings, "timezone", "UTC") or "UTC")
     activity_date = _activity_local_date(detailed_activity, timezone_name)
@@ -1746,12 +1815,7 @@ def _build_300_30_challenge_context(
         if CHALLENGE_300_30_START <= local_date <= through_date:
             total_elevation_feet += elevation_feet
 
-    summit_result = {
-        "count": 0,
-        "source": "inactive",
-        "registry": _load_royale_hill_registry(settings),
-    }
-    if active:
+    if summit_result is None:
         summit_result = _collect_royale_hill_current_summits(
             settings,
             strava_client,
@@ -1759,9 +1823,12 @@ def _build_300_30_challenge_context(
             local_date=activity_date,
             service_state=service_state,
         )
-    registry = summit_result.get("registry") if isinstance(summit_result.get("registry"), dict) else {}
-    today_summits = _royale_hill_registry_date_total(registry, activity_date)
-    total_summits = _royale_hill_registry_total(registry, through_date=through_date)
+    today_summits = _royale_hill_metric_date_total(settings, activity_date)
+    total_summits = _royale_hill_metric_period_total(
+        settings,
+        start_date=CHALLENGE_300_30_START,
+        end_date_exclusive=through_date + timedelta(days=1),
+    )
 
     distance_remaining = max(0.0, CHALLENGE_300_30_DISTANCE_GOAL_MILES - total_distance_miles)
     elevation_remaining = max(0.0, CHALLENGE_300_30_ELEVATION_GOAL_FEET - total_elevation_feet)
@@ -2999,6 +3066,7 @@ def _build_description_context(
     smashrun_badges: list[dict[str, Any]] | None = None,
     garmin_period_fallback: dict[str, dict[str, Any]] | None = None,
     challenge_context: dict[str, Any] | None = None,
+    summit_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     intervals_payload = intervals_payload or {}
     achievements = intervals_payload.get("achievements", [])
@@ -3035,6 +3103,11 @@ def _build_description_context(
     smashrun_activity = smashrun_activity or {}
     smashrun_stats = smashrun_stats or {}
     smashrun_badges = smashrun_badges or []
+    summit_context = summit_context or {}
+    royale_hill_context = (
+        summit_context.get("royale_hill") if isinstance(summit_context.get("royale_hill"), dict) else {}
+    )
+    royale_hill_activity_summits = max(0, int(_as_float(royale_hill_context.get("activity")) or 0))
     garmin_period_fallback = garmin_period_fallback or {}
     smashrun_activity_context = _normalize_smashrun_activity(smashrun_activity, local_tz=local_tz)
     smashrun_stats_context = _normalize_smashrun_stats(smashrun_stats)
@@ -3314,6 +3387,10 @@ def _build_description_context(
             "efficiency": efficiency,
             "treadmill_incline_percent": treadmill_incline_percent,
             "treadmill_elevation_feet_15pct": treadmill_elevation_feet_15pct,
+            "royale_hill_summits": royale_hill_activity_summits,
+            "summits": {
+                "royale_hill": royale_hill_activity_summits,
+            },
             "social": {
                 "kudos": int(round(_as_float(detailed_activity.get("kudos_count")) or 0)),
                 "comments": int(round(_as_float(detailed_activity.get("comment_count")) or 0)),
@@ -3391,6 +3468,7 @@ def _build_description_context(
             "stats": smashrun_stats_context,
         },
         "challenge": challenge_context or {},
+        "summits": summit_context,
         "periods": {
             "week": {
                 "gap": week["gap"],
@@ -4111,6 +4189,20 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             service_state=service_state,
         )
 
+        activity_local_date = _activity_local_date(detailed_activity, settings.timezone)
+        summit_result = _collect_royale_hill_current_summits(
+            settings,
+            strava_client,
+            detailed_activity,
+            local_date=activity_local_date,
+            service_state=service_state,
+        )
+        summit_context = _build_royale_hill_summit_context(
+            settings,
+            activity_date=activity_local_date,
+            summit_result=summit_result,
+        )
+
         challenge_context = _build_300_30_challenge_context(
             settings,
             strava_client,
@@ -4121,6 +4213,7 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             else [],
             profile_id=profile_id,
             service_state=service_state,
+            summit_result=summit_result,
         )
 
         description_context = _build_description_context(
@@ -4146,6 +4239,7 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
             smashrun_badges=smashrun_badges,
             garmin_period_fallback=garmin_period_fallback,
             challenge_context=challenge_context,
+            summit_context=summit_context,
         )
 
         description_context["profile"] = {
@@ -4324,6 +4418,83 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
         )
 
 
+def backfill_royale_hill_summits(
+    *,
+    since: date = date(2024, 1, 1),
+    include_all_activity_types: bool = False,
+) -> dict[str, Any]:
+    settings = Settings.from_env()
+    settings.validate()
+    settings.ensure_state_paths()
+    _configure_logging(settings.log_level)
+
+    strava_client = StravaClient(settings)
+    since_utc = datetime(since.year, since.month, since.day, tzinfo=timezone.utc)
+    activities = strava_client.get_activities_after(since_utc)
+    analyzed = 0
+    skipped = 0
+    total_summits = 0
+    records: list[dict[str, Any]] = []
+
+    for activity in activities:
+        if not isinstance(activity, dict):
+            skipped += 1
+            continue
+        if not include_all_activity_types and not _is_challenge_running_activity(activity):
+            skipped += 1
+            continue
+        activity_id = activity.get("id")
+        try:
+            numeric_activity_id = int(str(activity_id))
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        detailed_activity = strava_client.get_activity_details(numeric_activity_id)
+        if not isinstance(detailed_activity, dict):
+            skipped += 1
+            continue
+        local_date = _activity_local_date(detailed_activity, settings.timezone)
+        result = _collect_royale_hill_current_summits(
+            settings,
+            strava_client,
+            detailed_activity,
+            local_date=local_date,
+            service_state=None,
+        )
+        analyzed += 1
+        count = max(0, int(_as_float(result.get("count")) or 0))
+        total_summits += count
+        records.append(
+            {
+                "activity_id": str(numeric_activity_id),
+                "local_date": local_date.isoformat() if local_date else None,
+                "sport_type": str(detailed_activity.get("sport_type") or detailed_activity.get("type") or ""),
+                "summits": count,
+                "source": str(result.get("source") or ""),
+            }
+        )
+
+    summary = {
+        "status": "completed",
+        "location_key": ROYALE_HILL_LOCATION_KEY,
+        "location_name": ROYALE_HILL_LOCATION_NAME,
+        "since": since.isoformat(),
+        "activity_scope": "all" if include_all_activity_types else "running",
+        "activities_seen": len(activities),
+        "activities_analyzed": analyzed,
+        "activities_skipped": skipped,
+        "total_summits_analyzed": total_summits,
+        "records": records,
+    }
+    logger.info(
+        "Royale Hill summit backfill complete: analyzed=%s skipped=%s summits=%s",
+        analyzed,
+        skipped,
+        total_summits,
+    )
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Update Strava activity description with stats.")
     parser.add_argument("-f", "--force", action="store_true", help="Force update the most recent activity.")
@@ -4334,7 +4505,33 @@ def main() -> None:
         default=None,
         help="Rerun update for a specific Strava activity ID.",
     )
+    parser.add_argument(
+        "--backfill-royale-hill-summits",
+        action="store_true",
+        help="Seed local Royale Hill summit metrics by re-analyzing Strava activity streams.",
+    )
+    parser.add_argument(
+        "--backfill-since",
+        default="2024-01-01",
+        help="Start date for Royale Hill summit backfill, in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--backfill-all-activity-types",
+        action="store_true",
+        help="Analyze every Strava activity type during summit backfill instead of running activities only.",
+    )
     args = parser.parse_args()
+    if args.backfill_royale_hill_summits:
+        try:
+            since = date.fromisoformat(str(args.backfill_since))
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --backfill-since date: {args.backfill_since}") from exc
+        summary = backfill_royale_hill_summits(
+            since=since,
+            include_all_activity_types=bool(args.backfill_all_activity_types),
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
     run_once(force_update=args.force, activity_id=args.activity_id)
 
 

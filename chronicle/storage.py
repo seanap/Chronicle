@@ -232,6 +232,32 @@ def _initialize_runtime_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_summit_metrics (
+            activity_id TEXT NOT NULL,
+            location_key TEXT NOT NULL,
+            location_name TEXT NOT NULL,
+            local_date TEXT,
+            start_date_utc TEXT,
+            sport_type TEXT,
+            count INTEGER NOT NULL DEFAULT 0,
+            source TEXT,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            radius_feet REAL NOT NULL,
+            analyzed_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            PRIMARY KEY (activity_id, location_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_summit_metrics_location_date
+        ON activity_summit_metrics (location_key, local_date)
+        """
+    )
 
 
 def _ensure_activity_state_columns(conn: sqlite3.Connection) -> None:
@@ -445,6 +471,212 @@ def delete_runtime_value(path: Path, key: str) -> None:
             conn.execute("DELETE FROM runtime_kv WHERE key = ?", (key,))
     except sqlite3.Error:
         return
+
+
+def _summit_metric_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "activity_id": str(row["activity_id"]),
+        "location_key": str(row["location_key"]),
+        "location_name": str(row["location_name"]),
+        "local_date": str(row["local_date"]) if row["local_date"] is not None else None,
+        "start_date_utc": str(row["start_date_utc"]) if row["start_date_utc"] is not None else None,
+        "sport_type": str(row["sport_type"]) if row["sport_type"] is not None else "",
+        "count": max(0, int(row["count"] or 0)),
+        "source": str(row["source"]) if row["source"] is not None else "",
+        "latitude": float(row["latitude"]),
+        "longitude": float(row["longitude"]),
+        "radius_feet": float(row["radius_feet"]),
+        "analyzed_at_utc": str(row["analyzed_at_utc"]),
+        "updated_at_utc": str(row["updated_at_utc"]),
+    }
+
+
+def upsert_activity_summit_metric(
+    path: Path,
+    *,
+    activity_id: int | str,
+    location_key: str,
+    location_name: str,
+    local_date: date | str | None,
+    start_date_utc: str | None,
+    sport_type: str,
+    count: int,
+    source: str,
+    latitude: float,
+    longitude: float,
+    radius_feet: float,
+) -> dict[str, Any] | None:
+    activity_id_str = str(activity_id).strip()
+    location_key_text = str(location_key).strip()
+    if not activity_id_str or not location_key_text:
+        return None
+    if isinstance(local_date, date):
+        local_date_text = local_date.isoformat()
+    elif isinstance(local_date, str) and local_date.strip():
+        local_date_text = local_date.strip()
+    else:
+        local_date_text = None
+    now_iso = _utc_now_iso()
+    count_value = max(0, int(count))
+    try:
+        with _connect_runtime_db(path) as conn:
+            conn.execute(
+                """
+                INSERT INTO activity_summit_metrics (
+                    activity_id,
+                    location_key,
+                    location_name,
+                    local_date,
+                    start_date_utc,
+                    sport_type,
+                    count,
+                    source,
+                    latitude,
+                    longitude,
+                    radius_feet,
+                    analyzed_at_utc,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(activity_id, location_key) DO UPDATE SET
+                    location_name = excluded.location_name,
+                    local_date = excluded.local_date,
+                    start_date_utc = excluded.start_date_utc,
+                    sport_type = excluded.sport_type,
+                    count = excluded.count,
+                    source = excluded.source,
+                    latitude = excluded.latitude,
+                    longitude = excluded.longitude,
+                    radius_feet = excluded.radius_feet,
+                    analyzed_at_utc = excluded.analyzed_at_utc,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    activity_id_str,
+                    location_key_text,
+                    str(location_name or "").strip() or location_key_text,
+                    local_date_text,
+                    str(start_date_utc).strip() if start_date_utc else None,
+                    str(sport_type or ""),
+                    count_value,
+                    str(source or ""),
+                    float(latitude),
+                    float(longitude),
+                    float(radius_feet),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    return get_activity_summit_metric(path, activity_id_str, location_key_text)
+
+
+def get_activity_summit_metric(
+    path: Path,
+    activity_id: int | str,
+    location_key: str,
+) -> dict[str, Any] | None:
+    activity_id_str = str(activity_id).strip()
+    location_key_text = str(location_key).strip()
+    if not activity_id_str or not location_key_text:
+        return None
+    try:
+        with _connect_runtime_db(path) as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM activity_summit_metrics
+                WHERE activity_id = ? AND location_key = ?
+                LIMIT 1
+                """,
+                (activity_id_str, location_key_text),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    return _summit_metric_row_to_dict(row) if row is not None else None
+
+
+def list_activity_summit_metrics(
+    path: Path,
+    *,
+    location_key: str | None = None,
+    start_date: date | str | None = None,
+    end_date_exclusive: date | str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    location_key_text = str(location_key or "").strip()
+    if location_key_text:
+        clauses.append("location_key = ?")
+        params.append(location_key_text)
+    start_text = start_date.isoformat() if isinstance(start_date, date) else str(start_date or "").strip()
+    if start_text:
+        clauses.append("local_date >= ?")
+        params.append(start_text)
+    end_text = (
+        end_date_exclusive.isoformat()
+        if isinstance(end_date_exclusive, date)
+        else str(end_date_exclusive or "").strip()
+    )
+    if end_text:
+        clauses.append("local_date < ?")
+        params.append(end_text)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with _connect_runtime_db(path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM activity_summit_metrics
+                {where_sql}
+                ORDER BY local_date ASC, activity_id ASC
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [_summit_metric_row_to_dict(row) for row in rows]
+
+
+def sum_activity_summit_metrics(
+    path: Path,
+    *,
+    location_key: str,
+    start_date: date | str | None = None,
+    end_date_exclusive: date | str | None = None,
+) -> int:
+    clauses = ["location_key = ?"]
+    params: list[Any] = [str(location_key).strip()]
+    if not params[0]:
+        return 0
+    start_text = start_date.isoformat() if isinstance(start_date, date) else str(start_date or "").strip()
+    if start_text:
+        clauses.append("local_date >= ?")
+        params.append(start_text)
+    end_text = (
+        end_date_exclusive.isoformat()
+        if isinstance(end_date_exclusive, date)
+        else str(end_date_exclusive or "").strip()
+    )
+    if end_text:
+        clauses.append("local_date < ?")
+        params.append(end_text)
+    try:
+        with _connect_runtime_db(path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(count), 0) AS total
+                FROM activity_summit_metrics
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if row is None:
+        return 0
+    return max(0, int(row["total"] or 0))
 
 
 def set_worker_heartbeat(path: Path, heartbeat_utc: datetime | None = None) -> None:

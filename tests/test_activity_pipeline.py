@@ -14,6 +14,7 @@ from chronicle.activity_pipeline import (
     ROYALE_HILL_LONGITUDE,
     _build_300_30_challenge_context,
     _build_description_context,
+    _build_royale_hill_summit_context,
     _count_radius_entries,
     _extract_activity_smashrun_badges,
     _extract_strava_badges,
@@ -25,8 +26,10 @@ from chronicle.activity_pipeline import (
     _profile_match_reasons,
     _resolve_cycle_time_context,
     _select_activity_profile,
+    backfill_royale_hill_summits,
     preview_specific_profile_against_activity,
 )
+from chronicle.storage import get_activity_summit_metric, upsert_activity_summit_metric
 
 
 class TestStravaSegmentNotables(unittest.TestCase):
@@ -217,6 +220,47 @@ class TestActivityGarminBadges(unittest.TestCase):
         self.assertEqual(context.get("activity", {}).get("average_hr"), 167)
         self.assertEqual(context.get("activity", {}).get("cadence_spm"), 182)
 
+    def test_description_context_exposes_royale_hill_summit_tags(self) -> None:
+        context = _build_description_context(
+            detailed_activity={
+                "id": 888,
+                "name": "Hill Repeats",
+                "type": "Run",
+                "sport_type": "Run",
+                "distance": 3218.68,
+                "moving_time": 1500,
+                "elapsed_time": 1500,
+                "average_speed": 2.145,
+                "start_latlng": [34.2, -83.9],
+            },
+            training={},
+            intervals_payload={},
+            week={"gap": "8:00/mi", "distance": 10.0, "elevation": 100.0, "duration": "1:20:00", "beers_earned": 6.0, "calories": 1000, "run_count": 2},
+            month={"gap": "8:10/mi", "distance": 40.0, "elevation": 400.0, "duration": "5:20:00", "beers_earned": 25.0, "calories": 4000, "run_count": 8},
+            year={"gap": "8:20/mi", "distance": 80.0, "elevation": 800.0, "duration": "10:40:00", "beers_earned": 50.0, "calories": 8000, "run_count": 16},
+            longest_streak=10,
+            notables=[],
+            latest_elevation_feet=250,
+            misery_index=None,
+            misery_index_description=None,
+            air_quality_index=None,
+            aqi_description=None,
+            summit_context={
+                "royale_hill": {
+                    "activity": 6,
+                    "today": 8,
+                    "month": 42,
+                    "year": 99,
+                    "source": "strava_streams",
+                }
+            },
+        )
+
+        self.assertEqual(context["activity"]["royale_hill_summits"], 6)
+        self.assertEqual(context["activity"]["summits"]["royale_hill"], 6)
+        self.assertEqual(context["summits"]["royale_hill"]["month"], 42)
+        self.assertEqual(context["summits"]["royale_hill"]["year"], 99)
+
 
 class TestActivitySmashrunBadges(unittest.TestCase):
     def test_extract_activity_smashrun_badges_matches_smashrun_and_strava_ids(self) -> None:
@@ -359,6 +403,20 @@ class TestChallenge30030Context(unittest.TestCase):
                 ]
             }
         }
+        upsert_activity_summit_metric(
+            self.settings.processed_log_file,
+            activity_id="ride",
+            location_key="royale_hill",
+            location_name="Royale Hill",
+            local_date="2026-05-02",
+            start_date_utc="2026-05-02T11:00:00Z",
+            sport_type="Ride",
+            count=1,
+            source="seeded_test",
+            latitude=ROYALE_HILL_LATITUDE,
+            longitude=ROYALE_HILL_LONGITUDE,
+            radius_feet=60,
+        )
 
         context = _build_300_30_challenge_context(
             self.settings,
@@ -385,9 +443,203 @@ class TestChallenge30030Context(unittest.TestCase):
         self.assertEqual(context["pace"]["distance_status_emoji"], "🟡")
         self.assertEqual(context["pace"]["elevation_status_emoji"], "🔴")
         self.assertEqual(context["royale_hill"]["current_activity_summits"], 2)
+        self.assertEqual(context["today"]["royale_hill_summits"], 3)
+        self.assertEqual(context["totals"]["royale_hill_summits"], 3)
+        strava_client.get_activity_streams.assert_called_once_with(3003)
+
+    def test_royale_hill_summits_are_tracked_for_every_new_running_activity(self) -> None:
+        detailed = {
+            "id": 4004,
+            "sport_type": "Run",
+            "type": "Run",
+            "start_date": "2026-04-24T12:00:00Z",
+            "distance": 8 * 1609.34,
+            "moving_time": 3600,
+        }
+        outside = [34.24500, ROYALE_HILL_LONGITUDE]
+        inside = [ROYALE_HILL_LATITUDE, ROYALE_HILL_LONGITUDE]
+        stream_points = []
+        for _ in range(6):
+            stream_points.append(outside)
+            stream_points.append(inside)
+
+        strava_client = MagicMock()
+        strava_client.get_activity_streams.return_value = {"latlng": {"data": stream_points}}
+        service_state = {
+            "budget_enabled": True,
+            "budget_remaining_optional_calls": 0,
+            "optional_calls_executed": 0,
+            "services": {},
+        }
+
+        context = _build_300_30_challenge_context(
+            self.settings,
+            strava_client,
+            detailed,
+            [],
+            [],
+            profile_id="default",
+            service_state=service_state,
+        )
+
+        self.assertFalse(context["active"])
+        self.assertEqual(context["day"], 0)
+        self.assertEqual(context["royale_hill"]["current_activity_summits"], 6)
+        self.assertEqual(context["today"]["royale_hill_summits"], 6)
+        self.assertEqual(context["totals"]["royale_hill_summits"], 0)
+        self.assertEqual(service_state["budget_remaining_optional_calls"], 0)
+        stored = get_activity_summit_metric(self.settings.processed_log_file, 4004, "royale_hill")
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored["count"], 6)
+        self.assertEqual(stored["local_date"], "2026-04-24")
+        strava_client.get_activity_streams.assert_called_once_with(4004)
+
+    def test_royale_hill_summits_are_tracked_for_any_gps_activity_type(self) -> None:
+        detailed = {
+            "id": 5005,
+            "sport_type": "Ride",
+            "type": "Ride",
+            "start_date": "2026-05-03T12:00:00Z",
+            "distance": 12 * 1609.34,
+            "moving_time": 3600,
+        }
+        strava_client = MagicMock()
+        strava_client.get_activity_streams.return_value = {
+            "latlng": {
+                "data": [
+                    [34.24500, ROYALE_HILL_LONGITUDE],
+                    [ROYALE_HILL_LATITUDE, ROYALE_HILL_LONGITUDE],
+                    [34.24500, ROYALE_HILL_LONGITUDE],
+                    [ROYALE_HILL_LATITUDE, ROYALE_HILL_LONGITUDE],
+                ]
+            }
+        }
+
+        context = _build_300_30_challenge_context(
+            self.settings,
+            strava_client,
+            detailed,
+            [],
+            [],
+            profile_id=CHALLENGE_300_30_PROFILE_ID,
+            service_state={},
+        )
+
+        self.assertEqual(context["royale_hill"]["current_activity_summits"], 2)
         self.assertEqual(context["today"]["royale_hill_summits"], 2)
         self.assertEqual(context["totals"]["royale_hill_summits"], 2)
-        strava_client.get_activity_streams.assert_called_once_with(3003)
+        self.assertEqual(context["today"]["run_count"], 0)
+        self.assertEqual(context["totals"]["run_count"], 0)
+        stored = get_activity_summit_metric(self.settings.processed_log_file, 5005, "royale_hill")
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored["sport_type"], "Ride")
+        self.assertEqual(stored["count"], 2)
+
+    def test_royale_hill_summit_context_exposes_period_totals_for_templates(self) -> None:
+        upsert_activity_summit_metric(
+            self.settings.processed_log_file,
+            activity_id=6001,
+            location_key="royale_hill",
+            location_name="Royale Hill",
+            local_date="2026-05-01",
+            start_date_utc="2026-05-01T12:00:00Z",
+            sport_type="Run",
+            count=4,
+            source="seeded_test",
+            latitude=ROYALE_HILL_LATITUDE,
+            longitude=ROYALE_HILL_LONGITUDE,
+            radius_feet=60,
+        )
+        upsert_activity_summit_metric(
+            self.settings.processed_log_file,
+            activity_id=6002,
+            location_key="royale_hill",
+            location_name="Royale Hill",
+            local_date="2026-05-02",
+            start_date_utc="2026-05-02T12:00:00Z",
+            sport_type="Ride",
+            count=3,
+            source="seeded_test",
+            latitude=ROYALE_HILL_LATITUDE,
+            longitude=ROYALE_HILL_LONGITUDE,
+            radius_feet=60,
+        )
+
+        context = _build_royale_hill_summit_context(
+            self.settings,
+            activity_date=datetime(2026, 5, 2, tzinfo=timezone.utc).date(),
+            summit_result={"count": 3, "source": "strava_streams"},
+        )
+
+        royale_hill = context["royale_hill"]
+        self.assertEqual(royale_hill["activity"], 3)
+        self.assertEqual(royale_hill["today"], 3)
+        self.assertEqual(royale_hill["month"], 7)
+        self.assertEqual(royale_hill["year"], 7)
+
+    @patch("chronicle.activity_pipeline.StravaClient")
+    @patch("chronicle.activity_pipeline.Settings.from_env")
+    def test_backfill_royale_hill_summits_seeds_running_activities_since_date(
+        self,
+        settings_from_env: MagicMock,
+        strava_client_class: MagicMock,
+    ) -> None:
+        settings = SimpleNamespace(
+            processed_log_file=self.settings.processed_log_file,
+            timezone="UTC",
+            log_level="INFO",
+            service_cache_ttl_seconds=0,
+            enable_service_result_cache=False,
+            enable_service_call_budget=True,
+            service_retry_count=0,
+            service_retry_backoff_seconds=0,
+            service_cooldown_base_seconds=60,
+            service_cooldown_max_seconds=1800,
+            validate=MagicMock(),
+            ensure_state_paths=MagicMock(),
+        )
+        settings_from_env.return_value = settings
+        strava_client = strava_client_class.return_value
+        strava_client.get_activities_after.return_value = [
+            {"id": 7001, "sport_type": "Run", "type": "Run"},
+            {"id": 7002, "sport_type": "Ride", "type": "Ride"},
+            {"id": 7003, "sport_type": "TrailRun", "type": "TrailRun"},
+        ]
+        strava_client.get_activity_details.side_effect = [
+            {"id": 7001, "sport_type": "Run", "type": "Run", "start_date": "2024-01-02T12:00:00Z"},
+            {"id": 7003, "sport_type": "TrailRun", "type": "TrailRun", "start_date": "2024-01-03T12:00:00Z"},
+        ]
+        strava_client.get_activity_streams.side_effect = [
+            {
+                "latlng": {
+                    "data": [
+                        [34.24500, ROYALE_HILL_LONGITUDE],
+                        [ROYALE_HILL_LATITUDE, ROYALE_HILL_LONGITUDE],
+                    ]
+                }
+            },
+            {
+                "latlng": {
+                    "data": [
+                        [34.24500, ROYALE_HILL_LONGITUDE],
+                        [ROYALE_HILL_LATITUDE, ROYALE_HILL_LONGITUDE],
+                        [34.24500, ROYALE_HILL_LONGITUDE],
+                        [ROYALE_HILL_LATITUDE, ROYALE_HILL_LONGITUDE],
+                    ]
+                }
+            },
+        ]
+
+        summary = backfill_royale_hill_summits(since=datetime(2024, 1, 1, tzinfo=timezone.utc).date())
+
+        self.assertEqual(summary["activities_seen"], 3)
+        self.assertEqual(summary["activities_analyzed"], 2)
+        self.assertEqual(summary["activities_skipped"], 1)
+        self.assertEqual(summary["total_summits_analyzed"], 3)
+        self.assertEqual(get_activity_summit_metric(self.settings.processed_log_file, 7001, "royale_hill")["count"], 1)
+        self.assertEqual(get_activity_summit_metric(self.settings.processed_log_file, 7003, "royale_hill")["count"], 2)
 
 
 class TestStrengthProfileBehavior(unittest.TestCase):

@@ -340,6 +340,10 @@ SAMPLE_TEMPLATE_CONTEXT: dict[str, Any] = {
         "efficiency": "1.03",
         "treadmill_incline_percent": 15,
         "treadmill_elevation_feet_15pct": 6353,
+        "royale_hill_summits": 2,
+        "summits": {
+            "royale_hill": 2,
+        },
         "social": {
             "kudos": 12,
             "comments": 3,
@@ -550,6 +554,20 @@ SAMPLE_TEMPLATE_CONTEXT: dict[str, Any] = {
             "most_often_run_day": "Sunday",
             "least_often_run_day": "Thursday",
         },
+    },
+    "summits": {
+        "royale_hill": {
+            "location_key": "royale_hill",
+            "location_name": "Royale Hill",
+            "latitude": 34.24659,
+            "longitude": -83.96339,
+            "radius_feet": 60.0,
+            "activity": 2,
+            "today": 3,
+            "month": 19,
+            "year": 110,
+            "source": "strava_streams",
+        }
     },
     "challenge": {
         "id": "300-30-challenge",
@@ -1069,15 +1087,22 @@ PROFILE_TEMPLATE_DEFAULTS: dict[str, str] = {
 🏆 {{ streak_days }} days in a row
 {% for notable in notables %}🏅 {{ notable }}
 {% endfor %}{% for achievement in achievements %}🏅 {{ achievement }}
-{% endfor %}{% for segment_notable in segment_notables | default([]) %}🥇 {{ segment_notable }}
-{% endfor %}{% for badge in badges | default([]) %}🎖️ {{ badge }}
-{% endfor %}🌤️🌡️ MI {{ misery.index }} {{ misery.index.emoji }}{% if misery.index.polarity in ['hot', 'cold'] %} ({{ misery.index.polarity }}){% endif %} | 🏭 AQI {{ weather.aqi }}{{ weather.aqi_description }}
-🌤️🚦 Readiness {{ training.readiness_score }} {{ training.readiness_emoji }} | RHR {{ training.resting_hr }} | Sleep {{ training.sleep_score }}
-👟🏃 {{ activity.gap_pace }} | 🗺️ {{ activity.distance_miles }} mi | 🏔️ {{ activity.elevation_feet }}' | 🕓 {{ activity.time }} | 🍺 {{ activity.beers }}
-👟👣 {{ activity.cadence_spm }}spm | 💼 {{ activity.work }} | ⚡ {{ activity.norm_power }} | 💓 {{ activity.average_hr }} | ⚙️ {{ activity.efficiency }}
-🚄 {{ training.status_emoji }} {{ training.status_key }} | TE {{ training.aerobic_te }} : {{ training.anaerobic_te }} - {{ training.te_label }}
-🚄 {{ intervals.summary }}
-❤️‍🔥 {{ training.vo2 }} | ♾ Endur {{ training.endurance_score }} | 🗻 Hill {{ training.hill_score }}""",
+{% endfor %}
+{% if activity_badges %}{% for badge in activity_badges %}💎 {{ badge }}{% endfor %}{% endif %}
+
+{% if smashrun_activity_badges %}{% for badge in smashrun_activity_badges %}💎 {{ badge }}{% endfor %}{% endif %}
+
+
+🌤️🌡️ Misery Index: {{ misery.index }} {{ misery.index.emoji }} {{ misery.index.severity }} | 🏭 AQI: {{ weather.aqi }}{{ weather.aqi_description }}
+🌤️🚦 Training Readiness: {{ training.readiness_score }} {{ training.readiness_emoji }} | 💤 {{ training.sleep_score }} | 💗 {{ training.resting_hr }}
+
+👟🏃 {{ activity.gap_pace }} | 🏔️ {{ activity.elevation_feet }}' | 👣 {{ activity.cadence_spm }}spm | 💓 {{ activity.average_hr }}
+👟⚡ {{ activity.norm_power }} | ⚙️{{ activity.efficiency }} | 🍌☢️ {{ ((activity.calories | default(0, true) | float) / 1050) | round(2) }}µSv | 🍺 {{ activity.beers }}
+
+🚄{{ training.status_emoji }} {{ training.status_key }} | {{ training.aerobic_te }} : {{ training.anaerobic_te }} - {{ training.te_label }}
+🚄🏋️ {{ intervals.fitness }} | 💦 {{ intervals.fatigue }} | 🗿 {{ intervals.form_percent_display }} - {{ intervals.form_class }} {{ intervals.form_class_emoji }}
+🚄🏋️ {{ training.chronic_load | default('N/A') }} | 💦 {{ training.acute_load | default('N/A') }} | 🗿 {{ training.load_ratio | default('N/A') }} - {{ training.acwr_status | default('N/A') }} {{ training.acwr_status_emoji | default('⚪') }}
+🚄❤️‍🔥 {{ training.vo2 }} | ♾ Endur: {{ training.endurance_score }} | 🗻 Hill: {{ training.hill_score }}""",
     "incline_treadmill": """∠ Incline: 15%
 {% set distance_m = raw.activity.distance | default(0) | float %}
 {% set moving_s = raw.activity.moving_time | default(raw.activity.elapsed_time | default(0)) | float %}
@@ -2221,6 +2246,29 @@ def _profile_template_seed(profile_id: str) -> str:
     return _normalize_template_text(template)
 
 
+def _refresh_seeded_profile_template_if_needed(settings: Settings, profile_id: str, profile_label: str) -> None:
+    if profile_id != "300-30-challenge":
+        return
+    template_path = _template_profile_template_path(settings, profile_id)
+    if not template_path.exists():
+        return
+    metadata = _load_template_metadata(settings, profile_id=profile_id)
+    if metadata.get("current_version"):
+        return
+    if str(metadata.get("source") or "") != "profile-default":
+        return
+    desired = _profile_template_seed(profile_id)
+    try:
+        current = _normalize_template_text(template_path.read_text(encoding="utf-8"))
+    except OSError:
+        return
+    if current == desired:
+        return
+    _write_text_file_atomic(template_path, desired + "\n")
+    defaults = _profile_template_metadata_defaults(profile_label)
+    _write_json_file(_template_profile_meta_path(settings, profile_id), defaults)
+
+
 def _ensure_template_profiles(settings: Settings) -> dict[str, Any]:
     config = _load_template_profiles(settings)
     if config is None:
@@ -2246,6 +2294,11 @@ def _ensure_template_profiles(settings: Settings) -> dict[str, Any]:
         if not meta_path.exists():
             defaults = _profile_template_metadata_defaults(str(profile.get("label") or profile_id.title()))
             _write_json_file(meta_path, defaults)
+        _refresh_seeded_profile_template_if_needed(
+            settings,
+            profile_id,
+            str(profile.get("label") or profile_id.title()),
+        )
 
     return config
 
