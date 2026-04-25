@@ -75,13 +75,20 @@ class TestDescriptionTemplate(unittest.TestCase):
             self.assertFalse(challenge["enabled"])
 
             active = get_active_template(settings, profile_id="300-30-challenge")
-            self.assertIn("Run Nut x Everest", active["template"])
+            self.assertIn("RUN NUT", active["template"])
+            self.assertIn("filled_boxes", active["template"])
             self.assertIn("challenge.pace.distance_delta_display", active["template"])
             self.assertIn("🍌☢️", active["template"])
             self.assertIn("activity_badges", active["template"])
             self.assertNotIn("Remaining:", active["template"])
             validation = validate_template_text(active["template"], get_sample_template_context())
             self.assertTrue(validation["valid"], validation)
+
+            context = get_sample_template_context()
+            context["challenge"]["day"] = 3
+            rendered = render_template_text(active["template"], context)
+            self.assertTrue(rendered["ok"], rendered)
+            self.assertIn("🏁 ▰▱▱▱▱ Day 3 ▱▱▱▱▱🏁", rendered["description"])
 
     def test_challenge_profile_refreshes_untouched_seed_template(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -93,7 +100,8 @@ class TestDescriptionTemplate(unittest.TestCase):
             live_path.write_text("🔥 300/30 Challenge - Day {{ challenge.day }}/{{ challenge.days }}\nold seed\n", encoding="utf-8")
 
             active = get_active_template(settings, profile_id="300-30-challenge")
-            self.assertIn("Run Nut x Everest", active["template"])
+            self.assertIn("RUN NUT", active["template"])
+            self.assertIn("filled_boxes", active["template"])
             self.assertIn("🍌☢️", active["template"])
             self.assertNotIn("old seed", active["template"])
 

@@ -33,17 +33,20 @@ It excludes strength-like activities and only matches activity dates from `2026-
 The profile seed template leads with the challenge scoreboard:
 
 ```text
-🔥 Run Nut x Everest - Day 15/31
-🟢 +6.3mi | 🟢 +112'
-🏃 Today: 13.2 mi | +1,420' | 🏔️ 6
-📈 Total: 151.8 mi | +15,112' | 🏔️ 110
+🏁🥜 RUN NUT 🗙 EVEREST 🧗🏼‍♂️🏁
+🏁 ▰▱▱▱▱ Day 3 ▱▱▱▱▱🏁
+🏁🚦⚖️ • 🦖 +0.8 mi  • 🦖 +112'
+🏁🏃🏽‍♂️‍➡️ Today • 10.2 mi • 120' • 🏔️×6
+🏁✅ Total • 30.8 mi • 3,112' • 🏔️×24
 ```
 
 The lower section uses the `sean_default` streak, activity-award, weather, readiness, and technical training layout. It intentionally omits the default historical totals for past 7 days, past 30 days, and year-to-date.
 
 ## Pace Indicators
 
-The second line shows whether the challenge is ahead or behind the required average pace.
+The second line is a ten-block day progress bar split around the current challenge day. Days `1-3` show one filled block, `4-6` show two, and the bar clamps at ten filled blocks.
+
+The third line shows whether the challenge is ahead or behind the required average pace.
 
 Daily targets:
 

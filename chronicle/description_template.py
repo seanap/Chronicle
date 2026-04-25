@@ -1079,10 +1079,12 @@ PROFILE_BUILTINS: list[dict[str, Any]] = [
 
 PROFILE_TEMPLATE_DEFAULTS: dict[str, str] = {
     "default": DEFAULT_DESCRIPTION_TEMPLATE,
-    "300-30-challenge": """🔥 Run Nut x Everest - Day {{ challenge.day }}/{{ challenge.days }}
-{{ challenge.pace.distance_status_emoji }} {{ challenge.pace.distance_delta_display }} | {{ challenge.pace.elevation_status_emoji }} {{ challenge.pace.elevation_delta_display }}
-🏃 Today: {{ '%.1f' | format(challenge.today.distance_miles) }} mi | +{{ challenge.today.elevation_feet }}' | 🏔️ {{ challenge.today.royale_hill_summits }}
-📈 Total: {{ '%.1f' | format(challenge.totals.distance_miles) }} mi | +{{ challenge.totals.elevation_feet }}' | 🏔️ {{ challenge.totals.royale_hill_summits }}
+    "300-30-challenge": """{% set progress_day = challenge.day | default(0, true) | int %}{% set filled_boxes = ((progress_day - 1) // 3) + 1 %}{% if filled_boxes < 1 %}{% set filled_boxes = 1 %}{% endif %}{% if filled_boxes > 10 %}{% set filled_boxes = 10 %}{% endif %}{% set left_filled = [filled_boxes, 5] | min %}{% set right_filled = [filled_boxes - 5, 0] | max %}
+🏁🥜 RUN NUT 🗙 EVEREST 🧗🏼‍♂️🏁
+🏁 {{ '▰' * left_filled }}{{ '▱' * (5 - left_filled) }} Day {{ challenge.day }} {{ '▰' * right_filled }}{{ '▱' * (5 - right_filled) }}🏁
+🏁🚦⚖️ • 🦖 {{ challenge.pace.distance_delta_display | replace('mi', ' mi') }}  • 🦖 {{ challenge.pace.elevation_delta_display }}
+🏁🏃🏽‍♂️‍➡️ Today • {{ '%.1f' | format(challenge.today.distance_miles) }} mi • {{ challenge.today.elevation_feet }}' • 🏔️×{{ challenge.today.royale_hill_summits }}
+🏁✅ Total • {{ '%.1f' | format(challenge.totals.distance_miles) }} mi • {{ challenge.totals.elevation_feet }}' • 🏔️×{{ challenge.totals.royale_hill_summits }}
 
 🏆 {{ streak_days }} days in a row
 {% for notable in notables %}🏅 {{ notable }}
@@ -1096,9 +1098,8 @@ PROFILE_TEMPLATE_DEFAULTS: dict[str, str] = {
 🌤️🌡️ Misery Index: {{ misery.index }} {{ misery.index.emoji }} {{ misery.index.severity }} | 🏭 AQI: {{ weather.aqi }}{{ weather.aqi_description }}
 🌤️🚦 Training Readiness: {{ training.readiness_score }} {{ training.readiness_emoji }} | 💤 {{ training.sleep_score }} | 💗 {{ training.resting_hr }}
 
-👟🏃 {{ activity.gap_pace }} | 🏔️ {{ activity.elevation_feet }}' | 👣 {{ activity.cadence_spm }}spm | 💓 {{ activity.average_hr }}
-👟⚡ {{ activity.norm_power }} | ⚙️{{ activity.efficiency }} | 🍌☢️ {{ ((activity.calories | default(0, true) | float) / 1050) | round(2) }}µSv | 🍺 {{ activity.beers }}
-
+👟🏃 {{ activity.gap_pace }} | 🍌☢️ {{ ((activity.calories | default(0, true) | float) / 1050) | round(2) }}µSv | 🍺 {{ activity.beers }}
+👟💓 {{ activity.average_hr }} |⚡{{ activity.norm_power }} | ⚙️{{ activity.efficiency }} | 👣 {{ activity.cadence_spm }}spm
 🚄{{ training.status_emoji }} {{ training.status_key }} | {{ training.aerobic_te }} : {{ training.anaerobic_te }} - {{ training.te_label }}
 🚄🏋️ {{ intervals.fitness }} | 💦 {{ intervals.fatigue }} | 🗿 {{ intervals.form_percent_display }} - {{ intervals.form_class }} {{ intervals.form_class_emoji }}
 🚄🏋️ {{ training.chronic_load | default('N/A') }} | 💦 {{ training.acute_load | default('N/A') }} | 🗿 {{ training.load_ratio | default('N/A') }} - {{ training.acwr_status | default('N/A') }} {{ training.acwr_status_emoji | default('⚪') }}
