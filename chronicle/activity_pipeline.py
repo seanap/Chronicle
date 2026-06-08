@@ -1234,6 +1234,29 @@ def _is_incline_treadmill_named_activity(
     return garmin_type_key in {"treadmillincline", "inclinetreadmill"}
 
 
+def _is_garmin_treadmill_walking_speed_activity(
+    activity: dict[str, Any],
+    training: dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(training, dict) or not bool(training.get("_garmin_activity_aligned")):
+        return False
+    garmin_last = training.get("garmin_last_activity")
+    if not isinstance(garmin_last, dict):
+        return False
+    if _normalize_activity_type_key(garmin_last.get("activity_type")) != "treadmillrunning":
+        return False
+    if not _is_treadmill(activity):
+        return False
+    if "treadmill" in _text_blob(activity):
+        return False
+    distance = _distance_miles(activity)
+    moving_time = _as_float(activity.get("moving_time")) or 0.0
+    if distance < 0.25 or moving_time < 300:
+        return False
+    average_speed_mph = distance / (moving_time / 3600.0) if moving_time > 0 else 0.0
+    return average_speed_mph <= 4.0
+
+
 def _training_indicates_strength(training: dict[str, Any] | None) -> bool:
     def _is_positive_numeric(value: Any) -> bool:
         parsed = _as_float(value)
@@ -1287,7 +1310,9 @@ def _incline_treadmill_match_reasons(
     sport_type = raw_sport_type.lower()
     if _is_strength_like(activity) or _training_indicates_strength(training):
         return []
-    if not _is_incline_treadmill_named_activity(activity, training):
+    named_incline = _is_incline_treadmill_named_activity(activity, training)
+    garmin_walking_speed_incline = _is_garmin_treadmill_walking_speed_activity(activity, training)
+    if not named_incline and not garmin_walking_speed_incline:
         return []
     text = _text_blob(activity)
     start = _start_latlng(activity)
@@ -1310,7 +1335,10 @@ def _incline_treadmill_match_reasons(
     has_device_hint = external_id.startswith("garmin_ping_") or "garmin" in device_name
 
     reasons: list[str] = []
-    reasons.append("incline treadmill activity name")
+    if named_incline:
+        reasons.append("incline treadmill activity name")
+    if garmin_walking_speed_incline:
+        reasons.append("garmin treadmill walking-speed incline shape")
     if has_treadmill_hint:
         reasons.append("treadmill keyword")
     if sport_type == "virtualrun" and no_gps:
@@ -2213,6 +2241,7 @@ def _criteria_match_reasons(
     if moving_seconds is None:
         parsed_seconds = _duration_to_seconds(moving_raw)
         moving_seconds = float(parsed_seconds) if parsed_seconds is not None else 0.0
+    average_speed_mph = (distance / (moving_seconds / 3600.0)) if distance > 0 and moving_seconds > 0 else 0.0
     start = _start_latlng(activity)
     has_gps = bool(activity.get("has_gps")) or start is not None
     text = _text_blob(activity)
@@ -2307,6 +2336,20 @@ def _criteria_match_reasons(
         if maximum is None or moving_seconds > maximum:
             return []
         reasons.append(f"moving_time={moving_seconds:.0f}s <= {maximum:.0f}s")
+
+    if "average_speed_mph_min" in criteria:
+        evaluated = True
+        minimum = _as_float(criteria.get("average_speed_mph_min"))
+        if minimum is None or average_speed_mph < minimum:
+            return []
+        reasons.append(f"avg_speed={average_speed_mph:.1f}mph >= {minimum:.1f}mph")
+
+    if "average_speed_mph_max" in criteria:
+        evaluated = True
+        maximum = _as_float(criteria.get("average_speed_mph_max"))
+        if maximum is None or average_speed_mph > maximum:
+            return []
+        reasons.append(f"avg_speed={average_speed_mph:.1f}mph <= {maximum:.1f}mph")
 
     if "gain_per_mile_ft_min" in criteria:
         evaluated = True

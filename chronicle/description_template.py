@@ -1597,13 +1597,23 @@ def _profile_builtin_criteria(settings: Settings | None, profile_id: str) -> dic
     if normalized == "incline_treadmill":
         return {
             "kind": "activity",
-            "description": "Incline treadmill sessions named in Strava or Garmin activity context.",
+            "description": "Incline treadmill sessions named in Strava/Garmin or Garmin treadmill walking-speed sessions.",
             "all_of": [
                 {"none_of": [{"strength_like": True}]},
                 {
                     "any_of": [
                         {"name_contains_any": ["treadmill incline", "incline treadmill"]},
                         {"garmin_activity_type_in": ["treadmillincline", "inclinetreadmill"]},
+                        {
+                            "all_of": [
+                                {"treadmill": True},
+                                {"garmin_activity_type_in": ["treadmill_running"]},
+                                {"distance_miles_min": 0.25},
+                                {"moving_time_seconds_min": 300},
+                                {"average_speed_mph_max": 4.0},
+                                {"name_not_contains": ["treadmill"]},
+                            ]
+                        },
                     ]
                 },
             ],
@@ -1791,6 +1801,8 @@ _PROFILE_RULE_NUMERIC_KEYS = {
     "moving_time_seconds_max",
     "moving_time_minutes_min",
     "moving_time_minutes_max",
+    "average_speed_mph_min",
+    "average_speed_mph_max",
     "gain_per_mile_ft_min",
     "gain_per_mile_ft_max",
     "home_distance_miles_min",

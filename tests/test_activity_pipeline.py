@@ -975,6 +975,36 @@ class TestInclineTreadmillProfileBehavior(unittest.TestCase):
         self.assertTrue(reasons)
         self.assertIn("incline treadmill activity name", reasons)
 
+    def test_incline_treadmill_profile_uses_garmin_treadmill_walking_speed_context(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "trainer": True,
+            "start_latlng": [],
+            "distance": 943.6,
+            "moving_time": 902,
+            "external_id": "garmin_ping_581792060941",
+            "device_name": "Garmin Forerunner 955",
+            "name": "Lunch Run",
+        }
+        training = {
+            "_garmin_activity_aligned": True,
+            "garmin_last_activity": {
+                "activity_name": "Zone 2",
+                "activity_type": "treadmill_running",
+            },
+        }
+        reasons = _profile_match_reasons("incline_treadmill", activity, settings, training=training)
+        self.assertTrue(reasons)
+        self.assertIn("garmin treadmill walking-speed incline shape", reasons)
+
     def test_incline_treadmill_profile_update_payload_sets_walk_title_and_trainer(self) -> None:
         payload = _profile_activity_update_payload(
             "incline_treadmill",
@@ -1119,6 +1149,72 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
 
         self.assertEqual(standard_selected.get("profile_id"), "treadmill")
         self.assertEqual(incline_selected.get("profile_id"), "incline_treadmill")
+
+    def test_profile_selection_routes_garmin_treadmill_walking_speed_to_incline(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        enabled_profiles = [
+            {"profile_id": "default", "label": "Default", "enabled": True, "priority": 0},
+            {
+                "profile_id": "incline_treadmill",
+                "label": "Incline Treadmill",
+                "enabled": True,
+                "priority": 110,
+                "criteria": {
+                    "all_of": [
+                        {"none_of": [{"strength_like": True}]},
+                        {
+                            "any_of": [
+                                {"name_contains_any": ["treadmill incline", "incline treadmill"]},
+                                {"garmin_activity_type_in": ["treadmillincline", "inclinetreadmill"]},
+                                {
+                                    "all_of": [
+                                        {"treadmill": True},
+                                        {"garmin_activity_type_in": ["treadmill_running"]},
+                                        {"distance_miles_min": 0.25},
+                                        {"moving_time_seconds_min": 300},
+                                        {"average_speed_mph_max": 4.0},
+                                        {"name_not_contains": ["treadmill"]},
+                                    ]
+                                },
+                            ]
+                        },
+                    ]
+                },
+            },
+            {"profile_id": "treadmill", "label": "Treadmill", "enabled": True, "priority": 100},
+        ]
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "trainer": True,
+            "start_latlng": [],
+            "distance": 943.6,
+            "moving_time": 902,
+            "external_id": "garmin_ping_581792060941",
+            "device_name": "Garmin Forerunner 955",
+            "name": "Lunch Run",
+        }
+        training = {
+            "_garmin_activity_aligned": True,
+            "garmin_last_activity": {
+                "activity_name": "Zone 2",
+                "activity_type": "treadmill_running",
+            },
+        }
+
+        with patch("chronicle.activity_pipeline.list_template_profiles", return_value=enabled_profiles):
+            selected = _select_activity_profile(settings, activity, training=training)
+
+        self.assertEqual(selected.get("profile_id"), "incline_treadmill")
+        self.assertTrue(
+            any(str(reason).startswith("avg_speed=") and "<= 4.0mph" in str(reason) for reason in selected.get("reasons", []))
+        )
 
     def test_profile_selection_skips_disabled_profiles(self) -> None:
         settings = SimpleNamespace(
