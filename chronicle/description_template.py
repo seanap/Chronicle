@@ -1607,7 +1607,6 @@ def _profile_builtin_criteria(settings: Settings | None, profile_id: str) -> dic
                         {
                             "all_of": [
                                 {"treadmill": True},
-                                {"garmin_activity_type_in": ["treadmill_running"]},
                                 {"distance_miles_min": 0.25},
                                 {"moving_time_seconds_min": 300},
                                 {"average_speed_mph_max": 4.0},

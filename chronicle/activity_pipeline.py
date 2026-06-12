@@ -1234,17 +1234,10 @@ def _is_incline_treadmill_named_activity(
     return garmin_type_key in {"treadmillincline", "inclinetreadmill"}
 
 
-def _is_garmin_treadmill_walking_speed_activity(
+def _is_treadmill_walking_speed_activity(
     activity: dict[str, Any],
     training: dict[str, Any] | None = None,
 ) -> bool:
-    if not isinstance(training, dict) or not bool(training.get("_garmin_activity_aligned")):
-        return False
-    garmin_last = training.get("garmin_last_activity")
-    if not isinstance(garmin_last, dict):
-        return False
-    if _normalize_activity_type_key(garmin_last.get("activity_type")) != "treadmillrunning":
-        return False
     if not _is_treadmill(activity):
         return False
     if "treadmill" in _text_blob(activity):
@@ -1311,8 +1304,8 @@ def _incline_treadmill_match_reasons(
     if _is_strength_like(activity) or _training_indicates_strength(training):
         return []
     named_incline = _is_incline_treadmill_named_activity(activity, training)
-    garmin_walking_speed_incline = _is_garmin_treadmill_walking_speed_activity(activity, training)
-    if not named_incline and not garmin_walking_speed_incline:
+    walking_speed_incline = _is_treadmill_walking_speed_activity(activity, training)
+    if not named_incline and not walking_speed_incline:
         return []
     text = _text_blob(activity)
     start = _start_latlng(activity)
@@ -1337,8 +1330,8 @@ def _incline_treadmill_match_reasons(
     reasons: list[str] = []
     if named_incline:
         reasons.append("incline treadmill activity name")
-    if garmin_walking_speed_incline:
-        reasons.append("garmin treadmill walking-speed incline shape")
+    if walking_speed_incline:
+        reasons.append("treadmill walking-speed incline shape")
     if has_treadmill_hint:
         reasons.append("treadmill keyword")
     if sport_type == "virtualrun" and no_gps:
@@ -4010,46 +4003,51 @@ def run_once(force_update: bool = False, activity_id: int | None = None) -> dict
         )
         strava_client = StravaClient(settings)
 
-        activities = _run_required_call(
-            settings,
-            "strava.get_recent_activities",
-            strava_client.get_recent_activities,
-            service_state=service_state,
-            per_page=5,
-        )
-        if not activities:
-            logger.info("No Strava activities found.")
-            result = {"status": "no_activities"}
-            _record_cycle_status(settings, status=result["status"])
-            return result
-
-        for item in activities:
-            if not isinstance(item, dict):
-                continue
-            activity_value = item.get("id")
-            if activity_value is None:
-                continue
-            register_activity_discovery(
-                settings.processed_log_file,
-                activity_value,
-                sport_type=item.get("sport_type") if isinstance(item.get("sport_type"), str) else None,
-                start_date_utc=item.get("start_date") if isinstance(item.get("start_date"), str) else None,
-            )
-
-        latest, selected, selection_result = _select_strava_activity(
-            settings,
-            activities,
-            force_update=force_update,
-            activity_id=activity_id,
-        )
-        if selection_result is not None:
-            logger.info("No unprocessed activities in latest %s items.", len(activities))
-            _record_cycle_status(
+        if activity_id is not None:
+            selected = {"id": int(activity_id)}
+            latest = selected
+            selection_result = None
+        else:
+            activities = _run_required_call(
                 settings,
-                status=selection_result["status"],
-                activity_id=selection_result["activity_id"],
+                "strava.get_recent_activities",
+                strava_client.get_recent_activities,
+                service_state=service_state,
+                per_page=5,
             )
-            return selection_result
+            if not activities:
+                logger.info("No Strava activities found.")
+                result = {"status": "no_activities"}
+                _record_cycle_status(settings, status=result["status"])
+                return result
+
+            for item in activities:
+                if not isinstance(item, dict):
+                    continue
+                activity_value = item.get("id")
+                if activity_value is None:
+                    continue
+                register_activity_discovery(
+                    settings.processed_log_file,
+                    activity_value,
+                    sport_type=item.get("sport_type") if isinstance(item.get("sport_type"), str) else None,
+                    start_date_utc=item.get("start_date") if isinstance(item.get("start_date"), str) else None,
+                )
+
+            latest, selected, selection_result = _select_strava_activity(
+                settings,
+                activities,
+                force_update=force_update,
+                activity_id=activity_id,
+            )
+            if selection_result is not None:
+                logger.info("No unprocessed activities in latest %s items.", len(activities))
+                _record_cycle_status(
+                    settings,
+                    status=selection_result["status"],
+                    activity_id=selection_result["activity_id"],
+                )
+                return selection_result
         if selected is None:
             raise RuntimeError("Failed to resolve target activity.")
 

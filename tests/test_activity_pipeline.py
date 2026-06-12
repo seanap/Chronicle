@@ -975,7 +975,7 @@ class TestInclineTreadmillProfileBehavior(unittest.TestCase):
         self.assertTrue(reasons)
         self.assertIn("incline treadmill activity name", reasons)
 
-    def test_incline_treadmill_profile_uses_garmin_treadmill_walking_speed_context(self) -> None:
+    def test_incline_treadmill_profile_uses_treadmill_walking_speed_context(self) -> None:
         settings = SimpleNamespace(
             profile_trail_gain_per_mile_ft=220.0,
             profile_long_run_miles=10.0,
@@ -1003,7 +1003,30 @@ class TestInclineTreadmillProfileBehavior(unittest.TestCase):
         }
         reasons = _profile_match_reasons("incline_treadmill", activity, settings, training=training)
         self.assertTrue(reasons)
-        self.assertIn("garmin treadmill walking-speed incline shape", reasons)
+        self.assertIn("treadmill walking-speed incline shape", reasons)
+
+    def test_incline_treadmill_profile_uses_treadmill_walking_speed_without_garmin(self) -> None:
+        settings = SimpleNamespace(
+            profile_trail_gain_per_mile_ft=220.0,
+            profile_long_run_miles=10.0,
+            home_latitude=None,
+            home_longitude=None,
+            home_radius_miles=10.0,
+        )
+        activity = {
+            "sport_type": "Run",
+            "type": "Run",
+            "trainer": True,
+            "start_latlng": [],
+            "distance": 2453.1,
+            "moving_time": 2403,
+            "external_id": "garmin_ping_581792060941",
+            "device_name": "Garmin Forerunner 955",
+            "name": "Afternoon Run",
+        }
+        reasons = _profile_match_reasons("incline_treadmill", activity, settings, training=None)
+        self.assertTrue(reasons)
+        self.assertIn("treadmill walking-speed incline shape", reasons)
 
     def test_incline_treadmill_profile_update_payload_sets_walk_title_and_trainer(self) -> None:
         payload = _profile_activity_update_payload(
@@ -1150,7 +1173,7 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
         self.assertEqual(standard_selected.get("profile_id"), "treadmill")
         self.assertEqual(incline_selected.get("profile_id"), "incline_treadmill")
 
-    def test_profile_selection_routes_garmin_treadmill_walking_speed_to_incline(self) -> None:
+    def test_profile_selection_routes_treadmill_walking_speed_to_incline(self) -> None:
         settings = SimpleNamespace(
             profile_trail_gain_per_mile_ft=220.0,
             profile_long_run_miles=10.0,
@@ -1175,7 +1198,6 @@ class TestTreadmillProfileRoutingBehavior(unittest.TestCase):
                                 {
                                     "all_of": [
                                         {"treadmill": True},
-                                        {"garmin_activity_type_in": ["treadmill_running"]},
                                         {"distance_miles_min": 0.25},
                                         {"moving_time_seconds_min": 300},
                                         {"average_speed_mph_max": 4.0},
