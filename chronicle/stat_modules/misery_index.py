@@ -146,7 +146,7 @@ def _get_weather_data(
 
     response = requests.get(
         f"http://api.weatherapi.com/v1/{endpoint}",
-        params={"key": api_key, "q": f"{lat},{lon}", "dt": date_str},
+        params={"key": api_key, "q": f"{lat},{lon}", "dt": date_str, "aqi": "yes"},
         timeout=TIMEOUT_SECONDS,
     )
     response.raise_for_status()
@@ -179,6 +179,7 @@ def _get_weather_data(
 
     closest = min(hourly, key=_hour_distance)
     condition = closest.get("condition") or {}
+    air_quality = closest.get("air_quality") or {}
 
     return {
         "temp_f": closest.get("temp_f"),
@@ -195,25 +196,96 @@ def _get_weather_data(
         "condition_text": condition.get("text"),
         "heatindex_f": closest.get("heatindex_f"),
         "windchill_f": closest.get("windchill_f"),
+        "pm2_5": air_quality.get("pm2_5"),
         "tz_id": tz_name,
     }
 
 
-def _get_air_quality_index(api_key: str, lat: float, lon: float) -> int | None:
-    response = requests.get(
-        "http://api.weatherapi.com/v1/current.json",
-        params={"key": api_key, "q": f"{lat},{lon}", "aqi": "yes"},
+AIRNOW_FILES_BASE_URL = "https://files.airnowtech.org/airnow"
+AIRNOW_MAX_MONITOR_DISTANCE_KM = 75.0
+
+
+def _great_circle_distance_km(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float:
+    latitude_delta = math.radians(lat_b - lat_a)
+    longitude_delta = math.radians(lon_b - lon_a)
+    origin_latitude = math.radians(lat_a)
+    target_latitude = math.radians(lat_b)
+    haversine = (
+        math.sin(latitude_delta / 2.0) ** 2
+        + math.cos(origin_latitude) * math.cos(target_latitude) * math.sin(longitude_delta / 2.0) ** 2
+    )
+    return 6371.0 * 2.0 * math.asin(math.sqrt(haversine))
+
+
+def _pm25_to_us_epa_aqi(pm25_ug_m3: float | None) -> int | None:
+    if pm25_ug_m3 is None or pm25_ug_m3 < 0:
+        return None
+
+    concentration = math.floor(pm25_ug_m3 * 10.0) / 10.0
+    breakpoints = (
+        (0.0, 12.0, 0, 50),
+        (12.1, 35.4, 51, 100),
+        (35.5, 55.4, 101, 150),
+        (55.5, 125.4, 151, 200),
+        (125.5, 225.4, 201, 300),
+        (225.5, 325.4, 301, 400),
+        (325.5, 500.4, 401, 500),
+    )
+    for concentration_low, concentration_high, index_low, index_high in breakpoints:
+        if concentration_low <= concentration <= concentration_high:
+            index = ((index_high - index_low) / (concentration_high - concentration_low)) * (
+                concentration - concentration_low
+            ) + index_low
+            return math.floor(index + 0.5)
+    return 500 if concentration > 500.4 else None
+
+
+def _get_airnow_pm25_aqi(lat: float, lon: float, activity_time: datetime) -> int | None:
+    """Return the nearest official AirNow PM2.5 AQI for the activity hour."""
+    timestamp = activity_time.astimezone(timezone.utc)
+    date_path = timestamp.strftime("%Y/%Y%m%d")
+    hour_name = timestamp.strftime("HourlyData_%Y%m%d%H.dat")
+    hourly_response = requests.get(
+        f"{AIRNOW_FILES_BASE_URL}/{date_path}/{hour_name}",
         timeout=TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
-    payload = response.json()
-    index_value = payload.get("current", {}).get("air_quality", {}).get("us-epa-index")
-    if index_value is None:
+    hourly_response.raise_for_status()
+    sites_response = requests.get(
+        f"{AIRNOW_FILES_BASE_URL}/{date_path}/Monitoring_Site_Locations_V2.dat",
+        timeout=TIMEOUT_SECONDS,
+    )
+    sites_response.raise_for_status()
+
+    station_coordinates: dict[str, tuple[float, float]] = {}
+    for line in sites_response.text.splitlines():
+        fields = line.split("|")
+        if len(fields) < 13 or fields[3].strip().upper() != "PM2.5":
+            continue
+        try:
+            station_coordinates[fields[0].strip()] = (float(fields[11]), float(fields[12]))
+        except (TypeError, ValueError):
+            continue
+
+    candidates: list[tuple[float, float]] = []
+    for line in hourly_response.text.splitlines():
+        fields = line.split("|")
+        if len(fields) < 8 or fields[5].strip().upper() != "PM2.5" or fields[6].strip().upper() != "UG/M3":
+            continue
+        station = station_coordinates.get(fields[2].strip())
+        if station is None:
+            continue
+        try:
+            concentration = float(fields[7])
+        except (TypeError, ValueError):
+            continue
+        distance_km = _great_circle_distance_km(lat, lon, station[0], station[1])
+        if distance_km <= AIRNOW_MAX_MONITOR_DISTANCE_KM:
+            candidates.append((distance_km, concentration))
+
+    if not candidates:
         return None
-    try:
-        return int(index_value)
-    except (TypeError, ValueError):
-        return None
+    _distance_km, pm25_ug_m3 = min(candidates, key=lambda candidate: candidate[0])
+    return _pm25_to_us_epa_aqi(pm25_ug_m3)
 
 
 def _heat_index_f(temp_f: float, humidity: float) -> float:
@@ -731,9 +803,20 @@ def get_misery_index_description(misery_index: float, *, polarity: str | None = 
     return f"{emoji} {label}{suffix}"
 
 
-def get_aqi_description(us_epa_index: int | None) -> str:
-    aqi_descriptions = {1: "😃", 2: "🙂", 3: "😐", 4: "😷", 5: "🤢", 6: "☠️"}
-    return aqi_descriptions.get(us_epa_index, "Unknown")
+def get_aqi_description(aqi: int | None) -> str:
+    if aqi is None or aqi < 0 or aqi > 500:
+        return "Unknown"
+    if aqi <= 50:
+        return " 😃 Good"
+    if aqi <= 100:
+        return " 🙂 Moderate"
+    if aqi <= 150:
+        return " 😐 Unhealthy for Sensitive Groups"
+    if aqi <= 200:
+        return " 😷 Unhealthy"
+    if aqi <= 300:
+        return " 🤢 Very Unhealthy"
+    return " ☠️ Hazardous"
 
 
 def get_misery_index_details_for_activity(
@@ -755,22 +838,25 @@ def get_misery_index_details_for_activity(
     weather_data: dict[str, Any] | None = None
     aqi: int | None = None
     weather_error: requests.RequestException | None = None
-    aqi_error: requests.RequestException | None = None
+    airnow_error: requests.RequestException | None = None
+    try:
+        aqi = _get_airnow_pm25_aqi(float(lat), float(lon), activity_time)
+    except requests.RequestException as exc:
+        airnow_error = exc
+        logger.info("AirNow PM2.5 lookup unavailable: %s", exc)
     try:
         weather_data = _get_weather_data(weather_api_key, float(lat), float(lon), activity_time)
     except requests.RequestException as exc:
         weather_error = exc
         logger.error("Weather API weather request failed: %s", exc)
-    try:
-        aqi = _get_air_quality_index(weather_api_key, float(lat), float(lon))
-    except requests.RequestException as exc:
-        aqi_error = exc
-        logger.error("Weather API AQI request failed: %s", exc)
 
-    if weather_data is None and aqi is None and (weather_error is not None or aqi_error is not None):
+    if aqi is None and weather_data:
+        aqi = _pm25_to_us_epa_aqi(_to_float(weather_data.get("pm2_5")))
+
+    if weather_data is None and aqi is None and (weather_error is not None or airnow_error is not None):
         if weather_error is not None:
             raise weather_error
-        raise aqi_error if aqi_error is not None else requests.RequestException("Weather API request failed")
+        raise airnow_error if airnow_error is not None else requests.RequestException("Air quality request failed")
 
     if not weather_data:
         return {

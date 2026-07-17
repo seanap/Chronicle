@@ -1,9 +1,11 @@
 import unittest
-from unittest.mock import patch
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch
 
 import requests
 
 from chronicle.stat_modules.misery_index import (
+    _get_airnow_pm25_aqi,
     calculate_misery_index,
     calculate_misery_index_components,
     get_aqi_description,
@@ -241,8 +243,36 @@ class TestMiseryIndex(unittest.TestCase):
         self.assertGreater(components["component_risk_tail"], 0.0)
 
     def test_aqi_description(self) -> None:
-        self.assertEqual(get_aqi_description(1), "😃")
-        self.assertEqual(get_aqi_description(99), "Unknown")
+        self.assertEqual(get_aqi_description(1), " 😃 Good")
+        self.assertEqual(get_aqi_description(363), " ☠️ Hazardous")
+        self.assertEqual(get_aqi_description(999), "Unknown")
+
+    def test_airnow_hourly_pm25_returns_hazardous_numeric_aqi_for_nearest_monitor(self) -> None:
+        hourly_response = Mock()
+        hourly_response.text = (
+            "07/17/26|13:00|550790010|Milwaukee 16th Street|-6|PM2.5|UG/M3|287.8|WI DNR\n"
+            "07/17/26|13:00|550790056|Milwaukee College Ave|-6|PM2.5|UG/M3|262.2|WI DNR\n"
+        )
+        hourly_response.raise_for_status.return_value = None
+        sites_response = Mock()
+        sites_response.text = (
+            "550790010|550790010|840550790010|PM2.5|Permanent|0010|Milwaukee 16th Street|Active|WI1|WI DNR|R5|43.017800|-87.933300||-6.00|US\n"
+            "550790056|550790056|840550790056|PM2.5|Permanent|0056|Milwaukee College Ave|Active|WI1|WI DNR|R5|42.932570|-87.934340||-6.00|US\n"
+        )
+        sites_response.raise_for_status.return_value = None
+
+        with patch(
+            "chronicle.stat_modules.misery_index.requests.get",
+            side_effect=[hourly_response, sites_response],
+        ):
+            aqi = _get_airnow_pm25_aqi(
+                lat=43.018,
+                lon=-87.933,
+                activity_time=datetime(2026, 7, 17, 13, 11, 50, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(aqi, 363)
+        self.assertEqual(get_aqi_description(aqi), " ☠️ Hazardous")
 
     def test_activity_details_keep_weather_when_aqi_lookup_fails(self) -> None:
         activity = {
@@ -269,7 +299,7 @@ class TestMiseryIndex(unittest.TestCase):
                 "tz_id": "America/New_York",
             },
         ), patch(
-            "chronicle.stat_modules.misery_index._get_air_quality_index",
+            "chronicle.stat_modules.misery_index._get_airnow_pm25_aqi",
             side_effect=requests.RequestException("aqi unavailable"),
         ):
             details = get_misery_index_details_for_activity(activity, "weather-key")
